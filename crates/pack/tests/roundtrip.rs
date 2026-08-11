@@ -210,7 +210,7 @@ fn deferred_segments_are_isolated_and_can_arrive_after_snapshot_open() {
         .filter(|segment| segment.availability == Availability::Required)
         .map(|segment| {
             let bytes: Arc<[u8]> =
-                std::fs::read(output.join("data").join(format!("{}.hks", segment.id)))
+                std::fs::read(output.join("data").join(format!("{}.taku", segment.id)))
                     .unwrap()
                     .into();
             (segment.id, bytes)
@@ -264,7 +264,7 @@ fn segment_files(directory: &Path) -> Vec<String> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().into_string().ok()?;
-            name.ends_with(".hks").then_some(name)
+            name.ends_with(".taku").then_some(name)
         })
         .collect();
     names.sort();
@@ -327,7 +327,7 @@ fn extracted_content_key_cannot_forge_the_signed_block_commitment() {
     let block = map_page_record(&page_plain, 0).unwrap();
     assert_eq!(block.codec, Codec::Raw);
     let segment = catalog.segment(u32::from(block.segment_ordinal)).unwrap();
-    let segment_path = output.join("data").join(format!("{}.hks", segment.id));
+    let segment_path = output.join("data").join(format!("{}.taku", segment.id));
     let mut segment_bytes = std::fs::read(&segment_path).unwrap();
     let segment_header =
         hakutaku_core::format::SegmentHeader::parse(&segment_bytes[..4096]).unwrap();

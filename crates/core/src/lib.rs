@@ -9,5 +9,8 @@ mod package;
 
 pub use error::{Error, Result};
 pub use format::{AccessClass, Availability, ProjectId, SegmentId};
-pub use io::{DirectorySegmentSource, LocalFile, PositionedFile, SegmentSource};
+pub use io::{
+    DirectorySegmentSource, LocalFile, PositionedFile, SEGMENT_FILE_EXTENSION, SegmentSource,
+    segment_file_name,
+};
 pub use package::{Asset, AssetCursor, AssetInfo, Package, ResourceBudget, SegmentInfo};

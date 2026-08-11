@@ -21,10 +21,10 @@ compatibility branch in the wire format.
 release/
 ├── game.haku
 └── data/
-    └── <64 lowercase hex characters>.hks
+    └── <64 lowercase hex characters>.taku
 ```
 
-`SegmentId = BLAKE3(complete .hks file)`. Segment files are immutable. A new
+`SegmentId = BLAKE3(complete .taku file)`. Segment files are immutable. A new
 snapshot may reuse blocks from old segments and add new segments.
 
 ## SnapshotHeaderV1
@@ -216,7 +216,7 @@ page. Empty packages have no pages.
 | 0 | 8 | logical plaintext offset in file |
 | 8 | 2 | segment ordinal |
 | 10 | 4 | segment block ordinal |
-| 14 | 8 | absolute physical offset in `.hks` |
+| 14 | 8 | absolute physical offset in `.taku` |
 | 22 | 4 | ciphertext + tag length |
 | 26 | 4 | plaintext length |
 | 30 | 1 | codec: 0 RAW, 1 zstd |
@@ -240,7 +240,7 @@ load them.
 
 ## SegmentHeaderV1
 
-Every `.hks` begins with one 4096-byte header followed by tightly packed
+Every `.taku` begins with one 4096-byte header followed by tightly packed
 ciphertext blocks.
 
 | offset | size | field |

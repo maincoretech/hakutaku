@@ -2,7 +2,7 @@
 
 Hakutaku is an authenticated, random-access resource package designed for
 offline games. A release consists of one signed `game.haku` snapshot and a
-small set of immutable, content-addressed `.hks` segments.
+small set of immutable, content-addressed `.taku` segments.
 
 The repository is intentionally split by responsibility:
 
@@ -44,7 +44,7 @@ cargo run -p hakutaku-cli -- segments \
 cargo run -p hakutaku-gui
 ```
 
-Only `game.haku` and `data/*.hks` belong in the shipped game. The
+Only `game.haku` and `data/*.taku` belong in the shipped game. The
 `*.hakutaku-key` identity contains both the content root key and publisher
 signing key; never ship or commit it.
 

@@ -4,6 +4,13 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub const SEGMENT_FILE_EXTENSION: &str = "taku";
+
+#[must_use]
+pub fn segment_file_name(id: SegmentId) -> String {
+    format!("{id}.{SEGMENT_FILE_EXTENSION}")
+}
+
 /// A thread-safe file-like object with cursor-independent reads.
 pub trait PositionedFile: Send + Sync {
     fn len(&self) -> Result<u64>;
@@ -54,7 +61,7 @@ impl DirectorySegmentSource {
 
     #[must_use]
     pub fn segment_path(&self, id: SegmentId) -> PathBuf {
-        self.root.join(format!("{id}.hks"))
+        self.root.join(segment_file_name(id))
     }
 }
 

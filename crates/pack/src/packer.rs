@@ -6,7 +6,7 @@ use hakutaku_core::format::{
     SEGMENT_HEADER_SIZE, SegmentHeader, SegmentId, SegmentRecord, SnapshotHeader, encode_map_page,
     encode_reuse_page, validate_canonical_path,
 };
-use hakutaku_core::{Package, ResourceBudget};
+use hakutaku_core::{Package, ResourceBudget, SEGMENT_FILE_EXTENSION, segment_file_name};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -675,8 +675,10 @@ impl NewSegment {
         let uid = random_array::<16>(&rng)?;
         let salt = random_array::<16>(&rng)?;
         let nonce_prefix = random_array::<8>(&rng)?;
-        let temporary_path =
-            data_directory.join(format!(".segment-{}-{index}.hks.part", std::process::id()));
+        let temporary_path = data_directory.join(format!(
+            ".segment-{}-{index}.{SEGMENT_FILE_EXTENSION}.part",
+            std::process::id()
+        ));
         let file = OpenOptions::new()
             .write(true)
             .read(true)
@@ -786,7 +788,7 @@ impl NewSegment {
         writer.get_ref().sync_all()?;
         drop(writer);
         let id = hash_file(&self.temporary_path)?;
-        let final_path = self.data_directory.join(format!("{id}.hks"));
+        let final_path = self.data_directory.join(segment_file_name(id));
         if final_path.exists() {
             if hash_file(&final_path)? != id {
                 return Err(Error::InvalidInput(format!(
@@ -1185,7 +1187,7 @@ fn recover_interrupted_release(output: &Path) -> Result<()> {
             let name = name.to_string_lossy();
             if entry.file_type()?.is_file()
                 && name.starts_with(".segment-")
-                && name.ends_with(".hks.part")
+                && name.ends_with(&format!(".{SEGMENT_FILE_EXTENSION}.part"))
             {
                 std::fs::remove_file(entry.path())?;
                 data_changed = true;
@@ -1199,7 +1201,7 @@ fn recover_interrupted_release(output: &Path) -> Result<()> {
 }
 
 fn cleanup_unreferenced_segments(data_directory: &Path, active: &[SegmentId]) -> Result<()> {
-    let active_names: HashSet<String> = active.iter().map(|id| format!("{id}.hks")).collect();
+    let active_names: HashSet<String> = active.iter().copied().map(segment_file_name).collect();
     let mut removed = false;
     for entry in std::fs::read_dir(data_directory)? {
         let entry = entry?;
@@ -1209,10 +1211,11 @@ fn cleanup_unreferenced_segments(data_directory: &Path, active: &[SegmentId]) ->
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let bytes = name.as_bytes();
-        if bytes.len() == 68
-            && &bytes[64..] == b".hks"
-            && bytes[..64].iter().all(u8::is_ascii_hexdigit)
+        let Some(stem) = name.strip_suffix(&format!(".{SEGMENT_FILE_EXTENSION}")) else {
+            continue;
+        };
+        if stem.len() == 64
+            && stem.as_bytes().iter().all(u8::is_ascii_hexdigit)
             && !active_names.contains(&name)
         {
             std::fs::remove_file(entry.path())?;
@@ -1352,7 +1355,7 @@ mod tests {
         std::fs::create_dir_all(output.join("data")).unwrap();
         std::fs::write(output.join("game.haku.previous"), b"previous").unwrap();
         std::fs::write(output.join("game.haku.part-7"), b"partial").unwrap();
-        std::fs::write(output.join("data/.segment-7-0.hks.part"), b"partial").unwrap();
+        std::fs::write(output.join("data/.segment-7-0.taku.part"), b"partial").unwrap();
         std::fs::write(output.join("data/notes.txt"), b"keep").unwrap();
 
         recover_interrupted_release(&output).unwrap();
@@ -1362,7 +1365,7 @@ mod tests {
             b"previous"
         );
         assert!(!output.join("game.haku.part-7").exists());
-        assert!(!output.join("data/.segment-7-0.hks.part").exists());
+        assert!(!output.join("data/.segment-7-0.taku.part").exists());
         assert!(output.join("data/notes.txt").is_file());
         std::fs::remove_dir_all(output).unwrap();
     }
