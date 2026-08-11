@@ -112,7 +112,15 @@ impl Identity {
         let checksum = blake3::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
 
-        let temporary = path.with_extension(format!("part-{}", std::process::id()));
+        let mut temporary_nonce = [0_u8; 8];
+        SystemRandom::new()
+            .fill(&mut temporary_nonce)
+            .map_err(|_| Error::Crypto("identity temporary path generation"))?;
+        let temporary = path.with_extension(format!(
+            "part-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(temporary_nonce)
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -125,11 +133,22 @@ impl Identity {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            std::fs::rename(&temporary, path)
+            // A hard link publishes the fully synchronized inode without the
+            // check-then-rename overwrite race. The temporary and final path
+            // are deliberately siblings, so they cannot cross filesystems.
+            std::fs::hard_link(&temporary, path)
         })() {
             let _ = std::fs::remove_file(&temporary);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(Error::InvalidInput(format!(
+                    "identity already exists: {}",
+                    path.display()
+                )));
+            }
             return Err(Error::Io(error));
         }
+        let _ = std::fs::remove_file(&temporary);
+        sync_parent(path)?;
         Ok(())
     }
 
@@ -176,4 +195,17 @@ impl Identity {
             .try_into()
             .expect("Ed25519 signature size"))
     }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }

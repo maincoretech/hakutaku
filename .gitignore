@@ -1,4 +1,6 @@
 /target
 *.part
+*.part-*
 *.hakutaku-key
-
+.hakutaku.lock
+game.haku.previous

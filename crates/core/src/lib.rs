@@ -8,6 +8,6 @@ pub mod io;
 mod package;
 
 pub use error::{Error, Result};
-pub use format::{AccessClass, ProjectId, SegmentId};
+pub use format::{AccessClass, Availability, ProjectId, SegmentId};
 pub use io::{DirectorySegmentSource, LocalFile, PositionedFile, SegmentSource};
-pub use package::{Asset, AssetCursor, AssetInfo, Package, ResourceBudget};
+pub use package::{Asset, AssetCursor, AssetInfo, Package, ResourceBudget, SegmentInfo};

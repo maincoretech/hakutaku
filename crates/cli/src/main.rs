@@ -24,6 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Value(command) if command == "identity" => identity_command(&mut parser),
         Value(command) if command == "pack" => pack_command(&mut parser),
         Value(command) if command == "list" => list_command(&mut parser),
+        Value(command) if command == "segments" => segments_command(&mut parser),
         Value(command) if command == "extract" => extract_command(&mut parser),
         Value(command) if command == "verify" => verify_command(&mut parser),
         Value(command) if command == "help" => {
@@ -64,6 +65,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     let mut incremental = true;
     let mut level = 3;
     let mut segment_mib = 512_u64;
+    let mut deferred_prefixes = Vec::new();
     while let Some(argument) = parser.next()? {
         match argument {
             Long("input") | Short('i') => input = Some(PathBuf::from(parser.value()?)),
@@ -72,9 +74,12 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             Long("full") => incremental = false,
             Long("zstd-level") => level = parser.value()?.parse()?,
             Long("segment-mib") => segment_mib = parser.value()?.parse()?,
+            Long("deferred-prefix") => {
+                deferred_prefixes.push(parser.value()?.to_string_lossy().into_owned());
+            }
             Long("help") | Short('h') => {
                 println!(
-                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--zstd-level 3] [--segment-mib 512]"
+                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--zstd-level 3] [--segment-mib 512] [--deferred-prefix PATH]"
                 );
                 return Ok(());
             }
@@ -91,6 +96,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     options.segment_target_bytes = segment_mib
         .checked_mul(1024 * 1024)
         .ok_or("segment target overflow")?;
+    options.deferred_prefixes = deferred_prefixes;
     let mut last_phase = "";
     let report = pack_directory_with_progress(&options, &identity, |progress| {
         if progress.phase != last_phase {
@@ -126,6 +132,21 @@ fn list_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     let package = open_package(&release, &identity)?;
     for asset in package.list_assets()? {
         println!("{:>12}  {:?}  {}", asset.len, asset.access, asset.path);
+    }
+    Ok(())
+}
+
+fn segments_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
+    let (release, identity, extra) = package_arguments(parser)?;
+    if extra.is_some() {
+        return Err("segments accepts only --package and --identity".into());
+    }
+    let package = open_package(&release, &identity)?;
+    for segment in package.list_segments()? {
+        println!(
+            "{:>12}  {:?}  {}",
+            segment.len, segment.availability, segment.id
+        );
     }
     Ok(())
 }
@@ -220,6 +241,7 @@ fn print_help() {
          identity create <file>   create a publisher-only identity\n  \
          pack -i DIR -o DIR -k ID build or increment a release\n  \
          list -p DIR -k ID        list logical assets\n  \
+         segments -p DIR -k ID    list signed segment inventory\n  \
          extract -p DIR -k ID -o DIR\n  \
          verify -p DIR -k ID      verify snapshot and complete segments"
     );

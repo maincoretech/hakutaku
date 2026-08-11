@@ -1,9 +1,10 @@
 use crate::cache::ClockCache;
 use crate::crypto::{self, Aes256Key, ProjectKeys};
 use crate::format::{
-    AccessClass, BLOCKS_PER_MAP_PAGE, BlockRef, Catalog, Codec, FileRecord, LayoutKind, PageKind,
-    ProjectId, REUSE_PER_PAGE, ReuseRecord, SEGMENT_HEADER_SIZE, SegmentHeader, SegmentId,
-    SegmentRecord, SnapshotHeader, map_page_record, parse_reuse_page, validate_map_page,
+    AccessClass, Availability, BLOCKS_PER_MAP_PAGE, BlockRef, Catalog, Codec, FileRecord,
+    LayoutKind, PageKind, ProjectId, REUSE_PER_PAGE, ReuseRecord, SEGMENT_HEADER_SIZE,
+    SegmentHeader, SegmentId, SegmentRecord, SnapshotHeader, map_page_record, parse_reuse_page,
+    validate_map_page,
 };
 use crate::io::{DirectorySegmentSource, LocalFile, PositionedFile, SegmentSource};
 use crate::{Error, Result};
@@ -144,6 +145,18 @@ pub struct AssetInfo {
     pub access: AccessClass,
 }
 
+/// Immutable segment metadata available before any segment is opened.
+///
+/// Launchers can use this signed snapshot data to determine which required
+/// segments must be installed and which deferred segments may be fetched on
+/// demand. The runtime itself stays transport-agnostic through [`SegmentSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentInfo {
+    pub id: SegmentId,
+    pub len: u64,
+    pub availability: Availability,
+}
+
 #[derive(Clone)]
 pub struct Asset {
     package: Package,
@@ -241,7 +254,10 @@ impl Package {
                 path_key,
                 page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
                 block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
-                probation: Mutex::new(VecDeque::with_capacity(budget.normal_probation_entries)),
+                // Probation is sparse in normal play; grow only when a Normal
+                // block is actually touched instead of reserving caller budget
+                // eagerly on package open (important for mobile launchers).
+                probation: Mutex::new(VecDeque::new()),
                 handles: Mutex::new(HandleCache::new(budget.idle_segment_handles)),
                 budget,
             }),
@@ -311,6 +327,20 @@ impl Package {
             });
         }
         Ok(assets)
+    }
+
+    /// Signed segment inventory for installers, patchers, and mobile launchers.
+    pub fn list_segments(&self) -> Result<Vec<SegmentInfo>> {
+        (0..self.inner.catalog.segment_count())
+            .map(|index| {
+                let record = self.inner.catalog.segment(index)?;
+                Ok(SegmentInfo {
+                    id: record.id,
+                    len: record.file_len,
+                    availability: record.availability,
+                })
+            })
+            .collect()
     }
 
     /// Segment identities referenced by this complete snapshot.

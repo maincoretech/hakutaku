@@ -1,10 +1,15 @@
 use hakutaku_core::crypto::{self, Aes256Key, ProjectKeys};
 use hakutaku_core::format::{Catalog, Codec, SnapshotHeader, map_page_record, validate_map_page};
-use hakutaku_core::{Package, ResourceBudget};
+use hakutaku_core::{
+    AccessClass, Availability, Error as CoreError, Package, PositionedFile, ResourceBudget,
+    SegmentId, SegmentSource,
+};
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Barrier;
 
 struct Scratch(PathBuf);
 
@@ -81,6 +86,32 @@ fn runtime_material_reconstructs_the_identity_key() {
 }
 
 #[test]
+fn concurrent_identity_creation_never_overwrites_a_winner() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("publisher.hakutaku-key");
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let identity = Identity::generate().unwrap();
+                barrier.wait();
+                identity.save(path)
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    Identity::load(path).unwrap();
+}
+
+#[test]
 fn committed_snapshot_removes_only_unreferenced_segment_files() {
     let scratch = Scratch::new();
     let input = scratch.0.join("input");
@@ -103,6 +134,104 @@ fn committed_snapshot_removes_only_unreferenced_segment_files() {
     assert_eq!(new_segments.len(), 1);
     assert_ne!(old_segments, new_segments);
     assert!(data.join("notes.txt").is_file());
+}
+
+#[test]
+fn first_release_deduplicates_identical_chunks() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir_all(&input).unwrap();
+    let repeated = pseudo_random_bytes(100_000);
+    std::fs::write(input.join("a.bin"), &repeated).unwrap();
+    std::fs::write(input.join("b.bin"), &repeated).unwrap();
+    let identity = Identity::generate().unwrap();
+
+    let report = pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+
+    assert_eq!(report.block_count, 2);
+    assert_eq!(report.new_blocks, 1);
+    assert_eq!(report.reused_blocks, 1);
+    let package = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::memory_constrained(),
+    )
+    .unwrap();
+    assert_eq!(package.asset("a.bin").unwrap().read().unwrap(), repeated);
+    assert_eq!(
+        package.asset("b.bin").unwrap().read().unwrap(),
+        package.asset("a.bin").unwrap().read().unwrap()
+    );
+}
+
+#[test]
+fn deferred_segments_are_isolated_and_can_arrive_after_snapshot_open() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir_all(input.join("core")).unwrap();
+    std::fs::create_dir_all(input.join("dlc")).unwrap();
+    std::fs::write(input.join("core/config.json"), b"{\"start\":\"main\"}").unwrap();
+    std::fs::write(input.join("dlc/movie.mp4"), pseudo_random_bytes(700_000)).unwrap();
+    let identity = Identity::generate().unwrap();
+    let mut options = PackOptions::new(&input, &output);
+    options.deferred_prefixes.push("dlc".into());
+    pack_directory(&options, &identity).unwrap();
+
+    let local = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::memory_constrained(),
+    )
+    .unwrap();
+    let assets = local.list_assets().unwrap();
+    assert_eq!(assets[0].access, AccessClass::Hot);
+    assert_eq!(assets[1].access, AccessClass::Streaming);
+    let segments = local.list_segments().unwrap();
+    assert!(
+        segments
+            .iter()
+            .any(|segment| segment.availability == Availability::Required)
+    );
+    let deferred = segments
+        .iter()
+        .find(|segment| segment.availability == Availability::Deferred)
+        .copied()
+        .unwrap();
+
+    let snapshot: Arc<[u8]> = std::fs::read(output.join("game.haku")).unwrap().into();
+    let required_segments = segments
+        .iter()
+        .filter(|segment| segment.availability == Availability::Required)
+        .map(|segment| {
+            let bytes: Arc<[u8]> =
+                std::fs::read(output.join("data").join(format!("{}.hks", segment.id)))
+                    .unwrap()
+                    .into();
+            (segment.id, bytes)
+        })
+        .collect();
+    let package = Package::open(
+        Arc::new(MemoryFile(snapshot)),
+        Arc::new(MemorySegments(required_segments)),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::memory_constrained(),
+    )
+    .unwrap();
+    assert_eq!(
+        package.asset("core/config.json").unwrap().read().unwrap(),
+        b"{\"start\":\"main\"}"
+    );
+    assert!(matches!(
+        package.asset("dlc/movie.mp4").unwrap().read(),
+        Err(CoreError::SegmentUnavailable(id)) if id == deferred.id
+    ));
 }
 
 #[test]
@@ -298,4 +427,34 @@ fn pseudo_random_bytes(len: usize) -> Vec<u8> {
             state as u8
         })
         .collect()
+}
+
+struct MemoryFile(Arc<[u8]>);
+
+impl PositionedFile for MemoryFile {
+    fn len(&self) -> hakutaku_core::Result<u64> {
+        Ok(self.0.len() as u64)
+    }
+
+    fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> hakutaku_core::Result<()> {
+        let start = usize::try_from(offset).map_err(|_| CoreError::InvalidRange)?;
+        let end = start
+            .checked_add(destination.len())
+            .ok_or(CoreError::InvalidRange)?;
+        let source = self.0.get(start..end).ok_or(CoreError::InvalidRange)?;
+        destination.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+struct MemorySegments(HashMap<SegmentId, Arc<[u8]>>);
+
+impl SegmentSource for MemorySegments {
+    fn open(&self, id: SegmentId) -> hakutaku_core::Result<Arc<dyn PositionedFile>> {
+        self.0
+            .get(&id)
+            .cloned()
+            .map(|bytes| Arc::new(MemoryFile(bytes)) as Arc<dyn PositionedFile>)
+            .ok_or(CoreError::SegmentUnavailable(id))
+    }
 }

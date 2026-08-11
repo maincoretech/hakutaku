@@ -75,6 +75,7 @@ struct PackForm {
     incremental: bool,
     compression_level: i32,
     segment_mib: u64,
+    deferred_prefixes: String,
 }
 
 impl Default for PackForm {
@@ -86,6 +87,7 @@ impl Default for PackForm {
             incremental: true,
             compression_level: 3,
             segment_mib: 512,
+            deferred_prefixes: String::new(),
         }
     }
 }
@@ -119,7 +121,7 @@ struct BenchResult {
 enum Message {
     Progress(PackProgress),
     Packed(std::result::Result<PackReport, String>),
-    Loaded(std::result::Result<(Package, Vec<AssetInfo>), String>),
+    Loaded(std::result::Result<(Package, Vec<AssetInfo>, usize), String>),
     Extracted(std::result::Result<usize, String>),
     Benchmarked(std::result::Result<BenchResult, String>),
     IdentityCreated(std::result::Result<String, String>),
@@ -192,11 +194,12 @@ impl App {
                 Message::Loaded(result) => {
                     self.busy = false;
                     match result {
-                        Ok((package, assets)) => {
+                        Ok((package, assets, deferred_segments)) => {
                             self.status = format!(
-                                "Loaded release {} with {} assets",
+                                "Loaded release {} with {} assets, {} deferred segment(s)",
                                 package.release_sequence(),
-                                assets.len()
+                                assets.len(),
+                                deferred_segments,
                             );
                             self.browse.package = Some(package);
                             self.browse.assets = assets;
@@ -244,6 +247,7 @@ impl App {
             incremental: self.pack.incremental,
             compression_level: self.pack.compression_level,
             segment_mib: self.pack.segment_mib,
+            deferred_prefixes: self.pack.deferred_prefixes.clone(),
         };
         let sender = self.sender.clone();
         self.begin_work("Starting pack…");
@@ -257,6 +261,13 @@ impl App {
                     .segment_mib
                     .checked_mul(1024 * 1024)
                     .ok_or_else(|| "segment size overflow".to_owned())?;
+                options.deferred_prefixes = form
+                    .deferred_prefixes
+                    .split([',', '\n'])
+                    .map(str::trim)
+                    .filter(|prefix| !prefix.is_empty())
+                    .map(str::to_owned)
+                    .collect();
                 pack_directory_with_progress(&options, &identity, |progress| {
                     let _ = sender.send(Message::Progress(progress));
                 })
@@ -274,7 +285,13 @@ impl App {
         std::thread::spawn(move || {
             let result = open_release(&release, &identity).and_then(|package| {
                 let assets = package.list_assets().map_err(|error| error.to_string())?;
-                Ok((package, assets))
+                let deferred_segments = package
+                    .list_segments()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .filter(|segment| segment.availability == hakutaku_core::Availability::Deferred)
+                    .count();
+                Ok((package, assets, deferred_segments))
             });
             let _ = sender.send(Message::Loaded(result));
         });
@@ -516,6 +533,15 @@ impl App {
             RichText::new("The identity contains the signing key and must never be shipped.")
                 .color(Color32::from_rgb(215, 178, 120)),
         );
+        ui.horizontal(|ui| {
+            ui.label("Deferred:");
+            ui.add_sized(
+                [ui.available_width(), row_height],
+                egui::TextEdit::singleline(&mut self.pack.deferred_prefixes)
+                    .hint_text("optional prefixes, comma-separated"),
+            );
+        });
+        ui.small("Deferred prefixes are isolated into on-demand segments.");
         ui.horizontal(|ui| {
             ui.label("Options:");
             ui.checkbox(&mut self.pack.incremental, "Reuse current release");

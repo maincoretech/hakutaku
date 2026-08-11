@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  runtime-platforms:
+    name: Runtime (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo check -p hakutaku-core -p hakutaku-pack -p hakutaku-cli
+      - run: cargo test -p hakutaku-core -p hakutaku-pack

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 const STREAM_BLOCK: usize = 256 * 1024;
 const BULK_BLOCK: usize = 1024 * 1024;
-const TINY_LIMIT: u64 = 32 * 1024;
+const HOT_FILE_LIMIT: u64 = 32 * 1024;
 const CONTENT_DEFINED_LIMIT: u64 = 64 * 1024 * 1024;
 const FASTCDC_MIN: u32 = 32 * 1024;
 const FASTCDC_AVG: u32 = 128 * 1024;
@@ -30,6 +30,10 @@ pub struct PackOptions {
     pub incremental: bool,
     pub compression_level: i32,
     pub segment_target_bytes: u64,
+    /// Canonical asset paths or directory prefixes whose segments may be
+    /// installed on demand. Required and deferred blocks are never mixed in
+    /// one segment.
+    pub deferred_prefixes: Vec<String>,
 }
 
 impl PackOptions {
@@ -41,6 +45,20 @@ impl PackOptions {
             incremental: true,
             compression_level: 3,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET,
+            deferred_prefixes: Vec::new(),
+        }
+    }
+
+    fn availability(&self, path: &str) -> Availability {
+        if self.deferred_prefixes.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            Availability::Deferred
+        } else {
+            Availability::Required
         }
     }
 }
@@ -79,8 +97,8 @@ where
 {
     validate_options(options)?;
     std::fs::create_dir_all(&options.output_directory)?;
-    recover_interrupted_snapshot(&options.output_directory)?;
     let _lock = BuildLock::acquire(&options.output_directory)?;
+    recover_interrupted_release(&options.output_directory)?;
     let data_directory = options.output_directory.join("data");
     std::fs::create_dir_all(&data_directory)?;
 
@@ -133,6 +151,7 @@ where
         identity,
         keys: &keys,
         reuse_index,
+        current_reuse: HashMap::new(),
         used_existing_segments: BTreeMap::new(),
         new_segment_records: Vec::new(),
         new_segment_ids: Vec::new(),
@@ -166,6 +185,9 @@ where
         context.add_file(source)?;
     }
     context.finish_current_segment()?;
+    if !context.new_segment_ids.is_empty() {
+        sync_directory(&data_directory)?;
+    }
     let source_fingerprint = *context.fingerprint.finalize().as_bytes();
 
     if old_package
@@ -240,11 +262,13 @@ struct ReusableBlock {
     segment: SegmentRecord,
 }
 
+#[derive(Clone, Copy)]
 enum SegmentLocator {
     Existing(SegmentId),
     New(usize),
 }
 
+#[derive(Clone, Copy)]
 struct PendingBlock {
     locator: SegmentLocator,
     reference: BlockRef,
@@ -254,7 +278,8 @@ struct BuildContext<'a> {
     options: &'a PackOptions,
     identity: &'a Identity,
     keys: &'a ProjectKeys,
-    reuse_index: HashMap<[u8; 32], ReusableBlock>,
+    reuse_index: HashMap<([u8; 32], Availability), ReusableBlock>,
+    current_reuse: HashMap<([u8; 32], Availability), PendingBlock>,
     used_existing_segments: BTreeMap<SegmentId, SegmentRecord>,
     new_segment_records: Vec<SegmentRecord>,
     new_segment_ids: Vec<SegmentId>,
@@ -283,6 +308,7 @@ impl BuildContext<'_> {
 
     fn add_file(&mut self, source: &SourceFile) -> Result<()> {
         let (layout, fixed_block_len, access) = classify(source);
+        let availability = self.options.availability(&source.logical_path);
         let first_block = u32::try_from(self.pending_blocks.len())
             .map_err(|_| Error::InvalidInput("too many blocks".into()))?;
         let path_offset = u32::try_from(self.path_pool.len())
@@ -298,14 +324,19 @@ impl BuildContext<'_> {
             .update(&(source.logical_path.len() as u64).to_le_bytes());
         self.fingerprint.update(source.logical_path.as_bytes());
         self.fingerprint.update(&source.len.to_le_bytes());
-        self.fingerprint.update(&[layout as u8, access as u8]);
+        self.fingerprint
+            .update(&[layout as u8, access as u8, availability as u8]);
         self.fingerprint.update(&fixed_block_len.to_le_bytes());
 
         let before = self.pending_blocks.len();
         if source.len > 0 {
             match layout {
-                LayoutKind::Fixed => self.add_fixed_file(source, fixed_block_len as usize)?,
-                LayoutKind::ContentDefined => self.add_content_defined_file(source)?,
+                LayoutKind::Fixed => {
+                    self.add_fixed_file(source, fixed_block_len as usize, availability)?
+                }
+                LayoutKind::ContentDefined => {
+                    self.add_content_defined_file(source, availability)?
+                }
             }
         }
         let block_count = u32::try_from(self.pending_blocks.len() - before)
@@ -328,7 +359,12 @@ impl BuildContext<'_> {
         Ok(())
     }
 
-    fn add_fixed_file(&mut self, source: &SourceFile, block_size: usize) -> Result<()> {
+    fn add_fixed_file(
+        &mut self,
+        source: &SourceFile,
+        block_size: usize,
+        availability: Availability,
+    ) -> Result<()> {
         let mut reader =
             BufReader::with_capacity(block_size.min(1024 * 1024), File::open(&source.host_path)?);
         let mut buffer = vec![0_u8; block_size];
@@ -338,7 +374,7 @@ impl BuildContext<'_> {
             if read == 0 {
                 break;
             }
-            self.add_chunk(logical_offset, &buffer[..read])?;
+            self.add_chunk(logical_offset, &buffer[..read], availability)?;
             logical_offset = logical_offset
                 .checked_add(read as u64)
                 .ok_or_else(|| Error::InvalidInput("file offset overflow".into()))?;
@@ -352,7 +388,11 @@ impl BuildContext<'_> {
         Ok(())
     }
 
-    fn add_content_defined_file(&mut self, source: &SourceFile) -> Result<()> {
+    fn add_content_defined_file(
+        &mut self,
+        source: &SourceFile,
+        availability: Availability,
+    ) -> Result<()> {
         let bytes = std::fs::read(&source.host_path)?;
         if bytes.len() as u64 != source.len {
             return Err(Error::InvalidInput(format!(
@@ -365,16 +405,29 @@ impl BuildContext<'_> {
                 .offset
                 .checked_add(chunk.length)
                 .ok_or_else(|| Error::InvalidInput("FastCDC range overflow".into()))?;
-            self.add_chunk(chunk.offset as u64, &bytes[chunk.offset..end])?;
+            self.add_chunk(chunk.offset as u64, &bytes[chunk.offset..end], availability)?;
         }
         Ok(())
     }
 
-    fn add_chunk(&mut self, logical_offset: u64, plaintext: &[u8]) -> Result<()> {
+    fn add_chunk(
+        &mut self,
+        logical_offset: u64,
+        plaintext: &[u8],
+        availability: Availability,
+    ) -> Result<()> {
         let chunk_id = *blake3::hash(plaintext).as_bytes();
         self.fingerprint.update(&chunk_id);
         self.chunk_ids.push(chunk_id);
-        if let Some(reused) = self.reuse_index.get(&chunk_id)
+        let reuse_key = (chunk_id, availability);
+        if let Some(reused) = self.current_reuse.get(&reuse_key).copied() {
+            let mut reused = reused;
+            reused.reference.logical_offset = logical_offset;
+            self.pending_blocks.push(reused);
+            self.reused_blocks = self.reused_blocks.saturating_add(1);
+            return Ok(());
+        }
+        if let Some(reused) = self.reuse_index.get(&reuse_key)
             && reused.block.plain_len as usize == plaintext.len()
         {
             let mut reference = reused.block;
@@ -382,10 +435,12 @@ impl BuildContext<'_> {
             self.used_existing_segments
                 .entry(reused.segment.id)
                 .or_insert_with(|| reused.segment.clone());
-            self.pending_blocks.push(PendingBlock {
+            let pending = PendingBlock {
                 locator: SegmentLocator::Existing(reused.segment.id),
                 reference,
-            });
+            };
+            self.pending_blocks.push(pending);
+            self.current_reuse.insert(reuse_key, pending);
             self.reused_blocks = self.reused_blocks.saturating_add(1);
             return Ok(());
         }
@@ -397,9 +452,10 @@ impl BuildContext<'_> {
             .ok_or_else(|| Error::InvalidInput("block length overflow".into()))?
             as u64;
         let rotate = self.current_segment.as_ref().is_some_and(|segment| {
-            segment.block_count > 0
-                && segment.payload_len.saturating_add(estimated_stored)
-                    > self.options.segment_target_bytes
+            segment.availability != availability
+                || (segment.block_count > 0
+                    && segment.payload_len.saturating_add(estimated_stored)
+                        > self.options.segment_target_bytes)
         });
         if rotate {
             self.finish_current_segment()?;
@@ -411,6 +467,7 @@ impl BuildContext<'_> {
                 index,
                 self.identity.project_id(),
                 self.keys,
+                availability,
             )?);
         }
         let segment_index = self.new_segment_records.len();
@@ -419,10 +476,12 @@ impl BuildContext<'_> {
             .as_mut()
             .expect("segment initialized")
             .write_block(logical_offset, plaintext.len(), codec, encoded)?;
-        self.pending_blocks.push(PendingBlock {
+        let pending = PendingBlock {
             locator: SegmentLocator::New(segment_index),
             reference,
-        });
+        };
+        self.pending_blocks.push(pending);
+        self.current_reuse.insert(reuse_key, pending);
         self.new_blocks = self.new_blocks.saturating_add(1);
         Ok(())
     }
@@ -599,6 +658,7 @@ struct NewSegment {
     salt: [u8; 16],
     nonce_prefix: [u8; 8],
     key: Aes256Key,
+    availability: Availability,
     block_count: u32,
     payload_len: u64,
 }
@@ -609,6 +669,7 @@ impl NewSegment {
         index: usize,
         project_id: ProjectId,
         keys: &ProjectKeys,
+        availability: Availability,
     ) -> Result<Self> {
         let rng = SystemRandom::new();
         let uid = random_array::<16>(&rng)?;
@@ -643,6 +704,7 @@ impl NewSegment {
             salt,
             nonce_prefix,
             key,
+            availability,
             block_count: 0,
             payload_len: 0,
         })
@@ -745,7 +807,7 @@ impl NewSegment {
                 file_len,
                 payload_len: self.payload_len,
                 block_count: self.block_count,
-                availability: Availability::Required,
+                availability: self.availability,
             },
             file_len,
         ))
@@ -760,17 +822,21 @@ impl Drop for NewSegment {
     }
 }
 
-fn load_reuse_index(old: Option<&Package>) -> Result<HashMap<[u8; 32], ReusableBlock>> {
+fn load_reuse_index(
+    old: Option<&Package>,
+) -> Result<HashMap<([u8; 32], Availability), ReusableBlock>> {
     let Some(old) = old else {
         return Ok(HashMap::new());
     };
     let mut index = HashMap::new();
     for reuse in old.reuse_records()? {
         let segment = old.segment_record(reuse.block.segment_ordinal)?;
-        index.entry(reuse.chunk_id).or_insert(ReusableBlock {
-            block: reuse.block,
-            segment,
-        });
+        index
+            .entry((reuse.chunk_id, segment.availability))
+            .or_insert(ReusableBlock {
+                block: reuse.block,
+                segment,
+            });
     }
     Ok(index)
 }
@@ -932,9 +998,9 @@ fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
         extension.as_str(),
         "mp4" | "webm" | "mkv" | "mov" | "m4v" | "mp3" | "ogg" | "opus" | "flac" | "wav"
     );
-    if source.len <= TINY_LIMIT {
+    if source.len <= HOT_FILE_LIMIT {
         let fixed = u32::try_from(source.len.max(1)).unwrap_or(1);
-        return (LayoutKind::Fixed, fixed, AccessClass::Normal);
+        return (LayoutKind::Fixed, fixed, AccessClass::Hot);
     }
     if streaming {
         return (
@@ -1083,20 +1149,58 @@ fn commit_snapshot(target: &Path) -> Result<()> {
             std::fs::remove_file(previous)?;
         }
     }
+    if let Some(parent) = target.parent() {
+        sync_directory(parent)?;
+    }
     Ok(())
 }
 
-fn recover_interrupted_snapshot(output: &Path) -> Result<()> {
+fn recover_interrupted_release(output: &Path) -> Result<()> {
     let target = output.join("game.haku");
     let previous = output.join("game.haku.previous");
+    let mut output_changed = false;
     if !target.exists() && previous.exists() {
         std::fs::rename(previous, target)?;
+        output_changed = true;
+    }
+    for entry in std::fs::read_dir(output)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type()?.is_file() && name.starts_with("game.haku.part-") {
+            std::fs::remove_file(entry.path())?;
+            output_changed = true;
+        }
+    }
+    if output_changed {
+        sync_directory(output)?;
+    }
+
+    let data = output.join("data");
+    if data.is_dir() {
+        let mut data_changed = false;
+        for entry in std::fs::read_dir(&data)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_file()
+                && name.starts_with(".segment-")
+                && name.ends_with(".hks.part")
+            {
+                std::fs::remove_file(entry.path())?;
+                data_changed = true;
+            }
+        }
+        if data_changed {
+            sync_directory(&data)?;
+        }
     }
     Ok(())
 }
 
 fn cleanup_unreferenced_segments(data_directory: &Path, active: &[SegmentId]) -> Result<()> {
     let active_names: HashSet<String> = active.iter().map(|id| format!("{id}.hks")).collect();
+    let mut removed = false;
     for entry in std::fs::read_dir(data_directory)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -1112,8 +1216,25 @@ fn cleanup_unreferenced_segments(data_directory: &Path, active: &[SegmentId]) ->
             && !active_names.contains(&name)
         {
             std::fs::remove_file(entry.path())?;
+            removed = true;
         }
     }
+    if removed {
+        sync_directory(data_directory)?;
+    }
+    Ok(())
+}
+
+/// Persist directory-entry changes on Unix. Each file is synchronized before
+/// it is renamed; synchronizing the containing directory closes the remaining
+/// crash window between a durable file and its durable name. Windows keeps the
+/// same verified rename/recovery protocol without adding a platform crate to
+/// the publisher-only dependency graph.
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1133,6 +1254,11 @@ fn validate_options(options: &PackOptions) -> Result<()> {
         return Err(Error::InvalidInput(
             "zstd level must be between -7 and 22".into(),
         ));
+    }
+    for prefix in &options.deferred_prefixes {
+        validate_canonical_path(prefix).map_err(|_| {
+            Error::InvalidInput(format!("deferred prefix is not canonical: {prefix:?}"))
+        })?;
     }
     Ok(())
 }
@@ -1181,6 +1307,14 @@ impl Drop for BuildLock {
 mod tests {
     use super::*;
 
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hakutaku-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
     #[test]
     fn compressed_data_must_save_meaningful_space() {
         let mut compressor = zstd::bulk::Compressor::new(3).unwrap();
@@ -1209,5 +1343,27 @@ mod tests {
         ];
         let slots = build_path_slots(&paths, &files, &[1; 32]).unwrap();
         assert!(slots.iter().any(|slot| slot.file_index == EMPTY_PATH_SLOT));
+    }
+
+    #[test]
+    fn recovery_restores_snapshot_and_removes_only_temporary_files() {
+        let output = scratch("recovery");
+        let _ = std::fs::remove_dir_all(&output);
+        std::fs::create_dir_all(output.join("data")).unwrap();
+        std::fs::write(output.join("game.haku.previous"), b"previous").unwrap();
+        std::fs::write(output.join("game.haku.part-7"), b"partial").unwrap();
+        std::fs::write(output.join("data/.segment-7-0.hks.part"), b"partial").unwrap();
+        std::fs::write(output.join("data/notes.txt"), b"keep").unwrap();
+
+        recover_interrupted_release(&output).unwrap();
+
+        assert_eq!(
+            std::fs::read(output.join("game.haku")).unwrap(),
+            b"previous"
+        );
+        assert!(!output.join("game.haku.part-7").exists());
+        assert!(!output.join("data/.segment-7-0.hks.part").exists());
+        assert!(output.join("data/notes.txt").is_file());
+        std::fs::remove_dir_all(output).unwrap();
     }
 }

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 const STREAM_BYTES: usize = 32 * 1024 * 1024;
 const RANDOM_REQUESTS: usize = 10_000;
+const DEDUP_FILE_BYTES: usize = 4 * 1024 * 1024;
+const DEDUP_FILES: usize = 4;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::new()?;
@@ -73,6 +75,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "blocks={} segment_bytes={}",
         report.block_count, report.new_segment_bytes
+    );
+
+    let dedup_input = fixture.path.join("dedup-input");
+    let dedup_release = fixture.path.join("dedup-release");
+    std::fs::create_dir_all(&dedup_input)?;
+    let seed = dedup_input.join("copy-0.bin");
+    write_fixture(&seed, DEDUP_FILE_BYTES)?;
+    for index in 1..DEDUP_FILES {
+        std::fs::copy(&seed, dedup_input.join(format!("copy-{index}.bin")))?;
+    }
+    let dedup = pack_directory(
+        &PackOptions::new(&dedup_input, &dedup_release),
+        &Identity::generate()?,
+    )?;
+    println!(
+        "dedup_logical_bytes={} dedup_segment_bytes={} dedup_new_blocks={} dedup_reused_blocks={}",
+        DEDUP_FILE_BYTES * DEDUP_FILES,
+        dedup.new_segment_bytes,
+        dedup.new_blocks,
+        dedup.reused_blocks,
     );
     Ok(())
 }

@@ -94,3 +94,36 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(len: usize, value: u8) -> Arc<[u8]> {
+        vec![value; len].into()
+    }
+
+    #[test]
+    fn cache_never_exceeds_its_byte_budget() {
+        let mut cache = ClockCache::new(8);
+        cache.insert(1, bytes(6, 1));
+        cache.insert(2, bytes(6, 2));
+
+        assert!(cache.used <= 8);
+        assert_eq!(cache.index.len(), 1);
+        assert_eq!(cache.get(&2).as_deref(), Some([2; 6].as_slice()));
+    }
+
+    #[test]
+    fn clear_releases_every_rebuildable_entry() {
+        let mut cache = ClockCache::new(16);
+        cache.insert("a", bytes(8, 1));
+        cache.insert("b", bytes(8, 2));
+
+        cache.clear();
+
+        assert_eq!(cache.used, 0);
+        assert!(cache.entries.is_empty());
+        assert!(cache.index.is_empty());
+    }
+}

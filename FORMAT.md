@@ -138,6 +138,12 @@ data.
 | 92 | 1 | availability: 0 required, 1 deferred |
 | 93 | 3 | zero |
 
+Required and deferred blocks are never mixed in one segment. A launcher must
+install every required segment before normal play; deferred segments may be
+absent until an asset that references them is requested. The signed catalog is
+therefore also the authoritative update/install manifest. Transport and retry
+behavior are deliberately outside the wire format.
+
 ### FileRecordV1 — 32 bytes
 
 | offset | size | field |
@@ -154,6 +160,10 @@ data.
 
 Paths are non-empty UTF-8 separated by `/`. Absolute paths, empty components,
 `.`/`..`, backslashes, NUL, leading slash, and trailing slash are forbidden.
+
+The reference packer classifies files up to 32 KiB as Hot, known audio/video as
+Streaming, and remaining files as Normal. These are cache hints, not security
+or compatibility semantics; readers must accept every declared access class.
 
 ### PathSlotV1 — 16 bytes
 
@@ -306,3 +316,18 @@ Ed25519 public key
 
 Cache hits do not repeat digest, AEAD, or zstd work. Prepared AES keys are
 retained only by the active snapshot and the bounded segment-handle cache.
+
+## Publisher transaction
+
+Segment files are finalized and synchronized before their names are committed.
+The complete staged release is then reopened, all segment IDs are verified, and
+every logical asset is compared with its source. Only after successful
+verification is the synchronized snapshot atomically renamed to `game.haku`.
+Unreferenced content-addressed segments are deleted after that commit, never
+before it. On Unix the affected directories are synchronized after segment
+publication, snapshot replacement, recovery, and garbage collection.
+
+The packer may reuse a signed block from the previous snapshot or an identical
+block already written during the current build. Reuse is permitted only when
+the segment availability matches, preserving the required/deferred install
+boundary.

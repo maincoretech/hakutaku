@@ -29,12 +29,15 @@ cargo run -p hakutaku-cli -- identity create publisher.hakutaku-key
 cargo run -p hakutaku-cli -- pack \
   --input path/to/assets \
   --output path/to/release \
-  --identity publisher.hakutaku-key
+  --identity publisher.hakutaku-key \
+  --deferred-prefix dlc
 
 # Verify every immutable segment, or inspect the file table.
 cargo run -p hakutaku-cli -- verify \
   --package path/to/release --identity publisher.hakutaku-key
 cargo run -p hakutaku-cli -- list \
+  --package path/to/release --identity publisher.hakutaku-key
+cargo run -p hakutaku-cli -- segments \
   --package path/to/release --identity publisher.hakutaku-key
 
 # Developer GUI with Pack, Browse, and Bench tabs.
@@ -45,15 +48,48 @@ Only `game.haku` and `data/*.hks` belong in the shipped game. The
 `*.hakutaku-key` identity contains both the content root key and publisher
 signing key; never ship or commit it.
 
+Incremental packing reuses chunks from the active release. Identical chunks are
+also deduplicated during the first release, so copied assets are encrypted and
+stored only once. Files up to 32 KiB are marked `Hot`, media uses fixed
+`Streaming` blocks, and other assets enter the bounded second-hit `Normal`
+cache. A deferred prefix is isolated into separately signed segment records;
+required and deferred blocks never share a segment.
+
+## Runtime and update integration
+
+The runtime opens and authenticates `game.haku` first. `Package::list_segments`
+then exposes the signed ID, byte length, and `Required`/`Deferred` availability
+of every immutable segment. Installers can download only missing content while
+the game supplies storage through the dependency-free `SegmentSource` and
+`PositionedFile` traits. A missing on-demand segment returns
+`Error::SegmentUnavailable(id)`; networking and retry policy stay outside the
+format reader.
+
+This boundary works with desktop files, Android/iOS asset storage, memory maps,
+or a platform download manager without adding an HTTP client or async runtime
+to `hakutaku-core`. Snapshot and segment reads are positional and safe to share
+between concurrent cursors.
+
+Publisher writes use synchronized temporary files, verified staging, atomic
+snapshot replacement, Unix directory synchronization, and post-commit garbage
+collection. Interrupted `.part` files are removed only after the exclusive
+build lock is acquired. If a process is killed while packing, confirm no packer
+is still running before removing a reported stale `.hakutaku.lock`.
+
 See [FORMAT.md](FORMAT.md) for the normative v1 byte layout, parser limits,
 nonce/AAD rules, and verification chain.
+See [PERFORMANCE.md](PERFORMANCE.md) for the committed benchmark protocol and
+the current read/dedup baseline.
 
 ## Validation
 
+The repository pins its minimum supported Rust toolchain in
+`rust-toolchain.toml`. Local and CI acceptance use the same commands:
+
 ```sh
+cargo fmt --all --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
 cargo test --workspace
 cargo bench --workspace
 ```
