@@ -83,8 +83,8 @@ the current read/dedup baseline.
 
 ## Validation
 
-The repository pins its minimum supported Rust toolchain in
-`rust-toolchain.toml`. Local and CI acceptance use the same commands:
+Hakutaku requires Rust 1.97.1. The same version is pinned for local development
+and CI in `rust-toolchain.toml`. Local acceptance uses:
 
 ```sh
 cargo fmt --all --check

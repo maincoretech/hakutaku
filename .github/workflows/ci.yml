@@ -1,8 +1,12 @@
-name: CI
+name: CI & Builds
 
 on:
+  workflow_dispatch:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -18,14 +22,125 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  runtime-platforms:
-    name: Runtime (${{ matrix.os }})
+  mobile-core:
+    name: Core (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - os: macos-latest
+            target: aarch64-apple-ios
+            platform: iOS
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            platform: Android
     steps:
       - uses: actions/checkout@v6
-      - run: cargo check -p hakutaku-core -p hakutaku-pack -p hakutaku-cli
-      - run: cargo test -p hakutaku-core -p hakutaku-pack
+      - run: rustup target add ${{ matrix.target }}
+      - name: Configure Android NDK
+        if: matrix.platform == 'Android'
+        shell: bash
+        run: |
+          toolchain="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$toolchain/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$toolchain/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+      - run: cargo check -p hakutaku-core --target ${{ matrix.target }}
+
+  build-cli:
+    name: CLI (${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release -p hakutaku-cli --target ${{ matrix.target }}
+      - name: Package executable
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/hakutaku.exe" "hakutaku-${{ matrix.suffix }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/hakutaku" "hakutaku-${{ matrix.suffix }}"
+          fi
+      - uses: actions/upload-artifact@v5
+        with:
+          name: hakutaku-cli-${{ matrix.suffix }}
+          path: hakutaku-${{ matrix.suffix }}*
+
+  build-gui:
+    name: GUI (${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup target add ${{ matrix.target }}
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+      - run: cargo build --release -p hakutaku-gui --target ${{ matrix.target }}
+      - name: Package executable
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/hakutaku-gui.exe" "hakutaku-gui-${{ matrix.suffix }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/hakutaku-gui" "hakutaku-gui-${{ matrix.suffix }}"
+          fi
+      - name: Create macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="hakutaku-gui-${{ matrix.suffix }}.app"
+          mkdir -p "$app/Contents/MacOS"
+          cp "target/${{ matrix.target }}/release/hakutaku-gui" "$app/Contents/MacOS/hakutaku-gui"
+          chmod +x "$app/Contents/MacOS/hakutaku-gui"
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            '<key>CFBundleExecutable</key><string>hakutaku-gui</string>' \
+            '<key>CFBundleName</key><string>Hakutaku</string>' \
+            '<key>CFBundleIdentifier</key><string>tech.maincore.hakutaku</string>' \
+            '<key>CFBundleVersion</key><string>1</string>' \
+            '<key>NSHighResolutionCapable</key><true/>' \
+            '</dict></plist>' > "$app/Contents/Info.plist"
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$app.zip"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: hakutaku-gui-${{ matrix.suffix }}
+          path: |
+            hakutaku-gui-${{ matrix.suffix }}*
+            !hakutaku-gui-${{ matrix.suffix }}.app/**
