@@ -25,6 +25,8 @@ pub struct ResourceBudget {
     pub map_page_cache_bytes: usize,
     /// Maximum plaintext content-block bytes retained in memory.
     pub plaintext_cache_bytes: usize,
+    /// Maximum explicitly prefetched plaintext bytes retained for future reads.
+    pub prefetch_cache_bytes: usize,
     /// Maximum idle open segment handles retained for reuse.
     pub idle_segment_handles: usize,
     /// Maximum one-hit normal blocks tracked before cache admission.
@@ -36,6 +38,7 @@ impl Default for ResourceBudget {
         Self {
             map_page_cache_bytes: 2 * 1024 * 1024,
             plaintext_cache_bytes: 64 * 1024 * 1024,
+            prefetch_cache_bytes: 2 * 1024 * 1024,
             idle_segment_handles: 16,
             normal_probation_entries: 256,
         }
@@ -49,6 +52,7 @@ impl ResourceBudget {
         Self {
             map_page_cache_bytes: 512 * 1024,
             plaintext_cache_bytes: 16 * 1024 * 1024,
+            prefetch_cache_bytes: 512 * 1024,
             idle_segment_handles: 4,
             normal_probation_entries: 64,
         }
@@ -60,6 +64,7 @@ impl ResourceBudget {
         Self {
             map_page_cache_bytes: 0,
             plaintext_cache_bytes: 0,
+            prefetch_cache_bytes: 0,
             idle_segment_handles: 0,
             normal_probation_entries: 0,
         }
@@ -82,6 +87,7 @@ struct PackageInner {
     path_key: [u8; 32],
     page_cache: Mutex<ClockCache<u32>>,
     block_cache: Mutex<ClockCache<BlockKey>>,
+    prefetch_cache: Mutex<ClockCache<BlockKey>>,
     probation: Mutex<VecDeque<BlockKey>>,
     handles: Mutex<HandleCache>,
     budget: ResourceBudget,
@@ -183,11 +189,67 @@ pub struct Asset {
 pub struct AssetCursor {
     asset: Asset,
     position: u64,
-    current_block: Option<(BlockRef, BlockData)>,
+    current_block: Option<CursorBlock>,
+    previous_streaming_block: Option<CursorBlock>,
+    buffers: BlockBuffers,
+}
+
+struct CursorBlock {
+    reference: BlockRef,
+    data: BlockData,
+}
+
+impl CursorBlock {
+    fn covers(&self, position: u64) -> bool {
+        let end = self
+            .reference
+            .logical_offset
+            .saturating_add(u64::from(self.reference.plain_len));
+        position >= self.reference.logical_offset && position < end
+    }
+}
+
+#[derive(Default)]
+struct BlockBuffers {
+    ciphertext: Vec<u8>,
+    plaintext: Vec<u8>,
+}
+
+impl BlockBuffers {
+    fn prepare_ciphertext(&mut self, len: usize) -> &mut Vec<u8> {
+        if self.ciphertext.capacity() < len && self.plaintext.capacity() >= len {
+            std::mem::swap(&mut self.ciphertext, &mut self.plaintext);
+        }
+        self.ciphertext.resize(len, 0);
+        &mut self.ciphertext
+    }
+
+    fn take_raw(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.ciphertext)
+    }
+
+    fn prepare_plaintext(&mut self, len: usize) -> &mut Vec<u8> {
+        self.plaintext.resize(len, 0);
+        &mut self.plaintext
+    }
+
+    fn take_plaintext(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.plaintext)
+    }
+
+    fn recycle(&mut self, data: BlockData) {
+        let BlockData::Owned(mut bytes) = data else {
+            return;
+        };
+        bytes.clear();
+        if bytes.capacity() > self.plaintext.capacity() {
+            self.plaintext = bytes;
+        }
+    }
 }
 
 enum BlockData {
-    Shared(Arc<[u8]>),
+    Shared(Arc<Vec<u8>>),
     Owned(Vec<u8>),
 }
 
@@ -196,6 +258,15 @@ impl AsRef<[u8]> for BlockData {
         match self {
             Self::Shared(bytes) => bytes,
             Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl BlockData {
+    fn into_shared(self) -> Arc<Vec<u8>> {
+        match self {
+            Self::Shared(bytes) => bytes,
+            Self::Owned(bytes) => Arc::new(bytes),
         }
     }
 }
@@ -265,6 +336,7 @@ impl Package {
                 path_key,
                 page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
                 block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
+                prefetch_cache: Mutex::new(ClockCache::new(budget.prefetch_cache_bytes)),
                 // Probation is sparse in normal play; grow only when a Normal
                 // block is actually touched instead of reserving caller budget
                 // eagerly on package open (important for mobile launchers).
@@ -388,6 +460,7 @@ impl Package {
     pub fn trim(&self) {
         lock(&self.inner.page_cache).clear();
         lock(&self.inner.block_cache).clear();
+        lock(&self.inner.prefetch_cache).clear();
         lock(&self.inner.probation).clear();
         lock(&self.inner.handles).clear();
     }
@@ -461,7 +534,7 @@ impl PackageInner {
         map_page_record(&bytes, local_index)
     }
 
-    fn load_page(&self, page_index: u32, expected_kind: PageKind) -> Result<Arc<[u8]>> {
+    fn load_page(&self, page_index: u32, expected_kind: PageKind) -> Result<Arc<Vec<u8>>> {
         if let Some(value) = lock(&self.page_cache).get(&page_index) {
             return Ok(value);
         }
@@ -489,12 +562,22 @@ impl PackageInner {
             "snapshot page",
         )?;
         let decoded = decode_owned(page.codec, ciphertext, page.plain_len as usize)?;
-        let decoded: Arc<[u8]> = Arc::from(decoded);
+        let decoded = Arc::new(decoded);
         lock(&self.page_cache).insert(page_index, Arc::clone(&decoded));
         Ok(decoded)
     }
 
+    #[cfg(test)]
     fn load_block(&self, reference: &BlockRef, access: AccessClass) -> Result<BlockData> {
+        self.load_block_buffered(reference, access, &mut BlockBuffers::default())
+    }
+
+    fn load_block_buffered(
+        &self,
+        reference: &BlockRef,
+        access: AccessClass,
+        buffers: &mut BlockBuffers,
+    ) -> Result<BlockData> {
         let key = BlockKey {
             segment_ordinal: reference.segment_ordinal,
             block_ordinal: reference.segment_block_ordinal,
@@ -504,6 +587,12 @@ impl PackageInner {
         {
             if value.len() != reference.plain_len as usize {
                 return Err(Error::InvalidFormat("cached block length mismatch"));
+            }
+            return Ok(BlockData::Shared(value));
+        }
+        if let Some(value) = lock(&self.prefetch_cache).get(&key) {
+            if value.len() != reference.plain_len as usize {
+                return Err(Error::InvalidFormat("prefetched block length mismatch"));
             }
             return Ok(BlockData::Shared(value));
         }
@@ -520,11 +609,11 @@ impl PackageInner {
             return Err(Error::InvalidFormat("block physical range"));
         }
         let handle = self.open_segment(&segment)?;
-        let mut ciphertext = vec![0_u8; reference.stored_len as usize];
+        let ciphertext = buffers.prepare_ciphertext(reference.stored_len as usize);
         handle
             .file
-            .read_exact_at(reference.physical_offset, &mut ciphertext)?;
-        if blake3::hash(&ciphertext).as_bytes()[..16] != reference.cipher_digest {
+            .read_exact_at(reference.physical_offset, ciphertext)?;
+        if blake3::hash(ciphertext).as_bytes()[..16] != reference.cipher_digest {
             return Err(Error::Authentication("signed block digest"));
         }
         let aad = crypto::block_aad(
@@ -538,10 +627,10 @@ impl PackageInner {
         handle.key.open(
             crypto::nonce(segment.nonce_prefix, reference.segment_block_ordinal),
             &aad,
-            &mut ciphertext,
+            ciphertext,
             "segment block",
         )?;
-        let plaintext = decode_owned(reference.codec, ciphertext, reference.plain_len as usize)?;
+        let plaintext = decode_buffered(reference.codec, buffers, reference.plain_len as usize)?;
 
         let admit = match access {
             AccessClass::Hot => true,
@@ -549,12 +638,39 @@ impl PackageInner {
             AccessClass::Streaming | AccessClass::Transient => false,
         };
         if admit {
-            let plaintext: Arc<[u8]> = Arc::from(plaintext);
+            let plaintext = Arc::new(plaintext);
             lock(&self.block_cache).insert(key, Arc::clone(&plaintext));
             Ok(BlockData::Shared(plaintext))
         } else {
             Ok(BlockData::Owned(plaintext))
         }
+    }
+
+    fn prefetch_block(
+        &self,
+        reference: &BlockRef,
+        access: AccessClass,
+        buffers: &mut BlockBuffers,
+    ) -> Result<()> {
+        if self.budget.prefetch_cache_bytes == 0
+            || reference.plain_len as usize > self.budget.prefetch_cache_bytes
+        {
+            return Ok(());
+        }
+        let key = BlockKey {
+            segment_ordinal: reference.segment_ordinal,
+            block_ordinal: reference.segment_block_ordinal,
+        };
+        if lock(&self.block_cache).get(&key).is_some()
+            || lock(&self.prefetch_cache).get(&key).is_some()
+        {
+            return Ok(());
+        }
+        let plaintext = self.load_block_buffered(reference, access, buffers)?;
+        if lock(&self.block_cache).get(&key).is_none() {
+            lock(&self.prefetch_cache).insert(key, plaintext.into_shared());
+        }
+        Ok(())
     }
 
     fn second_normal_access(&self, key: BlockKey) -> bool {
@@ -655,22 +771,64 @@ impl Asset {
         }
         let mut written = 0_usize;
         let mut logical = offset;
+        let mut buffers = BlockBuffers::default();
         while written < requested {
             let reference = self.reference_for_offset(logical)?;
-            let block = self
-                .package
-                .inner
-                .load_block(&reference, self.record.access)?;
+            let block = self.package.inner.load_block_buffered(
+                &reference,
+                self.record.access,
+                &mut buffers,
+            )?;
             let within = usize::try_from(logical - reference.logical_offset)
                 .map_err(|_| Error::InvalidFormat("block logical offset"))?;
-            let block = block.as_ref();
-            validate_block_coverage(within, block.len())?;
-            let amount = (block.len() - within).min(requested - written);
-            destination[written..written + amount].copy_from_slice(&block[within..within + amount]);
+            let bytes = block.as_ref();
+            validate_block_coverage(within, bytes.len())?;
+            let amount = (bytes.len() - within).min(requested - written);
+            destination[written..written + amount].copy_from_slice(&bytes[within..within + amount]);
             written += amount;
             logical += amount as u64;
+            buffers.recycle(block);
         }
         Ok(written)
+    }
+
+    /// Authenticates and decodes every block intersecting a logical range into
+    /// the package's bounded prefetch cache.
+    ///
+    /// The operation is synchronous so engines can schedule it on their own
+    /// existing task pool without Hakutaku creating threads or requiring an
+    /// async runtime. The configured prefetch budget remains a strict bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid offset, unavailable segment, failed
+    /// authentication, or malformed block coverage.
+    pub fn prefetch_range(&self, offset: u64, len: usize) -> Result<()> {
+        if offset > self.len() {
+            return Err(Error::InvalidRange);
+        }
+        let requested_len = u64::try_from(len).map_err(|_| Error::InvalidRange)?;
+        let requested = usize::try_from((self.len() - offset).min(requested_len))
+            .map_err(|_| Error::InvalidRange)?;
+        if requested == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(requested as u64)
+            .ok_or(Error::InvalidRange)?;
+        let mut logical = offset;
+        let mut buffers = BlockBuffers::default();
+        while logical < end {
+            let reference = self.reference_for_offset(logical)?;
+            self.package
+                .inner
+                .prefetch_block(&reference, self.record.access, &mut buffers)?;
+            logical = reference
+                .logical_offset
+                .checked_add(u64::from(reference.plain_len))
+                .ok_or(Error::InvalidRange)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -680,6 +838,8 @@ impl Asset {
             asset: self.clone(),
             position: 0,
             current_block: None,
+            previous_streaming_block: None,
+            buffers: BlockBuffers::default(),
         }
     }
 
@@ -746,34 +906,56 @@ impl Read for AssetCursor {
                 .map_err(std::io::Error::other)?;
         let mut written = 0;
         while written < requested {
-            let covered = self.current_block.as_ref().is_some_and(|(reference, _)| {
-                let end = reference
-                    .logical_offset
-                    .saturating_add(u64::from(reference.plain_len));
-                self.position >= reference.logical_offset && self.position < end
-            });
+            let covered = self
+                .current_block
+                .as_ref()
+                .is_some_and(|block| block.covers(self.position));
             if !covered {
+                if self
+                    .previous_streaming_block
+                    .as_ref()
+                    .is_some_and(|block| block.covers(self.position))
+                {
+                    std::mem::swap(&mut self.current_block, &mut self.previous_streaming_block);
+                    continue;
+                }
                 let reference = self
                     .asset
                     .reference_for_offset(self.position)
                     .map_err(std::io::Error::other)?;
+                if self.asset.record.access == AccessClass::Streaming {
+                    if let Some(previous) = self.previous_streaming_block.take() {
+                        self.buffers.recycle(previous.data);
+                    }
+                    self.previous_streaming_block = self.current_block.take();
+                } else {
+                    if let Some(previous) = self.previous_streaming_block.take() {
+                        self.buffers.recycle(previous.data);
+                    }
+                    if let Some(current) = self.current_block.take() {
+                        self.buffers.recycle(current.data);
+                    }
+                }
                 let block = self
                     .asset
                     .package
                     .inner
-                    .load_block(&reference, self.asset.record.access)
+                    .load_block_buffered(&reference, self.asset.record.access, &mut self.buffers)
                     .map_err(std::io::Error::other)?;
-                self.current_block = Some((reference, block));
+                self.current_block = Some(CursorBlock {
+                    reference,
+                    data: block,
+                });
             }
-            let (reference, block) = self
+            let block = self
                 .current_block
                 .as_ref()
                 .expect("cursor block loaded above");
-            let block = block.as_ref();
-            let within = usize::try_from(self.position - reference.logical_offset)
+            let bytes = block.data.as_ref();
+            let within = usize::try_from(self.position - block.reference.logical_offset)
                 .map_err(std::io::Error::other)?;
-            let amount = (block.len() - within).min(requested - written);
-            buffer[written..written + amount].copy_from_slice(&block[within..within + amount]);
+            let amount = (bytes.len() - within).min(requested - written);
+            buffer[written..written + amount].copy_from_slice(&bytes[within..within + amount]);
             written += amount;
             self.position += amount as u64;
         }
@@ -817,14 +999,6 @@ impl Seek for AssetCursor {
             ));
         }
         self.position = target;
-        if self.current_block.as_ref().is_some_and(|(reference, _)| {
-            let end = reference
-                .logical_offset
-                .saturating_add(u64::from(reference.plain_len));
-            self.position < reference.logical_offset || self.position >= end
-        }) {
-            self.current_block = None;
-        }
         Ok(self.position)
     }
 }
@@ -937,21 +1111,52 @@ fn decode_owned(codec: Codec, stored: Vec<u8>, expected_len: usize) -> Result<Ve
     }
 }
 
+fn decode_buffered(
+    codec: Codec,
+    buffers: &mut BlockBuffers,
+    expected_len: usize,
+) -> Result<Vec<u8>> {
+    match codec {
+        Codec::Raw => {
+            if buffers.ciphertext.len() != expected_len {
+                return Err(Error::InvalidFormat("RAW plaintext length"));
+            }
+            Ok(buffers.take_raw())
+        }
+        Codec::Zstd => {
+            let stored = std::mem::take(&mut buffers.ciphertext);
+            let result = decompress_zstd_exact_into(
+                &stored,
+                buffers.prepare_plaintext(expected_len),
+                expected_len,
+            );
+            buffers.ciphertext = stored;
+            result?;
+            Ok(buffers.take_plaintext())
+        }
+    }
+}
+
 fn decompress_zstd_exact(stored: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     let mut output = vec![0_u8; expected_len];
+    decompress_zstd_exact_into(stored, &mut output, expected_len)?;
+    Ok(output)
+}
+
+fn decompress_zstd_exact_into(stored: &[u8], output: &mut [u8], expected_len: usize) -> Result<()> {
     let written = DECOMPRESSOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             *slot = Some(zstd::bulk::Decompressor::new()?);
         }
         let decompressor = slot.as_mut().expect("decompressor initialized above");
-        decompressor.decompress_to_buffer(stored, &mut output)
+        decompressor.decompress_to_buffer(stored, output)
     });
     let written = written.map_err(Error::Compression)?;
     if written != expected_len {
         return Err(Error::InvalidFormat("zstd plaintext length"));
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1159,6 +1364,7 @@ mod tests {
                 path_key,
                 page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
                 block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
+                prefetch_cache: Mutex::new(ClockCache::new(budget.prefetch_cache_bytes)),
                 probation: Mutex::new(VecDeque::new()),
                 handles: Mutex::new(HandleCache::new(budget.idle_segment_handles)),
                 budget,
@@ -1204,6 +1410,11 @@ mod tests {
 
     #[test]
     fn decode_helpers_enforce_exact_plaintext_lengths() {
+        let shared = Arc::new(b"shared".to_vec());
+        assert!(Arc::ptr_eq(
+            &BlockData::Shared(Arc::clone(&shared)).into_shared(),
+            &shared
+        ));
         assert_eq!(
             decode_owned(Codec::Raw, b"raw".to_vec(), 3).unwrap(),
             b"raw"
@@ -1218,6 +1429,11 @@ mod tests {
         let compressed = zstd::bulk::compress(b"compressed", 1).unwrap();
         assert!(decode_owned(Codec::Zstd, compressed, 11).is_err());
         assert!(decode_owned(Codec::Zstd, b"not-zstd".to_vec(), 10).is_err());
+        let mut buffers = BlockBuffers {
+            ciphertext: b"raw".to_vec(),
+            ..BlockBuffers::default()
+        };
+        assert!(decode_buffered(Codec::Raw, &mut buffers, 2).is_err());
     }
 
     #[test]
@@ -1234,7 +1450,7 @@ mod tests {
                 segment_ordinal: 0,
                 block_ordinal: 0,
             },
-            Arc::from(&b"bad"[..]),
+            Arc::new(b"bad".to_vec()),
         );
         assert!(
             package
@@ -1243,6 +1459,20 @@ mod tests {
                 .is_err()
         );
         lock(&package.inner.block_cache).clear();
+        lock(&package.inner.prefetch_cache).insert(
+            BlockKey {
+                segment_ordinal: 0,
+                block_ordinal: 0,
+            },
+            Arc::new(b"bad".to_vec()),
+        );
+        assert!(
+            package
+                .inner
+                .load_block(&reference, AccessClass::Transient)
+                .is_err()
+        );
+        lock(&package.inner.prefetch_cache).clear();
 
         let mut invalid = reference;
         invalid.segment_block_ordinal = 1;

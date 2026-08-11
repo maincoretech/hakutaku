@@ -58,8 +58,8 @@ bounded segment stream: 64 MiB for Hot, 256 MiB for Normal, 128 MiB for
 Transient, and up to the configured limit (512 MiB by default) for Streaming.
 These are upper bounds rather than padded target sizes. Deferred content is
 also isolated; required and deferred blocks never share a segment.
-See [`docs/io-performance.md`](docs/io-performance.md) for the local Unity- and
-Unreal-shaped I/O regression baseline.
+See [PERFORMANCE.md](PERFORMANCE.md) for the allocation policy and the local
+Unity- and Unreal-shaped I/O regression baseline.
 
 ## Runtime and update integration
 
@@ -70,6 +70,12 @@ the game supplies storage through the dependency-free `SegmentSource` and
 `PositionedFile` traits. A missing on-demand segment returns
 `Error::SegmentUnavailable(id)`; networking and retry policy stay outside the
 format reader.
+
+Sequential cursors reuse their ciphertext and decompression buffers and keep
+the current and previous Streaming blocks for short decoder seeks. Engines can
+schedule `Asset::prefetch_range` on their existing task pool; its dedicated
+cache is bounded by `ResourceBudget::prefetch_cache_bytes` and creates no
+Hakutaku-owned threads.
 
 This boundary works with desktop files, Android/iOS asset storage, memory maps,
 or a platform download manager without adding an HTTP client or async runtime
@@ -84,8 +90,6 @@ is still running before removing a reported stale `.hakutaku.lock`.
 
 See [FORMAT.md](FORMAT.md) for the normative v1 byte layout, parser limits,
 nonce/AAD rules, and verification chain.
-See [PERFORMANCE.md](PERFORMANCE.md) for the committed benchmark protocol and
-the current read/dedup baseline.
 
 ## Validation
 

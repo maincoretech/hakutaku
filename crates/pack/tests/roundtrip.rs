@@ -10,6 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Scratch(PathBuf);
 
@@ -73,6 +74,91 @@ fn full_incremental_and_unchanged_roundtrip() {
     let unchanged = pack_directory(&options, &identity).unwrap();
     assert!(!unchanged.changed);
     assert_eq!(unchanged.release_sequence, second.release_sequence);
+}
+
+#[test]
+fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir_all(&input).unwrap();
+    let video = pseudo_random_bytes(700_000);
+    std::fs::write(input.join("opening.mp4"), &video).unwrap();
+    let normal = pseudo_random_bytes(700_001);
+    std::fs::write(input.join("normal.bin"), &normal).unwrap();
+
+    let identity = Identity::generate().unwrap();
+    pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+    let directory_package = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::cache_disabled(),
+    )
+    .unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let segments = directory_package
+        .segment_ids()
+        .unwrap()
+        .into_iter()
+        .map(|id| {
+            let bytes = std::fs::read(output.join("data").join(format!("{id}.taku"))).unwrap();
+            (id, Arc::<[u8]>::from(bytes))
+        })
+        .collect();
+    let package = Package::open(
+        Arc::new(MemoryFile(Arc::from(
+            std::fs::read(output.join("game.haku")).unwrap(),
+        ))),
+        Arc::new(CountingSegments {
+            segments,
+            reads: Arc::clone(&reads),
+        }),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget {
+            prefetch_cache_bytes: 256 * 1024,
+            ..ResourceBudget::cache_disabled()
+        },
+    )
+    .unwrap();
+
+    let asset = package.asset("opening.mp4").unwrap();
+    let mut normal_cursor = package.asset("normal.bin").unwrap().cursor();
+    let mut decoded_normal = Vec::new();
+    normal_cursor.read_to_end(&mut decoded_normal).unwrap();
+    assert_eq!(decoded_normal, normal);
+    assert!(asset.prefetch_range(asset.len() + 1, 1).is_err());
+    asset.prefetch_range(asset.len(), 1).unwrap();
+    asset.prefetch_range(0, 0).unwrap();
+    directory_package
+        .asset("opening.mp4")
+        .unwrap()
+        .prefetch_range(0, 1)
+        .unwrap();
+    let mut cursor = asset.cursor();
+    let mut byte = [0_u8];
+    cursor.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], video[0]);
+    cursor.seek(SeekFrom::Start(256 * 1024)).unwrap();
+    cursor.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], video[256 * 1024]);
+    let reads_after_two_blocks = reads.load(Ordering::Relaxed);
+
+    cursor.seek(SeekFrom::Start(0)).unwrap();
+    cursor.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], video[0]);
+    assert_eq!(reads.load(Ordering::Relaxed), reads_after_two_blocks);
+
+    asset.prefetch_range(512 * 1024, 1).unwrap();
+    asset.prefetch_range(512 * 1024, 1).unwrap();
+    let reads_after_prefetch = reads.load(Ordering::Relaxed);
+    let mut prefetched_cursor = asset.cursor();
+    prefetched_cursor.seek(SeekFrom::Start(512 * 1024)).unwrap();
+    prefetched_cursor.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], video[512 * 1024]);
+    assert_eq!(reads.load(Ordering::Relaxed), reads_after_prefetch);
 }
 
 #[test]
@@ -406,6 +492,13 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
         package.asset("script/main.json").unwrap().read().unwrap(),
         std::fs::read(input.join("script/main.json")).unwrap()
     );
+    let mut script_cursor = package.asset("script/main.json").unwrap().cursor();
+    let mut streamed_script = Vec::new();
+    script_cursor.read_to_end(&mut streamed_script).unwrap();
+    assert_eq!(
+        streamed_script,
+        std::fs::read(input.join("script/main.json")).unwrap()
+    );
     assert_eq!(
         package.asset("video/opening.mp4").unwrap().read().unwrap(),
         std::fs::read(input.join("video/opening.mp4")).unwrap()
@@ -489,5 +582,46 @@ impl SegmentSource for MemorySegments {
             .cloned()
             .map(|bytes| Arc::new(MemoryFile(bytes)) as Arc<dyn PositionedFile>)
             .ok_or(CoreError::SegmentUnavailable(id))
+    }
+}
+
+struct CountingSegments {
+    segments: HashMap<SegmentId, Arc<[u8]>>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl SegmentSource for CountingSegments {
+    fn open(&self, id: SegmentId) -> hakutaku_core::Result<Arc<dyn PositionedFile>> {
+        self.segments
+            .get(&id)
+            .cloned()
+            .map(|bytes| {
+                Arc::new(CountingFile {
+                    bytes,
+                    reads: Arc::clone(&self.reads),
+                }) as Arc<dyn PositionedFile>
+            })
+            .ok_or(CoreError::SegmentUnavailable(id))
+    }
+}
+
+struct CountingFile {
+    bytes: Arc<[u8]>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl PositionedFile for CountingFile {
+    fn len(&self) -> hakutaku_core::Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+
+    fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> hakutaku_core::Result<()> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let start = usize::try_from(offset).map_err(|_| CoreError::InvalidRange)?;
+        let end = start
+            .checked_add(destination.len())
+            .ok_or(CoreError::InvalidRange)?;
+        destination.copy_from_slice(self.bytes.get(start..end).ok_or(CoreError::InvalidRange)?);
+        Ok(())
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 struct Entry<K> {
     key: K,
-    value: Arc<[u8]>,
+    value: Arc<Vec<u8>>,
     referenced: bool,
 }
 
@@ -27,14 +27,14 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         }
     }
 
-    pub fn get(&mut self, key: &K) -> Option<Arc<[u8]>> {
+    pub fn get(&mut self, key: &K) -> Option<Arc<Vec<u8>>> {
         let index = *self.index.get(key)?;
         let entry = self.entries.get_mut(index)?.as_mut()?;
         entry.referenced = true;
         Some(Arc::clone(&entry.value))
     }
 
-    pub fn insert(&mut self, key: K, value: Arc<[u8]>) {
+    pub fn insert(&mut self, key: K, value: Arc<Vec<u8>>) {
         if self.budget == 0 || value.len() > self.budget || self.index.contains_key(&key) {
             return;
         }
@@ -89,8 +89,8 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
 mod tests {
     use super::*;
 
-    fn bytes(len: usize, value: u8) -> Arc<[u8]> {
-        vec![value; len].into()
+    fn bytes(len: usize, value: u8) -> Arc<Vec<u8>> {
+        Arc::new(vec![value; len])
     }
 
     #[test]
@@ -101,7 +101,10 @@ mod tests {
 
         assert!(cache.used <= 8);
         assert_eq!(cache.index.len(), 1);
-        assert_eq!(cache.get(&2).as_deref(), Some([2; 6].as_slice()));
+        assert_eq!(
+            cache.get(&2).as_deref().map(Vec::as_slice),
+            Some(&[2; 6][..])
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 const STREAM_BYTES: usize = 32 * 1024 * 1024;
 const RANDOM_REQUESTS: usize = 10_000;
+const SHORT_SEEK_REQUESTS: usize = 10_000;
 const DEDUP_FILE_BYTES: usize = 4 * 1024 * 1024;
 const DEDUP_FILES: usize = 4;
 
@@ -50,6 +51,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let random_elapsed = random_started.elapsed();
 
+    package.trim();
+    let mut cursor = asset.cursor();
+    let mut short_seek_buffer = [0_u8; 4096];
+    cursor.read_exact(&mut short_seek_buffer)?;
+    cursor.seek(SeekFrom::Start(256 * 1024))?;
+    cursor.read_exact(&mut short_seek_buffer)?;
+    let short_seek_started = Instant::now();
+    for request in 0..SHORT_SEEK_REQUESTS {
+        let offset = if request & 1 == 0 { 0 } else { 256 * 1024 };
+        cursor.seek(SeekFrom::Start(offset))?;
+        cursor.read_exact(&mut short_seek_buffer)?;
+        std::hint::black_box(&short_seek_buffer);
+    }
+    let short_seek_elapsed = short_seek_started.elapsed();
+
     println!("Hakutaku runtime benchmark: stream-32m-v1");
     println!("pack_ms={:.3}", milliseconds(pack_elapsed));
     println!("open_ms={:.3}", milliseconds(open_elapsed));
@@ -58,6 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "random_4k_iops={:.0}",
         RANDOM_REQUESTS as f64 / random_elapsed.as_secs_f64()
+    );
+    println!(
+        "short_seek_4k_iops={:.0}",
+        SHORT_SEEK_REQUESTS as f64 / short_seek_elapsed.as_secs_f64()
     );
     println!(
         "blocks={} segment_bytes={}",
