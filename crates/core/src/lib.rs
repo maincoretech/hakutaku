@@ -1,9 +1,14 @@
+#![deny(missing_docs)]
+
 //! Hakutaku's minimal game-runtime reader.
 
 mod cache;
+/// Cryptographic key derivation, authentication, and wire-domain helpers.
 pub mod crypto;
 mod error;
+/// Normative Hakutaku v1 wire-format records and codecs.
 pub mod format;
+/// Random-access file and immutable segment-source abstractions.
 pub mod io;
 mod package;
 

@@ -4,17 +4,34 @@ use std::fmt;
 /// Failures produced by the Hakutaku parser and random-access reader.
 #[derive(Debug)]
 pub enum Error {
+    /// A filesystem or positioned-read operation failed.
     Io(std::io::Error),
+    /// Bytes violate a structural or canonical format invariant.
     InvalidFormat(&'static str),
-    UnsupportedVersion { major: u16, minor: u16 },
+    /// The package uses an unsupported major or minor format version.
+    UnsupportedVersion {
+        /// Encoded major version.
+        major: u16,
+        /// Encoded minor version.
+        minor: u16,
+    },
+    /// An encoded allocation or record count exceeds the reader's hard limit.
     LimitExceeded(&'static str),
+    /// Authenticated encryption failed for the named scope.
     Authentication(&'static str),
+    /// The publisher signature or its key identifier is invalid.
     Signature,
+    /// A segment belongs to another project.
     ProjectMismatch,
+    /// A required immutable segment cannot be opened.
     SegmentUnavailable(SegmentId),
+    /// No asset has the requested canonical path.
     AssetNotFound,
+    /// An asset path is not canonical.
     InvalidPath,
+    /// A requested byte range cannot be represented or lies outside the asset.
     InvalidRange,
+    /// Zstandard decompression failed.
     Compression(std::io::Error),
 }
 
@@ -54,4 +71,54 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Result type returned by Hakutaku runtime operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_error_has_stable_display_and_source_semantics() {
+        let cases = [
+            Error::Io(std::io::ErrorKind::NotFound.into()),
+            Error::InvalidFormat("record"),
+            Error::UnsupportedVersion { major: 2, minor: 3 },
+            Error::LimitExceeded("files"),
+            Error::Authentication("catalog"),
+            Error::Signature,
+            Error::ProjectMismatch,
+            Error::SegmentUnavailable(SegmentId([1; 32])),
+            Error::AssetNotFound,
+            Error::InvalidPath,
+            Error::InvalidRange,
+            Error::Compression(std::io::ErrorKind::InvalidData.into()),
+        ];
+        let expected = [
+            "I/O error:",
+            "invalid Hakutaku format: record",
+            "unsupported Hakutaku format version 2.3",
+            "Hakutaku limit exceeded: files",
+            "authentication failed for catalog",
+            "snapshot publisher signature is invalid",
+            "package belongs to a different project",
+            "segment is unavailable:",
+            "asset was not found",
+            "asset path is not canonical",
+            "asset read range is invalid",
+            "zstd error:",
+        ];
+        for (error, expected) in cases.iter().zip(expected) {
+            assert!(error.to_string().contains(expected));
+        }
+        assert!(std::error::Error::source(&cases[0]).is_some());
+        assert!(std::error::Error::source(&cases[11]).is_some());
+        for error in &cases[1..11] {
+            assert!(std::error::Error::source(error).is_none());
+        }
+        assert!(matches!(
+            Error::from(std::io::Error::from(std::io::ErrorKind::Other)),
+            Error::Io(_)
+        ));
+    }
+}

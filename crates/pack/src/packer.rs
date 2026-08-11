@@ -24,11 +24,17 @@ const COMPRESSION_SAVINGS: usize = 64;
 const DEFAULT_SEGMENT_TARGET: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
+/// Inputs and policy controls for one deterministic package build.
 pub struct PackOptions {
+    /// Directory recursively containing canonical source assets.
     pub input_directory: PathBuf,
+    /// Publisher output directory containing `game.haku` and `data/`.
     pub output_directory: PathBuf,
+    /// Whether unchanged encrypted blocks may be reused from the previous release.
     pub incremental: bool,
+    /// Zstandard compression level used when compression is canonical and beneficial.
     pub compression_level: i32,
+    /// Approximate maximum payload bytes written to one new segment.
     pub segment_target_bytes: u64,
     /// Canonical asset paths or directory prefixes whose segments may be
     /// installed on demand. Required and deferred blocks are never mixed in
@@ -38,6 +44,7 @@ pub struct PackOptions {
 
 impl PackOptions {
     #[must_use]
+    /// Creates options with safe incremental-build defaults.
     pub fn new(input_directory: impl Into<PathBuf>, output_directory: impl Into<PathBuf>) -> Self {
         Self {
             input_directory: input_directory.into(),
@@ -64,29 +71,53 @@ impl PackOptions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Current phase and byte progress reported during a package build.
 pub struct PackProgress {
+    /// Stable human-readable build phase.
     pub phase: &'static str,
+    /// Canonical asset path currently being processed, when applicable.
     pub current_path: Option<String>,
+    /// Input bytes processed during the active phase.
     pub completed_bytes: u64,
+    /// Total input bytes expected during the active phase.
     pub total_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Summary of the immutable release produced by a build.
 pub struct PackReport {
+    /// Whether the canonical source fingerprint differed from the prior release.
     pub changed: bool,
+    /// Monotonic sequence of the resulting snapshot.
     pub release_sequence: u64,
+    /// Number of indexed source files.
     pub file_count: u32,
+    /// Number of content blocks across all files.
     pub block_count: u32,
+    /// Blocks reused byte-for-byte from older immutable segments.
     pub reused_blocks: u32,
+    /// Blocks encrypted into newly created segments.
     pub new_blocks: u32,
+    /// Newly created immutable segment files.
     pub new_segments: u32,
+    /// Complete byte size of newly created segment files.
     pub new_segment_bytes: u64,
 }
 
+/// Builds a package without progress notifications.
+///
+/// # Errors
+///
+/// Returns an error for invalid options, filesystem failures, or cryptographic failures.
 pub fn pack_directory(options: &PackOptions, identity: &Identity) -> Result<PackReport> {
     pack_directory_with_progress(options, identity, |_| {})
 }
 
+/// Builds a package and reports synchronous phase progress to `progress`.
+///
+/// # Errors
+///
+/// Returns an error for invalid options, filesystem failures, or cryptographic failures.
 pub fn pack_directory_with_progress<F>(
     options: &PackOptions,
     identity: &Identity,
@@ -127,13 +158,6 @@ where
     } else {
         None
     };
-    if let Some(old) = &old_package
-        && old.project_id() != identity.project_id()
-    {
-        return Err(Error::InvalidInput(
-            "output contains a snapshot for another publisher identity".into(),
-        ));
-    }
     let reuse_index = load_reuse_index(old_package.as_ref())?;
     let release_sequence = old_package.as_ref().map_or(Ok(1), |package| {
         package
@@ -313,9 +337,7 @@ impl BuildContext<'_> {
             .map_err(|_| Error::InvalidInput("too many blocks".into()))?;
         let path_offset = u32::try_from(self.path_pool.len())
             .map_err(|_| Error::InvalidInput("path pool is too large".into()))?;
-        let path_len = u16::try_from(source.logical_path.len()).map_err(|_| {
-            Error::InvalidInput(format!("path is too long: {}", source.logical_path))
-        })?;
+        let path_len = checked_path_len(&source.logical_path)?;
         self.path_pool
             .extend_from_slice(source.logical_path.as_bytes());
         self.file_paths.push(source.logical_path.clone());
@@ -379,12 +401,7 @@ impl BuildContext<'_> {
                 .checked_add(read as u64)
                 .ok_or_else(|| Error::InvalidInput("file offset overflow".into()))?;
         }
-        if logical_offset != source.len {
-            return Err(Error::InvalidInput(format!(
-                "file changed while packing: {}",
-                source.logical_path
-            )));
-        }
+        validate_source_len(logical_offset, source)?;
         Ok(())
     }
 
@@ -394,12 +411,7 @@ impl BuildContext<'_> {
         availability: Availability,
     ) -> Result<()> {
         let bytes = std::fs::read(&source.host_path)?;
-        if bytes.len() as u64 != source.len {
-            return Err(Error::InvalidInput(format!(
-                "file changed while packing: {}",
-                source.logical_path
-            )));
-        }
+        validate_source_len(bytes.len() as u64, source)?;
         for chunk in fastcdc::v2020::FastCDC::new(&bytes, FASTCDC_MIN, FASTCDC_AVG, FASTCDC_MAX) {
             let end = chunk
                 .offset
@@ -540,9 +552,7 @@ impl BuildContext<'_> {
             .zip(block_refs.iter().copied())
             .map(|(chunk_id, block)| ReuseRecord { chunk_id, block })
             .collect();
-        if block_refs.len() != reuse_records.len() {
-            return Err(Error::InvalidInput("block/reuse record mismatch".into()));
-        }
+        validate_pair_count(block_refs.len(), reuse_records.len())?;
 
         let path_slots =
             build_path_slots(&self.file_paths, &self.file_records, &self.keys.path_key())?;
@@ -600,9 +610,7 @@ impl BuildContext<'_> {
             &aad,
             &mut catalog_ciphertext,
         )?;
-        if catalog_ciphertext.len() as u64 != catalog_stored_len {
-            return Err(Error::InvalidInput("catalog ciphertext length".into()));
-        }
+        validate_catalog_ciphertext_len(catalog_ciphertext.len(), catalog_stored_len)?;
         let zeroed_header = header.encode(true);
         let signature_message =
             crypto::snapshot_signature_message(&zeroed_header, &catalog_ciphertext);
@@ -737,9 +745,7 @@ impl NewSegment {
             &aad,
             &mut encoded,
         )?;
-        let physical_offset = (SEGMENT_HEADER_SIZE as u64)
-            .checked_add(self.payload_len)
-            .ok_or_else(|| Error::InvalidInput("segment offset overflow".into()))?;
+        let physical_offset = segment_physical_offset(self.payload_len)?;
         self.writer
             .as_mut()
             .expect("writer is active")
@@ -988,6 +994,43 @@ fn compress_bytes(
     } else {
         Ok((Codec::Raw, plaintext.to_vec()))
     }
+}
+
+fn checked_path_len(path: &str) -> Result<u16> {
+    u16::try_from(path.len()).map_err(|_| Error::InvalidInput(format!("path is too long: {path}")))
+}
+
+fn validate_source_len(actual: u64, source: &SourceFile) -> Result<()> {
+    if actual == source.len {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "file changed while packing: {}",
+            source.logical_path
+        )))
+    }
+}
+
+fn validate_pair_count(blocks: usize, reuse: usize) -> Result<()> {
+    if blocks == reuse {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput("block/reuse record mismatch".into()))
+    }
+}
+
+fn validate_catalog_ciphertext_len(actual: usize, expected: u64) -> Result<()> {
+    if actual as u64 == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput("catalog ciphertext length".into()))
+    }
+}
+
+fn segment_physical_offset(payload_len: u64) -> Result<u64> {
+    (SEGMENT_HEADER_SIZE as u64)
+        .checked_add(payload_len)
+        .ok_or_else(|| Error::InvalidInput("segment offset overflow".into()))
 }
 
 fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
@@ -1309,6 +1352,7 @@ impl Drop for BuildLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1368,5 +1412,231 @@ mod tests {
         assert!(!output.join("data/.segment-7-0.taku.part").exists());
         assert!(output.join("data/notes.txt").is_file());
         std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn options_availability_and_classification_cover_all_policies() {
+        let root = scratch("options");
+        let input = root.join("input");
+        std::fs::create_dir_all(&input).unwrap();
+        let mut options = PackOptions::new(&input, root.join("output"));
+        options.deferred_prefixes = vec!["dlc".into()];
+        assert_eq!(options.availability("dlc"), Availability::Deferred);
+        assert_eq!(
+            options.availability("dlc/movie.mp4"),
+            Availability::Deferred
+        );
+        assert_eq!(
+            options.availability("dlc2/movie.mp4"),
+            Availability::Required
+        );
+        validate_options(&options).unwrap();
+
+        let source = |path: &str, len| SourceFile {
+            host_path: PathBuf::new(),
+            logical_path: path.into(),
+            len,
+        };
+        assert_eq!(classify(&source("tiny", 0)).2, AccessClass::Hot);
+        assert_eq!(
+            classify(&source("MOVIE.MP4", HOT_FILE_LIMIT + 1)).2,
+            AccessClass::Streaming
+        );
+        assert_eq!(
+            classify(&source("asset.bin", HOT_FILE_LIMIT + 1)).0,
+            LayoutKind::ContentDefined
+        );
+        assert_eq!(
+            classify(&source("asset.bin", CONTENT_DEFINED_LIMIT + 1)).1,
+            BULK_BLOCK as u32
+        );
+
+        let mut invalid = options.clone();
+        invalid.input_directory = root.join("missing");
+        assert!(validate_options(&invalid).is_err());
+        let mut invalid = options.clone();
+        invalid.segment_target_bytes = 1;
+        assert!(validate_options(&invalid).is_err());
+        for level in [-8, 23] {
+            let mut invalid = options.clone();
+            invalid.compression_level = level;
+            assert!(validate_options(&invalid).is_err());
+        }
+        let mut invalid = options;
+        invalid.deferred_prefixes = vec!["/absolute".into()];
+        assert!(validate_options(&invalid).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct ScriptedReader(VecDeque<std::io::Result<Vec<u8>>>);
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front().unwrap_or(Ok(Vec::new()))? {
+                bytes if bytes.is_empty() => Ok(0),
+                bytes => {
+                    let len = bytes.len().min(destination.len());
+                    destination[..len].copy_from_slice(&bytes[..len]);
+                    Ok(len)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_reader_retries_interrupts_and_propagates_other_errors() {
+        let mut reader = ScriptedReader(VecDeque::from([
+            Err(std::io::ErrorKind::Interrupted.into()),
+            Ok(vec![1, 2]),
+            Ok(vec![3, 4]),
+        ]));
+        let mut bytes = [0; 4];
+        assert_eq!(read_chunk(&mut reader, &mut bytes).unwrap(), 4);
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        let mut reader = ScriptedReader(VecDeque::from([Err(
+            std::io::ErrorKind::PermissionDenied.into(),
+        )]));
+        assert!(read_chunk(&mut reader, &mut bytes).is_err());
+        let mut reader = ScriptedReader(VecDeque::new());
+        assert_eq!(read_chunk(&mut reader, &mut bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn filesystem_helpers_sort_hash_commit_clean_and_lock() {
+        let root = scratch("filesystem");
+        let input = root.join("input");
+        let output = root.join("output");
+        let data = output.join("data");
+        std::fs::create_dir_all(input.join("nested")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(input.join("z.bin"), b"z").unwrap();
+        std::fs::write(input.join("nested/a.bin"), b"a").unwrap();
+        let files = collect_files(&input).unwrap();
+        assert_eq!(files[0].logical_path, "nested/a.bin");
+        assert_eq!(
+            hash_file(&input.join("z.bin")).unwrap(),
+            SegmentId(*blake3::hash(b"z").as_bytes())
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(input.join("z.bin"), input.join("link")).unwrap();
+            assert!(collect_files(&input).is_err());
+            std::fs::remove_file(input.join("link")).unwrap();
+        }
+
+        let target = output.join("game.haku");
+        let temporary = target.with_extension(format!("haku.part-{}", std::process::id()));
+        std::fs::write(&temporary, b"snapshot").unwrap();
+        commit_snapshot(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot");
+
+        let active = SegmentId([1; 32]);
+        let stale = SegmentId([2; 32]);
+        std::fs::write(data.join(segment_file_name(active)), b"active").unwrap();
+        std::fs::write(data.join(segment_file_name(stale)), b"stale").unwrap();
+        std::fs::write(data.join("notes.txt"), b"keep").unwrap();
+        std::fs::create_dir(data.join("directory.taku")).unwrap();
+        std::fs::write(data.join("not-a-digest.taku"), b"keep").unwrap();
+        cleanup_unreferenced_segments(&data, &[active]).unwrap();
+        assert!(data.join(segment_file_name(active)).exists());
+        assert!(!data.join(segment_file_name(stale)).exists());
+        assert!(data.join("notes.txt").exists());
+
+        let lock = BuildLock::acquire(&output).unwrap();
+        assert!(BuildLock::acquire(&output).is_err());
+        drop(lock);
+        assert!(BuildLock::acquire(&root.join("missing")).is_err());
+        recover_interrupted_release(&output).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packer_rejects_other_publishers_and_staged_source_changes() {
+        let root = scratch("publisher-mismatch");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let asset_path = input.join("asset.bin");
+        std::fs::write(&asset_path, b"original").unwrap();
+        let first = Identity::generate().unwrap();
+        let options = PackOptions::new(&input, &output);
+        pack_directory(&options, &first).unwrap();
+        assert!(pack_directory(&options, &Identity::generate().unwrap()).is_err());
+
+        let files = collect_files(&input).unwrap();
+        std::fs::write(&asset_path, b"changed!").unwrap();
+        assert!(
+            verify_staged_release(
+                &output.join("game.haku"),
+                &output.join("data"),
+                &files,
+                &first
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_release_has_no_pages_and_snapshot_length_is_exact() {
+        let root = scratch("empty-release");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let identity = Identity::generate().unwrap();
+        pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+        let package = Package::open_directory(
+            output.join("game.haku"),
+            output.join("data"),
+            identity.root_key(),
+            identity.public_key(),
+            ResourceBudget::cache_disabled(),
+        )
+        .unwrap();
+        assert!(package.list_assets().unwrap().is_empty());
+
+        let snapshot = output.join("game.haku");
+        let mut bytes = std::fs::read(&snapshot).unwrap();
+        bytes.push(0);
+        std::fs::write(&snapshot, bytes).unwrap();
+        assert!(
+            Package::open_directory(
+                &snapshot,
+                output.join("data"),
+                identity.root_key(),
+                identity.public_key(),
+                ResourceBudget::cache_disabled(),
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_index_rejects_mismatched_inputs() {
+        assert!(build_path_slots(&["a".into()], &[], &[0; 32]).is_err());
+    }
+
+    #[test]
+    fn packer_invariant_validators_cover_success_and_failure_paths() {
+        assert_eq!(checked_path_len("asset").unwrap(), 5);
+        assert!(checked_path_len(&"a".repeat(u16::MAX as usize + 1)).is_err());
+        let source = SourceFile {
+            host_path: PathBuf::new(),
+            logical_path: "asset".into(),
+            len: 4,
+        };
+        validate_source_len(4, &source).unwrap();
+        assert!(validate_source_len(3, &source).is_err());
+        validate_pair_count(1, 1).unwrap();
+        assert!(validate_pair_count(1, 0).is_err());
+        validate_catalog_ciphertext_len(16, 16).unwrap();
+        assert!(validate_catalog_ciphertext_len(15, 16).is_err());
+        assert_eq!(
+            segment_physical_offset(1).unwrap(),
+            SEGMENT_HEADER_SIZE as u64 + 1
+        );
+        assert!(segment_physical_offset(u64::MAX).is_err());
     }
 }

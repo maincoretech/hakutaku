@@ -371,6 +371,7 @@ fn extracted_content_key_cannot_forge_the_signed_block_commitment() {
         ResourceBudget::cache_disabled(),
     )
     .unwrap();
+    assert!(package.verify_segments().is_err());
     assert!(package.asset("asset.bin").unwrap().read().is_err());
 }
 
@@ -383,10 +384,24 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
         ResourceBudget::default(),
     )
     .unwrap();
+    assert_eq!(package.project_id(), identity.project_id());
+    assert!(package.release_sequence() > 0);
+    assert_ne!(package.source_fingerprint(), [0; 32]);
     package.verify_segments().unwrap();
     assert!(package.contains_asset("empty.txt").unwrap());
     assert!(!package.contains_asset("missing.txt").unwrap());
-    assert_eq!(package.asset("empty.txt").unwrap().read().unwrap(), []);
+    assert!(matches!(
+        package.asset("missing.txt"),
+        Err(CoreError::AssetNotFound)
+    ));
+    let empty = package.asset("empty.txt").unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert_eq!(empty.file_index(), 0);
+    assert_eq!(empty.read().unwrap(), []);
+    assert_eq!(empty.read_at(0, &mut [0; 1]).unwrap(), 0);
+    assert!(empty.read_at(1, &mut [0; 1]).is_err());
+    assert!(empty.cursor().is_empty());
     assert_eq!(
         package.asset("script/main.json").unwrap().read().unwrap(),
         std::fs::read(input.join("script/main.json")).unwrap()
@@ -396,9 +411,21 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
         std::fs::read(input.join("video/opening.mp4")).unwrap()
     );
     let expected_video = std::fs::read(input.join("video/opening.mp4")).unwrap();
-    let mut cursor = package.asset("video/opening.mp4").unwrap().cursor();
+    let video_asset = package.asset("video/opening.mp4").unwrap();
+    assert!(!video_asset.is_empty());
+    let mut cursor = video_asset.cursor();
     assert_eq!(cursor.len(), expected_video.len() as u64);
     assert_eq!(cursor.position(), 0);
+    assert!(cursor.seek(SeekFrom::Current(-1)).is_err());
+    assert_eq!(
+        cursor.seek(SeekFrom::End(-32)).unwrap(),
+        expected_video.len() as u64 - 32
+    );
+    assert_eq!(
+        cursor.seek(SeekFrom::Current(16)).unwrap(),
+        expected_video.len() as u64 - 16
+    );
+    assert_eq!(cursor.seek(SeekFrom::Start(0)).unwrap(), 0);
     assert!(
         cursor
             .seek(SeekFrom::Start(expected_video.len() as u64 + 1))
@@ -415,6 +442,12 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
         actual_video.extend_from_slice(&small[..read]);
     }
     assert_eq!(actual_video, expected_video);
+    let segments = package.segment_ids().unwrap();
+    assert!(!segments.is_empty());
+    assert_eq!(package.segment_record(0).unwrap().id, segments[0]);
+    assert!(package.segment_record(u16::MAX).is_err());
+    assert_eq!(package.list_segments().unwrap().len(), segments.len());
+    package.trim();
 }
 
 fn pseudo_random_bytes(len: usize) -> Vec<u8> {

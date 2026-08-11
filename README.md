@@ -91,5 +91,14 @@ cargo fmt --all --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc -p hakutaku-core -p hakutaku-pack --no-deps
+cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
 cargo bench --workspace
 ```
+
+Both library crates deny missing public API documentation. CI therefore keeps
+public rustdoc coverage at 100%. The canonical wire-format parser is held at
+100% line coverage; the combined runtime and publisher baseline is 97.5% or
+higher. The remaining lines are operating-system and cryptographic-provider
+failure returns that cannot be triggered deterministically without replacing
+the production backends.

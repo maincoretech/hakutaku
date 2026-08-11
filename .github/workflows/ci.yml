@@ -21,6 +21,23 @@ jobs:
       - run: cargo check --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Public API documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p hakutaku-core -p hakutaku-pack --no-deps
+
+  coverage:
+    name: Coverage gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Runtime and publisher line coverage
+        run: cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
+      - name: Wire-format line coverage
+        run: >-
+          cargo llvm-cov -p hakutaku-core -p hakutaku-pack
+          --ignore-filename-regex
+          '(cli|gui)/src/main\.rs$|/(cache|crypto|error|io|package|identity|packer)\.rs$'
+          --fail-under-lines 100
 
   mobile-core:
     name: Core (${{ matrix.platform }})

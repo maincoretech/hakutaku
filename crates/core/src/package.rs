@@ -21,9 +21,13 @@ thread_local! {
 /// Explicit bounds for all rebuildable runtime state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceBudget {
+    /// Maximum decrypted block-map bytes retained in memory.
     pub map_page_cache_bytes: usize,
+    /// Maximum plaintext content-block bytes retained in memory.
     pub plaintext_cache_bytes: usize,
+    /// Maximum idle open segment handles retained for reuse.
     pub idle_segment_handles: usize,
+    /// Maximum one-hit normal blocks tracked before cache admission.
     pub normal_probation_entries: usize,
 }
 
@@ -40,6 +44,7 @@ impl Default for ResourceBudget {
 
 impl ResourceBudget {
     #[must_use]
+    /// Returns conservative cache bounds suitable for memory-constrained devices.
     pub const fn memory_constrained() -> Self {
         Self {
             map_page_cache_bytes: 512 * 1024,
@@ -50,6 +55,7 @@ impl ResourceBudget {
     }
 
     #[must_use]
+    /// Disables every rebuildable cache while preserving correct reads.
     pub const fn cache_disabled() -> Self {
         Self {
             map_page_cache_bytes: 0,
@@ -61,6 +67,7 @@ impl ResourceBudget {
 }
 
 #[derive(Clone)]
+/// Authenticated, random-access view of one immutable release snapshot.
 pub struct Package {
     inner: Arc<PackageInner>,
 }
@@ -139,9 +146,13 @@ struct SegmentHandle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Public metadata for one indexed asset.
 pub struct AssetInfo {
+    /// Canonical package-relative UTF-8 path.
     pub path: String,
+    /// Plaintext asset length in bytes.
     pub len: u64,
+    /// Runtime cache and access hint.
     pub access: AccessClass,
 }
 
@@ -152,18 +163,23 @@ pub struct AssetInfo {
 /// demand. The runtime itself stays transport-agnostic through [`SegmentSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentInfo {
+    /// Content-derived immutable segment identifier.
     pub id: SegmentId,
+    /// Complete segment-file length.
     pub len: u64,
+    /// Installation policy signed into the snapshot.
     pub availability: Availability,
 }
 
 #[derive(Clone)]
+/// Lightweight handle for random or sequential reads from one package asset.
 pub struct Asset {
     package: Package,
     file_index: u32,
     record: FileRecord,
 }
 
+/// [`Read`] and [`Seek`] cursor over an [`Asset`].
 pub struct AssetCursor {
     asset: Asset,
     position: u64,
@@ -185,6 +201,12 @@ impl AsRef<[u8]> for BlockData {
 }
 
 impl Package {
+    /// Opens and authenticates a package through caller-provided random-access backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O failures, invalid signatures, failed authentication,
+    /// resource-limit violations, or any non-canonical snapshot structure.
     pub fn open(
         snapshot: Arc<dyn PositionedFile>,
         source: Arc<dyn SegmentSource>,
@@ -214,34 +236,23 @@ impl Package {
             &mut catalog_ciphertext,
             "snapshot catalog",
         )?;
-        let catalog_plain_len = usize::try_from(header.catalog_plain_len)
-            .map_err(|_| Error::LimitExceeded("catalog plaintext length"))?;
+        // SnapshotHeader::parse bounds this to 64 MiB, which fits every
+        // supported 32-bit and 64-bit target.
+        let catalog_plain_len = header.catalog_plain_len as usize;
         let catalog_bytes = decompress_zstd_exact(&catalog_ciphertext, catalog_plain_len)?;
         let catalog = Catalog::parse(Arc::from(catalog_bytes))?;
-        if catalog
-            .map_page_count()
-            .checked_add(catalog.reuse_page_count())
-            != Some(header.page_count)
-        {
-            return Err(Error::InvalidFormat(
-                "snapshot and catalog page counts differ",
-            ));
-        }
+        validate_page_counts(
+            catalog.map_page_count(),
+            catalog.reuse_page_count(),
+            header.page_count,
+        )?;
         let page_bytes = if header.page_count == 0 {
             0
         } else {
             let last = catalog.page(header.page_count - 1)?;
-            last.relative_offset
-                .checked_add(u64::from(last.stored_len))
-                .ok_or(Error::InvalidFormat("page region length overflow"))?
+            checked_page_region_len(last.relative_offset, last.stored_len)?
         };
-        let expected_snapshot_len = header
-            .page_region_offset
-            .checked_add(page_bytes)
-            .ok_or(Error::InvalidFormat("snapshot length overflow"))?;
-        if snapshot.len()? != expected_snapshot_len {
-            return Err(Error::InvalidFormat("snapshot file length"));
-        }
+        validate_snapshot_len(snapshot.len()?, header.page_region_offset, page_bytes)?;
         let path_key = keys.path_key();
         Ok(Self {
             inner: Arc::new(PackageInner {
@@ -264,6 +275,11 @@ impl Package {
         })
     }
 
+    /// Opens a local `game.haku` snapshot and its sibling segment directory.
+    ///
+    /// # Errors
+    ///
+    /// Propagates filesystem and package-validation failures.
     pub fn open_directory(
         snapshot_path: impl AsRef<Path>,
         segment_directory: impl AsRef<Path>,
@@ -283,20 +299,28 @@ impl Package {
     }
 
     #[must_use]
+    /// Returns the stable project identifier authenticated by this snapshot.
     pub fn project_id(&self) -> ProjectId {
         self.inner.header.project_id
     }
 
     #[must_use]
+    /// Returns the monotonic publisher release sequence.
     pub fn release_sequence(&self) -> u64 {
         self.inner.header.release_sequence
     }
 
     #[must_use]
+    /// Returns the canonical source-tree fingerprint recorded by the packer.
     pub fn source_fingerprint(&self) -> [u8; 32] {
         self.inner.header.source_fingerprint
     }
 
+    /// Resolves a canonical asset path to a read handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AssetNotFound`] when absent, or a validation error for bad paths.
     pub fn asset(&self, path: &str) -> Result<Asset> {
         let Some(file_index) = self.inner.catalog.find_file(path, &self.inner.path_key)? else {
             return Err(Error::AssetNotFound);
@@ -308,6 +332,11 @@ impl Package {
         })
     }
 
+    /// Reports whether a canonical asset path exists without opening segment data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for a non-canonical path or malformed catalog.
     pub fn contains_asset(&self, path: &str) -> Result<bool> {
         Ok(self
             .inner
@@ -316,6 +345,11 @@ impl Package {
             .is_some())
     }
 
+    /// Returns public metadata for every asset in catalog order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validated catalog data cannot be decoded.
     pub fn list_assets(&self) -> Result<Vec<AssetInfo>> {
         let mut assets = Vec::with_capacity(self.inner.catalog.file_count() as usize);
         for index in 0..self.inner.catalog.file_count() {
@@ -350,6 +384,7 @@ impl Package {
             .collect()
     }
 
+    /// Releases all rebuildable plaintext, page, and handle caches.
     pub fn trim(&self) {
         lock(&self.inner.page_cache).clear();
         lock(&self.inner.block_cache).clear();
@@ -357,6 +392,11 @@ impl Package {
         lock(&self.inner.handles).clear();
     }
 
+    /// Streams every segment and verifies its content-derived identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable, unreadable, or corrupted segments.
     pub fn verify_segments(&self) -> Result<()> {
         let mut buffer = vec![0_u8; 1024 * 1024];
         for index in 0..self.inner.catalog.segment_count() {
@@ -389,17 +429,18 @@ impl Package {
             let bytes = self
                 .inner
                 .load_page(first_page + reuse_index, PageKind::Reuse)?;
-            let expected_first = reuse_index
-                .checked_mul(REUSE_PER_PAGE as u32)
-                .ok_or(Error::InvalidFormat("reuse record index overflow"))?;
+            let expected_first = checked_record_index(reuse_index, REUSE_PER_PAGE as u32)?;
             records.extend(parse_reuse_page(&bytes, expected_first)?);
         }
-        if records.len() != self.inner.catalog.total_blocks() as usize {
-            return Err(Error::InvalidFormat("reuse record total"));
-        }
+        validate_record_total(records.len(), self.inner.catalog.total_blocks())?;
         Ok(records)
     }
 
+    /// Returns the complete signed record for a segment ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `ordinal` is outside the segment inventory.
     pub fn segment_record(&self, ordinal: u16) -> Result<SegmentRecord> {
         self.inner.catalog.segment(u32::from(ordinal))
     }
@@ -407,20 +448,16 @@ impl Package {
 
 impl PackageInner {
     fn block_ref(&self, global_index: u32) -> Result<BlockRef> {
-        if global_index >= self.catalog.total_blocks() {
-            return Err(Error::InvalidFormat("global block index"));
-        }
-        let page_index = global_index / BLOCKS_PER_MAP_PAGE as u32;
-        if page_index >= self.catalog.map_page_count() {
-            return Err(Error::InvalidFormat("map page index"));
-        }
+        let page_index = validate_global_block_index(
+            global_index,
+            self.catalog.total_blocks(),
+            self.catalog.map_page_count(),
+        )?;
         let expected_first = page_index * BLOCKS_PER_MAP_PAGE as u32;
         let bytes = self.load_page(page_index, PageKind::BlockMap)?;
         let count = validate_map_page(&bytes, expected_first)?;
         let local_index = (global_index - expected_first) as usize;
-        if local_index >= count {
-            return Err(Error::InvalidFormat("map page local index"));
-        }
+        validate_local_block_index(local_index, count)?;
         map_page_record(&bytes, local_index)
     }
 
@@ -432,16 +469,10 @@ impl PackageInner {
         if page.kind != expected_kind {
             return Err(Error::InvalidFormat("page kind at use site"));
         }
-        let offset = self
-            .header
-            .page_region_offset
-            .checked_add(page.relative_offset)
-            .ok_or(Error::InvalidRange)?;
+        let offset = checked_offset(self.header.page_region_offset, page.relative_offset)?;
         let mut ciphertext = vec![0_u8; page.stored_len as usize];
         self.snapshot.read_exact_at(offset, &mut ciphertext)?;
-        if &blake3::hash(&ciphertext).as_bytes()[..] != page.digest.as_slice() {
-            return Err(Error::Authentication("signed page digest"));
-        }
+        validate_digest(&ciphertext, &page.digest, "signed page digest")?;
         let aad = crypto::page_aad(
             self.header.project_id,
             self.header.release_sequence,
@@ -578,30 +609,41 @@ impl PackageInner {
 
 impl Asset {
     #[must_use]
+    /// Returns the plaintext asset length in bytes.
     pub const fn len(&self) -> u64 {
         self.record.logical_len
     }
 
     #[must_use]
+    /// Reports whether this asset has zero plaintext bytes.
     pub const fn is_empty(&self) -> bool {
         self.record.logical_len == 0
     }
 
     #[must_use]
+    /// Returns this asset's stable catalog index.
     pub const fn file_index(&self) -> u32 {
         self.file_index
     }
 
+    /// Reads and returns the complete plaintext asset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for allocation limits, unavailable segments, or failed validation.
     pub fn read(&self) -> Result<Vec<u8>> {
         let len = usize::try_from(self.len()).map_err(|_| Error::LimitExceeded("asset length"))?;
         let mut result = vec![0_u8; len];
         let read = self.read_at(0, &mut result)?;
-        if read != len {
-            return Err(Error::InvalidFormat("short complete asset read"));
-        }
+        validate_complete_read(read, len)?;
         Ok(result)
     }
 
+    /// Reads up to `destination.len()` bytes from a plaintext logical offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid offset, unavailable segment, or failed authentication.
     pub fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize> {
         if offset > self.len() {
             return Err(Error::InvalidRange);
@@ -622,11 +664,7 @@ impl Asset {
             let within = usize::try_from(logical - reference.logical_offset)
                 .map_err(|_| Error::InvalidFormat("block logical offset"))?;
             let block = block.as_ref();
-            if within >= block.len() {
-                return Err(Error::InvalidFormat(
-                    "block does not cover requested offset",
-                ));
-            }
+            validate_block_coverage(within, block.len())?;
             let amount = (block.len() - within).min(requested - written);
             destination[written..written + amount].copy_from_slice(&block[within..within + amount]);
             written += amount;
@@ -636,6 +674,7 @@ impl Asset {
     }
 
     #[must_use]
+    /// Creates an independent sequential [`Read`] and [`Seek`] cursor.
     pub fn cursor(&self) -> AssetCursor {
         AssetCursor {
             asset: self.clone(),
@@ -726,9 +765,10 @@ impl Read for AssetCursor {
                     .map_err(std::io::Error::other)?;
                 self.current_block = Some((reference, block));
             }
-            let Some((reference, block)) = self.current_block.as_ref() else {
-                return Err(std::io::Error::other("cursor block was not loaded"));
-            };
+            let (reference, block) = self
+                .current_block
+                .as_ref()
+                .expect("cursor block loaded above");
             let block = block.as_ref();
             let within = usize::try_from(self.position - reference.logical_offset)
                 .map_err(std::io::Error::other)?;
@@ -743,16 +783,19 @@ impl Read for AssetCursor {
 
 impl AssetCursor {
     #[must_use]
+    /// Returns the underlying asset length.
     pub const fn len(&self) -> u64 {
         self.asset.len()
     }
 
     #[must_use]
+    /// Reports whether the underlying asset is empty.
     pub const fn is_empty(&self) -> bool {
         self.asset.is_empty()
     }
 
     #[must_use]
+    /// Returns the current logical cursor position.
     pub const fn position(&self) -> u64 {
         self.position
     }
@@ -786,6 +829,96 @@ impl Seek for AssetCursor {
     }
 }
 
+fn validate_page_counts(map: u32, reuse: u32, expected: u32) -> Result<()> {
+    if map.checked_add(reuse) == Some(expected) {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat(
+            "snapshot and catalog page counts differ",
+        ))
+    }
+}
+
+fn checked_page_region_len(relative_offset: u64, stored_len: u32) -> Result<u64> {
+    relative_offset
+        .checked_add(u64::from(stored_len))
+        .ok_or(Error::InvalidFormat("page region length overflow"))
+}
+
+fn validate_snapshot_len(actual: u64, page_offset: u64, page_bytes: u64) -> Result<()> {
+    let expected = page_offset
+        .checked_add(page_bytes)
+        .ok_or(Error::InvalidFormat("snapshot length overflow"))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat("snapshot file length"))
+    }
+}
+
+fn checked_record_index(page: u32, records_per_page: u32) -> Result<u32> {
+    page.checked_mul(records_per_page)
+        .ok_or(Error::InvalidFormat("reuse record index overflow"))
+}
+
+fn validate_record_total(actual: usize, expected: u32) -> Result<()> {
+    if actual == expected as usize {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat("reuse record total"))
+    }
+}
+
+fn validate_global_block_index(global: u32, total: u32, pages: u32) -> Result<u32> {
+    if global >= total {
+        return Err(Error::InvalidFormat("global block index"));
+    }
+    let page = global / BLOCKS_PER_MAP_PAGE as u32;
+    if page >= pages {
+        Err(Error::InvalidFormat("map page index"))
+    } else {
+        Ok(page)
+    }
+}
+
+fn validate_local_block_index(local: usize, count: usize) -> Result<()> {
+    if local < count {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat("map page local index"))
+    }
+}
+
+fn checked_offset(base: u64, relative: u64) -> Result<u64> {
+    base.checked_add(relative).ok_or(Error::InvalidRange)
+}
+
+fn validate_digest(bytes: &[u8], expected: &[u8; 32], scope: &'static str) -> Result<()> {
+    if blake3::hash(bytes).as_bytes() == expected {
+        Ok(())
+    } else {
+        Err(Error::Authentication(scope))
+    }
+}
+
+fn validate_complete_read(actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat("short complete asset read"))
+    }
+}
+
+fn validate_block_coverage(within: usize, block_len: usize) -> Result<()> {
+    if within < block_len {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat(
+            "block does not cover requested offset",
+        ))
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -811,11 +944,7 @@ fn decompress_zstd_exact(stored: &[u8], expected_len: usize) -> Result<Vec<u8>> 
         if slot.is_none() {
             *slot = Some(zstd::bulk::Decompressor::new()?);
         }
-        let Some(decompressor) = slot.as_mut() else {
-            return Err(std::io::Error::other(
-                "zstd decompressor initialization failed",
-            ));
-        };
+        let decompressor = slot.as_mut().expect("decompressor initialized above");
         decompressor.decompress_to_buffer(stored, &mut output)
     });
     let written = written.map_err(Error::Compression)?;
@@ -823,4 +952,418 @@ fn decompress_zstd_exact(stored: &[u8], expected_len: usize) -> Result<Vec<u8>> 
         return Err(Error::InvalidFormat("zstd plaintext length"));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{
+        CatalogData, EMPTY_PATH_SLOT, PageRecord, PathSlot, SegmentId, encode_map_page,
+        encode_reuse_page,
+    };
+
+    struct MemoryFile(Vec<u8>);
+
+    impl PositionedFile for MemoryFile {
+        fn len(&self) -> Result<u64> {
+            Ok(self.0.len() as u64)
+        }
+
+        fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> Result<()> {
+            let start = usize::try_from(offset).map_err(|_| Error::InvalidRange)?;
+            let end = start
+                .checked_add(destination.len())
+                .ok_or(Error::InvalidRange)?;
+            destination.copy_from_slice(self.0.get(start..end).ok_or(Error::InvalidRange)?);
+            Ok(())
+        }
+    }
+
+    struct MemorySegments(HashMap<SegmentId, Arc<[u8]>>);
+
+    impl SegmentSource for MemorySegments {
+        fn open(&self, id: SegmentId) -> Result<Arc<dyn PositionedFile>> {
+            self.0
+                .get(&id)
+                .map(|bytes| Arc::new(MemoryFile(bytes.to_vec())) as Arc<dyn PositionedFile>)
+                .ok_or(Error::SegmentUnavailable(id))
+        }
+    }
+
+    fn package_with_budget(budget: ResourceBudget) -> (Package, BlockRef) {
+        let project_id = ProjectId([1; 16]);
+        let root_key = [2; 32];
+        let keys = ProjectKeys::new(root_key, project_id);
+        let snapshot_salt = [3; 16];
+        let snapshot_nonce = [4; 8];
+        let snapshot_key_bytes = keys.snapshot_key(&snapshot_salt);
+        let snapshot_key = Aes256Key::new(&snapshot_key_bytes).unwrap();
+        let segment_header = SegmentHeader {
+            project_id,
+            segment_uid: [5; 16],
+            salt: [6; 16],
+            nonce_prefix: [7; 8],
+            block_count: 1,
+            payload_len: 20,
+            file_len: SEGMENT_HEADER_SIZE as u64 + 20,
+        };
+        let segment_key = Aes256Key::new(&keys.segment_key(&segment_header)).unwrap();
+        let mut encrypted_block = b"data".to_vec();
+        segment_key
+            .seal(
+                crypto::nonce(segment_header.nonce_prefix, 0),
+                &crypto::block_aad(
+                    project_id,
+                    &segment_header.segment_uid,
+                    0,
+                    Codec::Raw,
+                    20,
+                    4,
+                ),
+                &mut encrypted_block,
+            )
+            .unwrap();
+        let block_digest = blake3::hash(&encrypted_block);
+        let mut cipher_digest = [0; 16];
+        cipher_digest.copy_from_slice(&block_digest.as_bytes()[..16]);
+        let reference = BlockRef {
+            logical_offset: 0,
+            segment_ordinal: 0,
+            segment_block_ordinal: 0,
+            physical_offset: SEGMENT_HEADER_SIZE as u64,
+            stored_len: 20,
+            plain_len: 4,
+            codec: Codec::Raw,
+            cipher_digest,
+        };
+        let reuse = ReuseRecord {
+            chunk_id: *blake3::hash(b"data").as_bytes(),
+            block: reference,
+        };
+        let plain_pages = [
+            (
+                PageKind::BlockMap,
+                encode_map_page(0, &[reference]).unwrap(),
+            ),
+            (PageKind::Reuse, encode_reuse_page(0, &[reuse]).unwrap()),
+        ];
+        let mut page_region = Vec::new();
+        let mut pages = Vec::new();
+        for (index, (kind, plain)) in plain_pages.into_iter().enumerate() {
+            let nonce_ordinal = index as u32 + 1;
+            let relative_offset = page_region.len() as u64;
+            let mut encrypted = plain.clone();
+            let stored_len = plain.len() as u32 + 16;
+            snapshot_key
+                .seal(
+                    crypto::nonce(snapshot_nonce, nonce_ordinal),
+                    &crypto::page_aad(
+                        project_id,
+                        1,
+                        kind,
+                        Codec::Raw,
+                        nonce_ordinal,
+                        stored_len,
+                        plain.len() as u32,
+                    ),
+                    &mut encrypted,
+                )
+                .unwrap();
+            pages.push(PageRecord {
+                kind,
+                codec: Codec::Raw,
+                nonce_ordinal,
+                relative_offset,
+                stored_len,
+                plain_len: plain.len() as u32,
+                digest: *blake3::hash(&encrypted).as_bytes(),
+            });
+            page_region.extend_from_slice(&encrypted);
+        }
+        let segment_id = SegmentId([8; 32]);
+        let segment_record = SegmentRecord {
+            id: segment_id,
+            uid: segment_header.segment_uid,
+            salt: segment_header.salt,
+            nonce_prefix: segment_header.nonce_prefix,
+            file_len: segment_header.file_len,
+            payload_len: segment_header.payload_len,
+            block_count: 1,
+            availability: Availability::Required,
+        };
+        let path_key = keys.path_key();
+        let hash = u64::from_le_bytes(
+            blake3::keyed_hash(&path_key, b"a").as_bytes()[..8]
+                .try_into()
+                .unwrap(),
+        );
+        let mut path_slots = vec![
+            PathSlot {
+                hash: 0,
+                file_index: EMPTY_PATH_SLOT,
+            };
+            2
+        ];
+        path_slots[hash as usize & 1] = PathSlot {
+            hash,
+            file_index: 0,
+        };
+        let catalog = Catalog::parse(Arc::from(
+            CatalogData {
+                segments: vec![segment_record],
+                files: vec![FileRecord {
+                    path_offset: 0,
+                    path_len: 1,
+                    layout: LayoutKind::Fixed,
+                    access: AccessClass::Normal,
+                    logical_len: 4,
+                    first_block: 0,
+                    block_count: 1,
+                    fixed_block_len: 4,
+                }],
+                path_slots,
+                path_pool: b"a".to_vec(),
+                pages,
+                total_blocks: 1,
+                map_page_count: 1,
+                reuse_page_count: 1,
+            }
+            .encode()
+            .unwrap(),
+        ))
+        .unwrap();
+        let mut segment = segment_header.encode().to_vec();
+        segment.extend_from_slice(&encrypted_block);
+        let source = MemorySegments(HashMap::from([(segment_id, Arc::from(segment))]));
+        let header = SnapshotHeader {
+            project_id,
+            release_sequence: 1,
+            catalog_stored_len: 16,
+            catalog_plain_len: 1,
+            page_region_offset: 0,
+            page_count: 2,
+            snapshot_salt,
+            nonce_prefix: snapshot_nonce,
+            signing_key_id: [0; 16],
+            source_fingerprint: [0; 32],
+            signature: [0; crate::format::SIGNATURE_LEN],
+        };
+        let package = Package {
+            inner: Arc::new(PackageInner {
+                snapshot: Arc::new(MemoryFile(page_region)),
+                source: Arc::new(source),
+                header,
+                catalog,
+                keys,
+                snapshot_key,
+                path_key,
+                page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
+                block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
+                probation: Mutex::new(VecDeque::new()),
+                handles: Mutex::new(HandleCache::new(budget.idle_segment_handles)),
+                budget,
+            }),
+        };
+        (package, reference)
+    }
+
+    fn handle() -> Arc<SegmentHandle> {
+        Arc::new(SegmentHandle {
+            file: Arc::new(MemoryFile(Vec::new())),
+            key: Aes256Key::new(&[0; 32]).unwrap(),
+        })
+    }
+
+    #[test]
+    fn handle_cache_obeys_capacity_recency_and_duplicate_rules() {
+        let first = SegmentId([1; 32]);
+        let second = SegmentId([2; 32]);
+        let mut disabled = HandleCache::new(0);
+        disabled.insert(first, handle());
+        assert!(disabled.get(&first).is_none());
+
+        let mut cache = HandleCache::new(1);
+        cache.insert(first, handle());
+        cache.insert(first, handle());
+        assert!(cache.get(&first).is_some());
+        cache.insert(second, handle());
+        assert!(cache.get(&first).is_none());
+        assert!(cache.get(&second).is_some());
+        cache.clear();
+        assert!(cache.values.is_empty());
+
+        cache.values.insert(first, handle());
+        cache.order.clear();
+        cache.insert(second, handle());
+        assert_eq!(cache.values.len(), 2);
+
+        let handle = handle();
+        assert_eq!(handle.file.len().unwrap(), 0);
+        handle.file.read_exact_at(0, &mut []).unwrap();
+    }
+
+    #[test]
+    fn decode_helpers_enforce_exact_plaintext_lengths() {
+        assert_eq!(
+            decode_owned(Codec::Raw, b"raw".to_vec(), 3).unwrap(),
+            b"raw"
+        );
+        assert!(decode_owned(Codec::Raw, b"raw".to_vec(), 2).is_err());
+        let compressed = zstd::bulk::compress(b"compressed", 1).unwrap();
+        assert_eq!(
+            decode_owned(Codec::Zstd, compressed.clone(), 10).unwrap(),
+            b"compressed"
+        );
+        assert!(decode_owned(Codec::Zstd, compressed, 9).is_err());
+        let compressed = zstd::bulk::compress(b"compressed", 1).unwrap();
+        assert!(decode_owned(Codec::Zstd, compressed, 11).is_err());
+        assert!(decode_owned(Codec::Zstd, b"not-zstd".to_vec(), 10).is_err());
+    }
+
+    #[test]
+    fn runtime_defenses_reject_invalid_block_and_segment_metadata() {
+        let (package, reference) = package_with_budget(ResourceBudget::default());
+        assert_eq!(package.asset("a").unwrap().read().unwrap(), b"data");
+        assert_eq!(package.reuse_records().unwrap().len(), 1);
+        assert!(package.inner.block_ref(1).is_err());
+        lock(&package.inner.page_cache).clear();
+        assert!(package.inner.load_page(0, PageKind::Reuse).is_err());
+
+        lock(&package.inner.block_cache).insert(
+            BlockKey {
+                segment_ordinal: 0,
+                block_ordinal: 0,
+            },
+            Arc::from(&b"bad"[..]),
+        );
+        assert!(
+            package
+                .inner
+                .load_block(&reference, AccessClass::Hot)
+                .is_err()
+        );
+        lock(&package.inner.block_cache).clear();
+
+        let mut invalid = reference;
+        invalid.segment_block_ordinal = 1;
+        assert!(
+            package
+                .inner
+                .load_block(&invalid, AccessClass::Transient)
+                .is_err()
+        );
+        let mut invalid = reference;
+        invalid.physical_offset = 0;
+        assert!(
+            package
+                .inner
+                .load_block(&invalid, AccessClass::Transient)
+                .is_err()
+        );
+        let mut invalid = reference;
+        invalid.physical_offset = u64::MAX;
+        assert!(
+            package
+                .inner
+                .load_block(&invalid, AccessClass::Transient)
+                .is_err()
+        );
+
+        assert!(!package.inner.second_normal_access(BlockKey {
+            segment_ordinal: 0,
+            block_ordinal: 7,
+        }));
+        assert!(package.inner.second_normal_access(BlockKey {
+            segment_ordinal: 0,
+            block_ordinal: 7,
+        }));
+
+        let (limited, _) = package_with_budget(ResourceBudget {
+            normal_probation_entries: 1,
+            ..ResourceBudget::cache_disabled()
+        });
+        assert!(!limited.inner.second_normal_access(BlockKey {
+            segment_ordinal: 0,
+            block_ordinal: 1,
+        }));
+        assert!(!limited.inner.second_normal_access(BlockKey {
+            segment_ordinal: 0,
+            block_ordinal: 2,
+        }));
+
+        let record = package.segment_record(0).unwrap();
+        let (mut bad_length, _) = package_with_budget(ResourceBudget::cache_disabled());
+        Arc::get_mut(&mut bad_length.inner).unwrap().source = Arc::new(MemorySegments(
+            HashMap::from([(record.id, Arc::from(vec![0; 1]))]),
+        ));
+        assert!(bad_length.inner.open_segment(&record).is_err());
+
+        let (mut bad_header, _) = package_with_budget(ResourceBudget::cache_disabled());
+        let header = SegmentHeader {
+            project_id: ProjectId([9; 16]),
+            segment_uid: record.uid,
+            salt: record.salt,
+            nonce_prefix: record.nonce_prefix,
+            block_count: record.block_count,
+            payload_len: record.payload_len,
+            file_len: record.file_len,
+        };
+        let mut bytes = header.encode().to_vec();
+        bytes.resize(record.file_len as usize, 0);
+        Arc::get_mut(&mut bad_header.inner).unwrap().source = Arc::new(MemorySegments(
+            HashMap::from([(record.id, Arc::from(bytes))]),
+        ));
+        assert!(bad_header.inner.open_segment(&record).is_err());
+    }
+
+    #[test]
+    fn asset_and_cursor_defenses_cover_invalid_ranges_and_layouts() {
+        let (package, _) = package_with_budget(ResourceBudget::cache_disabled());
+        let asset = package.asset("a").unwrap();
+        assert!(asset.read_at(5, &mut [0; 1]).is_err());
+        let mut empty_blocks = asset.clone();
+        empty_blocks.record.block_count = 0;
+        assert!(empty_blocks.reference_for_offset(0).is_err());
+        let mut too_few_blocks = asset.clone();
+        too_few_blocks.record.logical_len = 8;
+        assert!(too_few_blocks.reference_for_offset(4).is_err());
+        let mut cursor = asset.cursor();
+        let mut byte = [0];
+        assert_eq!(cursor.read(&mut byte).unwrap(), 1);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(cursor.read(&mut byte).unwrap(), 0);
+        assert!(cursor.seek(SeekFrom::Current(-5)).is_err());
+        cursor.position = asset.len() + 1;
+        assert!(cursor.read(&mut byte).is_err());
+    }
+
+    #[test]
+    fn snapshot_and_index_validators_cover_all_failure_modes() {
+        validate_page_counts(1, 1, 2).unwrap();
+        assert!(validate_page_counts(u32::MAX, 1, 0).is_err());
+        assert!(validate_page_counts(1, 1, 1).is_err());
+        assert_eq!(checked_page_region_len(1, 2).unwrap(), 3);
+        assert!(checked_page_region_len(u64::MAX, 1).is_err());
+        validate_snapshot_len(3, 1, 2).unwrap();
+        assert!(validate_snapshot_len(4, 1, 2).is_err());
+        assert!(validate_snapshot_len(0, u64::MAX, 1).is_err());
+        assert_eq!(checked_record_index(2, 3).unwrap(), 6);
+        assert!(checked_record_index(u32::MAX, 2).is_err());
+        validate_record_total(2, 2).unwrap();
+        assert!(validate_record_total(1, 2).is_err());
+        assert_eq!(validate_global_block_index(0, 1, 1).unwrap(), 0);
+        assert!(validate_global_block_index(1, 1, 1).is_err());
+        assert!(validate_global_block_index(0, 1, 0).is_err());
+        validate_local_block_index(0, 1).unwrap();
+        assert!(validate_local_block_index(1, 1).is_err());
+        assert_eq!(checked_offset(1, 2).unwrap(), 3);
+        assert!(checked_offset(u64::MAX, 1).is_err());
+        let digest = *blake3::hash(b"page").as_bytes();
+        validate_digest(b"page", &digest, "page").unwrap();
+        assert!(validate_digest(b"other", &digest, "page").is_err());
+        validate_complete_read(1, 1).unwrap();
+        assert!(validate_complete_read(0, 1).is_err());
+        validate_block_coverage(0, 1).unwrap();
+        assert!(validate_block_coverage(1, 1).is_err());
+    }
 }

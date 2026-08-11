@@ -14,6 +14,7 @@ const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"Hakutaku snapshot signature v1";
 const PAGE_AAD_DOMAIN: &[u8] = b"Hakutaku page aad v1";
 const BLOCK_AAD_DOMAIN: &[u8] = b"Hakutaku block aad v1";
 
+/// Domain-separated keys derived from one project's runtime root key.
 pub struct ProjectKeys {
     master: Zeroizing<[u8; 32]>,
 }
@@ -22,6 +23,11 @@ pub struct ProjectKeys {
 pub struct Aes256Key(LessSafeKey);
 
 impl Aes256Key {
+    /// Prepares an AES-256-GCM key from exactly 256 bits of key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if the crypto provider rejects the key.
     pub fn new(key: &[u8; 32]) -> Result<Self> {
         Ok(Self(LessSafeKey::new(
             UnboundKey::new(&aead::AES_256_GCM, key)
@@ -29,12 +35,22 @@ impl Aes256Key {
         )))
     }
 
+    /// Encrypts `plaintext` in place and appends its authentication tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if sealing fails.
     pub fn seal(&self, nonce: Nonce, aad: &[u8], plaintext: &mut Vec<u8>) -> Result<()> {
         self.0
             .seal_in_place_append_tag(nonce, Aad::from(aad), plaintext)
             .map_err(|_| Error::Authentication("AES-256-GCM seal"))
     }
 
+    /// Authenticates and decrypts a ciphertext-plus-tag buffer in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] with `scope` when verification fails.
     pub fn open(
         &self,
         nonce: Nonce,
@@ -53,6 +69,7 @@ impl Aes256Key {
 }
 
 impl ProjectKeys {
+    /// Derives the project master key and erases the supplied root-key copy.
     #[must_use]
     pub fn new(mut root_key: [u8; 32], project_id: ProjectId) -> Self {
         let mut material = Zeroizing::new([0_u8; 48]);
@@ -63,16 +80,19 @@ impl ProjectKeys {
         Self { master }
     }
 
+    /// Derives the key used to authenticate and decrypt one release snapshot.
     #[must_use]
     pub fn snapshot_key(&self, salt: &[u8; 16]) -> Zeroizing<[u8; 32]> {
         self.derive(b"snapshot", &[salt])
     }
 
+    /// Derives the key used to authenticate and decrypt one immutable segment.
     #[must_use]
     pub fn segment_key(&self, header: &SegmentHeader) -> Zeroizing<[u8; 32]> {
         self.derive(b"segment", &[&header.segment_uid, &header.salt])
     }
 
+    /// Derives the keyed-hash key for canonical asset paths.
     #[must_use]
     pub fn path_key(&self) -> [u8; 32] {
         *self.derive(b"path", &[])
@@ -89,6 +109,7 @@ impl ProjectKeys {
     }
 }
 
+/// Forms the format's 96-bit nonce from a random prefix and unique ordinal.
 pub fn nonce(prefix: [u8; 8], ordinal: u32) -> Nonce {
     let mut bytes = [0_u8; 12];
     bytes[..8].copy_from_slice(&prefix);
@@ -97,6 +118,7 @@ pub fn nonce(prefix: [u8; 8], ordinal: u32) -> Nonce {
 }
 
 #[must_use]
+/// Computes the 128-bit identifier stored for an Ed25519 verification key.
 pub fn signing_key_id(public_key: &[u8; 32]) -> [u8; 16] {
     let mut result = [0_u8; 16];
     result.copy_from_slice(&blake3::hash(public_key).as_bytes()[..16]);
@@ -104,6 +126,7 @@ pub fn signing_key_id(public_key: &[u8; 32]) -> [u8; 16] {
 }
 
 #[must_use]
+/// Builds the domain-separated message signed by a package publisher.
 pub fn snapshot_signature_message(zeroed_header: &[u8], catalog_ciphertext: &[u8]) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(zeroed_header);
@@ -115,6 +138,11 @@ pub fn snapshot_signature_message(zeroed_header: &[u8], catalog_ciphertext: &[u8
     message
 }
 
+/// Verifies both the expected signing-key identifier and snapshot signature.
+///
+/// # Errors
+///
+/// Returns [`Error::Signature`] for a key mismatch or invalid signature.
 pub fn verify_snapshot_signature(
     header: &SnapshotHeader,
     catalog_ciphertext: &[u8],
@@ -131,6 +159,7 @@ pub fn verify_snapshot_signature(
 }
 
 #[must_use]
+/// Encodes authenticated metadata for one encrypted snapshot page.
 pub fn page_aad(
     project_id: ProjectId,
     release_sequence: u64,
@@ -153,6 +182,7 @@ pub fn page_aad(
 }
 
 #[must_use]
+/// Encodes authenticated metadata for one encrypted segment block.
 pub fn block_aad(
     project_id: ProjectId,
     segment_uid: &[u8; 16],
@@ -173,6 +203,7 @@ pub fn block_aad(
 }
 
 #[must_use]
+/// Encodes authenticated metadata for the encrypted catalog.
 pub fn catalog_aad(header: &SnapshotHeader) -> Vec<u8> {
     let mut aad = Vec::with_capacity(24 + 16 + 8 + 8 + 8 + 4);
     aad.extend_from_slice(b"Hakutaku catalog aad v1");
@@ -182,4 +213,34 @@ pub fn catalog_aad(header: &SnapshotHeader) -> Vec<u8> {
     aad.extend_from_slice(&header.catalog_plain_len.to_le_bytes());
     aad.extend_from_slice(&header.page_count.to_le_bytes());
     aad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::SIGNATURE_LEN;
+
+    fn header() -> SnapshotHeader {
+        SnapshotHeader {
+            project_id: ProjectId([1; 16]),
+            release_sequence: 2,
+            catalog_stored_len: 16,
+            catalog_plain_len: 1,
+            page_region_offset: crate::format::SNAPSHOT_HEADER_SIZE as u64 + 16,
+            page_count: 0,
+            snapshot_salt: [3; 16],
+            nonce_prefix: [4; 8],
+            signing_key_id: [5; 16],
+            source_fingerprint: [6; 32],
+            signature: [0; SIGNATURE_LEN],
+        }
+    }
+
+    #[test]
+    fn signature_key_identifier_mismatch_is_rejected_before_verification() {
+        assert!(matches!(
+            verify_snapshot_signature(&header(), &[], &[7; 32]),
+            Err(Error::Signature)
+        ));
+    }
 }

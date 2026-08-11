@@ -1,3 +1,5 @@
+#![deny(missing_docs)]
+
 //! Publisher-side Hakutaku package construction.
 
 mod error;

@@ -13,8 +13,11 @@ const CHECKSUM_SIZE: usize = 32;
 
 /// Runtime-only key material embedded into a packaged executable.
 pub struct RuntimeKeyMaterial {
+    /// First obfuscated share of the project root key.
     pub key_share_a: [u8; 32],
+    /// Second share; XOR with `key_share_a` reconstructs the root key.
     pub key_share_b: [u8; 32],
+    /// Ed25519 verification key for authenticating snapshots.
     pub public_key: [u8; 32],
 }
 
@@ -27,6 +30,11 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Generates a new project identity from the operating system CSPRNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if secure randomness or Ed25519 key generation fails.
     pub fn generate() -> Result<Self> {
         let rng = SystemRandom::new();
         let mut project_id = [0_u8; 16];
@@ -52,6 +60,11 @@ impl Identity {
         })
     }
 
+    /// Loads and validates a publisher-only identity file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O failures, corruption, or inconsistent key material.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = Zeroizing::new(std::fs::read(path)?);
         if bytes.len() < HEADER_SIZE + CHECKSUM_SIZE || bytes.get(..8) != Some(MAGIC) {
@@ -64,9 +77,7 @@ impl Identity {
             return Err(Error::Identity("version"));
         }
         let pkcs8_len = u32::from_le_bytes(bytes[92..96].try_into().expect("fixed slice")) as usize;
-        let payload_len = HEADER_SIZE
-            .checked_add(pkcs8_len)
-            .ok_or(Error::Identity("length overflow"))?;
+        let payload_len = identity_payload_len(pkcs8_len)?;
         if payload_len.checked_add(CHECKSUM_SIZE) != Some(bytes.len()) {
             return Err(Error::Identity("length"));
         }
@@ -88,6 +99,11 @@ impl Identity {
         })
     }
 
+    /// Atomically creates a publisher-only identity file without overwriting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path exists or the durable write cannot complete.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if path.exists() {
@@ -129,44 +145,41 @@ impl Identity {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        if let Err(error) = (|| -> std::io::Result<()> {
+        let publish = (|| -> std::io::Result<()> {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            // A hard link publishes the fully synchronized inode without the
-            // check-then-rename overwrite race. The temporary and final path
-            // are deliberately siblings, so they cannot cross filesystems.
-            std::fs::hard_link(&temporary, path)
-        })() {
-            let _ = std::fs::remove_file(&temporary);
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(Error::InvalidInput(format!(
-                    "identity already exists: {}",
-                    path.display()
-                )));
-            }
-            return Err(Error::Io(error));
-        }
-        let _ = std::fs::remove_file(&temporary);
+            Ok(())
+        })();
+        cleanup_temporary_on_error(publish, &temporary)?;
+        publish_identity(&temporary, path)?;
         sync_parent(path)?;
         Ok(())
     }
 
     #[must_use]
+    /// Returns the stable project identifier.
     pub const fn project_id(&self) -> ProjectId {
         self.project_id
     }
 
     #[must_use]
+    /// Returns the Ed25519 verification key safe to embed in a runtime.
     pub const fn public_key(&self) -> [u8; 32] {
         self.public_key
     }
 
     #[must_use]
+    /// Returns a copy of the project root key for controlled publisher use.
     pub fn root_key(&self) -> [u8; 32] {
         *self.root_key
     }
 
+    /// Splits runtime decryption material into two XOR shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operating system CSPRNG fails.
     pub fn runtime_key_material(&self) -> Result<RuntimeKeyMaterial> {
         let mut key_share_a = [0_u8; 32];
         SystemRandom::new()
@@ -197,6 +210,33 @@ impl Identity {
     }
 }
 
+fn identity_payload_len(pkcs8_len: usize) -> Result<usize> {
+    HEADER_SIZE
+        .checked_add(pkcs8_len)
+        .ok_or(Error::Identity("length overflow"))
+}
+
+fn publish_identity(temporary: &Path, path: &Path) -> Result<()> {
+    // A hard link publishes the fully synchronized inode without the
+    // check-then-rename overwrite race. Both paths are deliberately siblings.
+    let result = std::fs::hard_link(temporary, path);
+    let _ = std::fs::remove_file(temporary);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            Error::InvalidInput(format!("identity already exists: {}", path.display())),
+        ),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn cleanup_temporary_on_error(result: std::io::Result<()>, temporary: &Path) -> Result<()> {
+    result.map_err(|error| {
+        let _ = std::fs::remove_file(temporary);
+        Error::Io(error)
+    })
+}
+
 fn sync_parent(path: &Path) -> Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path
@@ -208,4 +248,90 @@ fn sync_parent(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hakutaku-identity-{}-{name}", std::process::id()))
+    }
+
+    fn rewrite_checksum(bytes: &mut [u8]) {
+        let payload_len = bytes.len() - CHECKSUM_SIZE;
+        let checksum = blake3::hash(&bytes[..payload_len]);
+        bytes[payload_len..].copy_from_slice(checksum.as_bytes());
+    }
+
+    #[test]
+    fn identity_loader_rejects_each_corruption_class() {
+        let root = root("corruption");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("publisher.haki");
+        let identity = Identity::generate().unwrap();
+        identity.save(&path).unwrap();
+        assert_eq!(
+            Identity::load(&path).unwrap().project_id(),
+            identity.project_id()
+        );
+        assert!(identity.save(&path).is_err());
+        let valid = std::fs::read(&path).unwrap();
+
+        for (name, mutate, fix_checksum) in [
+            ("short", 0_usize, false),
+            ("magic", 0, false),
+            ("version", 8, false),
+            ("length", 92, false),
+            ("checksum", 28, false),
+            ("private", HEADER_SIZE, true),
+            ("public", 60, true),
+        ] {
+            let damaged_path = root.join(name);
+            let mut damaged = if name == "short" {
+                vec![0; HEADER_SIZE]
+            } else {
+                valid.clone()
+            };
+            damaged[mutate] ^= 1;
+            if fix_checksum {
+                rewrite_checksum(&mut damaged);
+            }
+            std::fs::write(&damaged_path, damaged).unwrap();
+            assert!(Identity::load(damaged_path).is_err(), "{name}");
+        }
+        assert!(identity_payload_len(usize::MAX).is_err());
+        sync_parent(Path::new("identity-without-parent")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_maps_collisions_and_other_link_failures() {
+        let root = root("publish");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let temporary = root.join("temporary");
+        let target = root.join("target");
+        std::fs::write(&temporary, b"identity").unwrap();
+        std::fs::write(&target, b"winner").unwrap();
+        assert!(matches!(
+            publish_identity(&temporary, &target),
+            Err(Error::InvalidInput(_))
+        ));
+        let temporary = root.join("temporary-2");
+        std::fs::write(&temporary, b"identity").unwrap();
+        assert!(matches!(
+            publish_identity(&temporary, &root.join("missing/target")),
+            Err(Error::Io(_))
+        ));
+        let temporary = root.join("temporary-3");
+        std::fs::write(&temporary, b"identity").unwrap();
+        assert!(
+            cleanup_temporary_on_error(Err(std::io::ErrorKind::WriteZero.into()), &temporary)
+                .is_err()
+        );
+        assert!(!temporary.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

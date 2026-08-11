@@ -39,9 +39,7 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
             return;
         }
         while self.used.saturating_add(value.len()) > self.budget {
-            if !self.evict_one() {
-                return;
-            }
+            self.evict_one();
         }
         let slot = self
             .entries
@@ -67,31 +65,23 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         self.index.clear();
     }
 
-    fn evict_one(&mut self) -> bool {
-        if self.index.is_empty() {
-            return false;
-        }
-        let scan_limit = self.entries.len().saturating_mul(2).max(1);
-        for _ in 0..scan_limit {
-            if self.entries.is_empty() {
-                return false;
-            }
+    fn evict_one(&mut self) {
+        debug_assert!(!self.index.is_empty());
+        loop {
             self.hand %= self.entries.len();
             if let Some(entry) = self.entries[self.hand].as_mut() {
                 if entry.referenced {
                     entry.referenced = false;
                 } else {
-                    if let Some(entry) = self.entries[self.hand].take() {
-                        self.used = self.used.saturating_sub(entry.value.len());
-                        self.index.remove(&entry.key);
-                        self.hand = (self.hand + 1) % self.entries.len();
-                        return true;
-                    }
+                    let entry = self.entries[self.hand].take().expect("occupied clock slot");
+                    self.used = self.used.saturating_sub(entry.value.len());
+                    self.index.remove(&entry.key);
+                    self.hand = (self.hand + 1) % self.entries.len();
+                    return;
                 }
             }
             self.hand = (self.hand + 1) % self.entries.len();
         }
-        false
     }
 }
 
@@ -124,6 +114,17 @@ mod tests {
 
         assert_eq!(cache.used, 0);
         assert!(cache.entries.is_empty());
+        assert!(cache.index.is_empty());
+    }
+
+    #[test]
+    fn clock_scan_skips_vacant_slots_without_losing_live_entries() {
+        let mut cache = ClockCache::new(8);
+        cache.insert(1, bytes(4, 1));
+        cache.entries.insert(0, None);
+        *cache.index.get_mut(&1).unwrap() += 1;
+        cache.hand = 0;
+        cache.evict_one();
         assert!(cache.index.is_empty());
     }
 }
