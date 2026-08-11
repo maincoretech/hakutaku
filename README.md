@@ -9,7 +9,7 @@ The repository is intentionally split by responsibility:
 - `hakutaku-core`: the only crate linked by a game runtime;
 - `hakutaku-pack`: publisher identity, full/incremental bundle construction;
 - `hakutaku`: command-line pack/list/extract/verify tool;
-- `hakutaku-gui`: optional Pack/Browse/Bench developer application.
+- `hakutaku-gui`: optional resource, release, and publisher-identity manager.
 
 The v1 wire format has one cryptographic suite: AES-256-GCM for encrypted
 catalogs, pages, and blocks, Ed25519 for publisher identity, and BLAKE3 for
@@ -40,9 +40,18 @@ cargo run -p hakutaku-cli -- list \
 cargo run -p hakutaku-cli -- segments \
   --package path/to/release --identity publisher.hakutaku-key
 
-# Developer GUI with Pack, Browse, and Bench tabs.
+# Inspect source changes, build and verify releases, and manage identities.
 cargo run -p hakutaku-gui
 ```
+
+The GUI treats the source directory as the single source of truth. Its
+**Resources** view compares every source asset with the authenticated active
+release, including same-size edits, and supports safe import, atomic replace,
+search, and reveal operations. **Release** previews and builds incremental or
+full releases and verifies all immutable segments. **Identity** creates,
+inspects, and backs up publisher identities without exposing private key
+material. Runtime benchmarks remain in the repository's Criterion bench rather
+than the application.
 
 Only `game.haku` and `data/*.taku` belong in the shipped game. The
 `*.hakutaku-key` identity contains both the content root key and publisher

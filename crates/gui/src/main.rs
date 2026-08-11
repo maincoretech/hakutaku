@@ -1,18 +1,22 @@
 use egui::{Align, Color32, RichText};
-use hakutaku_core::{AssetInfo, Package, ResourceBudget};
+use hakutaku_core::{Availability, Package, ResourceBudget, SegmentInfo};
 use hakutaku_pack::{
-    Identity, PackOptions, PackProgress, PackReport, pack_directory_with_progress,
+    AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan,
+    pack_directory_with_progress, plan_directory,
 };
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 fn main() {
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([720.0, 500.0])
+        .with_inner_size([860.0, 620.0])
         .with_resizable(true)
-        .with_min_inner_size([520.0, 360.0]);
+        .with_min_inner_size([680.0, 480.0]);
     let result = eframe::run_native(
         "Hakutaku",
         eframe::NativeOptions {
@@ -63,14 +67,14 @@ fn load_cjk_font() -> Option<Vec<u8>> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
-    Pack,
-    Browse,
-    Bench,
+    Resources,
+    Release,
+    Identity,
 }
 
-struct PackForm {
-    input: String,
-    output: String,
+struct Workspace {
+    assets: String,
+    release: String,
     identity: String,
     incremental: bool,
     compression_level: i32,
@@ -78,11 +82,11 @@ struct PackForm {
     deferred_prefixes: String,
 }
 
-impl Default for PackForm {
+impl Default for Workspace {
     fn default() -> Self {
         Self {
-            input: String::new(),
-            output: String::new(),
+            assets: String::new(),
+            release: String::new(),
             identity: String::new(),
             incremental: true,
             compression_level: 3,
@@ -92,48 +96,86 @@ impl Default for PackForm {
     }
 }
 
-#[derive(Default)]
-struct BrowseForm {
-    release: String,
-    identity: String,
-    search: String,
-    assets: Vec<AssetInfo>,
-    package: Option<Package>,
-    selected: HashSet<usize>,
+impl Workspace {
+    fn ready(&self) -> bool {
+        !self.assets.is_empty() && !self.release.is_empty() && !self.identity.is_empty()
+    }
+
+    fn pack_options(&self) -> Result<PackOptions, String> {
+        let mut options = PackOptions::new(&self.assets, &self.release);
+        options.incremental = self.incremental;
+        options.compression_level = self.compression_level;
+        options.segment_target_bytes = self
+            .segment_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "segment size overflow".to_owned())?;
+        options.deferred_prefixes = self
+            .deferred_prefixes
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok(options)
+    }
 }
 
 #[derive(Default)]
-struct BenchForm {
-    release: String,
-    identity: String,
-    result: Option<BenchResult>,
+struct Resources {
+    search: String,
+    show_unchanged: bool,
+    plan: Option<ReleasePlan>,
+    selected: Option<usize>,
+    pending_replace: Option<Replacement>,
+}
+
+#[derive(Clone)]
+struct Replacement {
+    source: PathBuf,
+    target: PathBuf,
+    logical_path: String,
+}
+
+#[derive(Default)]
+struct Release {
+    last_report: Option<PackReport>,
+    summary: Option<ReleaseSummary>,
 }
 
 #[derive(Clone, Debug)]
-struct BenchResult {
-    open_ms: f64,
-    sequential_mib_s: f64,
-    random_iops: f64,
-    bytes: u64,
-    requests: u64,
+struct ReleaseSummary {
+    sequence: u64,
+    assets: usize,
+    segments: Vec<SegmentInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct IdentityInfo {
+    path: String,
+    project_id: String,
+    public_key: String,
 }
 
 enum Message {
     Progress(PackProgress),
-    Packed(std::result::Result<PackReport, String>),
-    Loaded(std::result::Result<(Package, Vec<AssetInfo>, usize), String>),
-    Extracted(std::result::Result<usize, String>),
-    Benchmarked(std::result::Result<BenchResult, String>),
-    IdentityCreated(std::result::Result<String, String>),
+    Planned(Result<ReleasePlan, String>),
+    Packed(Result<(PackReport, ReleasePlan, ReleaseSummary), String>),
+    Verified(Result<ReleaseSummary, String>),
+    IdentityLoaded(Result<IdentityInfo, String>),
+    IdentityCreated(Result<IdentityInfo, String>),
+    IdentityBackedUp(Result<String, String>),
+    Imported(Result<usize, String>),
+    Replaced(Result<String, String>),
 }
 
 struct App {
     tab: Tab,
     active_tab: Tab,
     tab_fade: f32,
-    pack: PackForm,
-    browse: BrowseForm,
-    bench: BenchForm,
+    workspace: Workspace,
+    resources: Resources,
+    release: Release,
+    identity_info: Option<IdentityInfo>,
     status: String,
     busy: bool,
     progress: Option<PackProgress>,
@@ -147,12 +189,16 @@ impl App {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
-            tab: Tab::Pack,
-            active_tab: Tab::Pack,
-            tab_fade: 1.0,
-            pack: PackForm::default(),
-            browse: BrowseForm::default(),
-            bench: BenchForm::default(),
+            tab: Tab::Resources,
+            active_tab: Tab::Resources,
+            tab_fade: 0.0,
+            workspace: Workspace::default(),
+            resources: Resources {
+                show_unchanged: true,
+                ..Default::default()
+            },
+            release: Release::default(),
+            identity_info: None,
             status: "Ready".into(),
             busy: false,
             progress: None,
@@ -164,6 +210,7 @@ impl App {
     }
 
     fn poll_messages(&mut self) {
+        let mut refresh_resources = false;
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 Message::Progress(progress) => {
@@ -173,179 +220,206 @@ impl App {
                     );
                     self.progress = Some(progress);
                 }
-                Message::Packed(result) => {
-                    self.busy = false;
-                    self.progress = None;
-                    self.status = match result {
-                        Ok(report) if report.changed => format!(
-                            "Release {}: {} reused, {} new blocks, {} new segment(s)",
-                            report.release_sequence,
-                            report.reused_blocks,
-                            report.new_blocks,
-                            report.new_segments
-                        ),
-                        Ok(report) => format!(
-                            "No changes; release {} remains active",
-                            report.release_sequence
-                        ),
-                        Err(error) => format!("Pack failed: {error}"),
-                    };
-                }
-                Message::Loaded(result) => {
-                    self.busy = false;
+                Message::Planned(result) => {
+                    self.finish_work();
                     match result {
-                        Ok((package, assets, deferred_segments)) => {
-                            self.status = format!(
-                                "Loaded release {} with {} assets, {} deferred segment(s)",
-                                package.release_sequence(),
-                                assets.len(),
-                                deferred_segments,
-                            );
-                            self.browse.package = Some(package);
-                            self.browse.assets = assets;
-                            self.browse.selected.clear();
+                        Ok(plan) => {
+                            self.status = plan_status(&plan);
+                            self.resources.plan = Some(plan);
+                            self.resources.selected = None;
                         }
-                        Err(error) => self.status = format!("Load failed: {error}"),
+                        Err(error) => self.status = format!("Scan failed: {error}"),
                     }
                 }
-                Message::Extracted(result) => {
-                    self.busy = false;
-                    self.status = result.map_or_else(
-                        |error| format!("Extract failed: {error}"),
-                        |count| format!("Extracted {count} asset(s)"),
-                    );
-                }
-                Message::Benchmarked(result) => {
-                    self.busy = false;
+                Message::Packed(result) => {
+                    self.finish_work();
                     match result {
-                        Ok(result) => {
-                            self.status = "Benchmark complete".into();
-                            self.bench.result = Some(result);
+                        Ok((report, plan, summary)) => {
+                            self.status = pack_status(&report);
+                            self.release.last_report = Some(report);
+                            self.release.summary = Some(summary);
+                            self.resources.plan = Some(plan);
+                            self.resources.selected = None;
                         }
-                        Err(error) => self.status = format!("Benchmark failed: {error}"),
+                        Err(error) => self.status = format!("Build failed: {error}"),
+                    }
+                }
+                Message::Verified(result) => {
+                    self.finish_work();
+                    match result {
+                        Ok(summary) => {
+                            self.status = format!("Release {} is valid", summary.sequence);
+                            self.release.summary = Some(summary);
+                        }
+                        Err(error) => self.status = format!("Verification failed: {error}"),
+                    }
+                }
+                Message::IdentityLoaded(result) => {
+                    self.finish_work();
+                    match result {
+                        Ok(info) => {
+                            self.status = "Publisher identity loaded".into();
+                            self.identity_info = Some(info);
+                        }
+                        Err(error) => self.status = format!("Identity load failed: {error}"),
                     }
                 }
                 Message::IdentityCreated(result) => {
-                    self.busy = false;
+                    self.finish_work();
+                    match result {
+                        Ok(info) => {
+                            self.workspace.identity.clone_from(&info.path);
+                            self.status = "Publisher identity created; back it up now".into();
+                            self.identity_info = Some(info);
+                        }
+                        Err(error) => self.status = format!("Identity creation failed: {error}"),
+                    }
+                }
+                Message::IdentityBackedUp(result) => {
+                    self.finish_work();
                     self.status = result.map_or_else(
-                        |error| format!("Identity creation failed: {error}"),
-                        |path| {
-                            self.pack.identity.clone_from(&path);
-                            format!("Created publisher identity: {path}")
-                        },
+                        |error| format!("Backup failed: {error}"),
+                        |path| format!("Identity backed up to {path}"),
                     );
+                }
+                Message::Imported(result) => {
+                    self.finish_work();
+                    match result {
+                        Ok(count) => {
+                            self.status = format!("Imported {count} resource(s)");
+                            refresh_resources = true;
+                        }
+                        Err(error) => self.status = format!("Import failed: {error}"),
+                    }
+                }
+                Message::Replaced(result) => {
+                    self.finish_work();
+                    match result {
+                        Ok(path) => {
+                            self.status = format!("Replaced {path}");
+                            refresh_resources = true;
+                        }
+                        Err(error) => self.status = format!("Replace failed: {error}"),
+                    }
                 }
             }
         }
+        if refresh_resources && self.workspace.ready() {
+            self.start_plan();
+        }
+    }
+
+    fn start_plan(&mut self) {
+        let options = match self.workspace.pack_options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let identity_path = self.workspace.identity.clone();
+        let sender = self.sender.clone();
+        self.begin_work("Scanning resources…");
+        std::thread::spawn(move || {
+            let result = Identity::load(identity_path)
+                .map_err(|error| error.to_string())
+                .and_then(|identity| {
+                    plan_directory(&options, &identity).map_err(|error| error.to_string())
+                });
+            let _ = sender.send(Message::Planned(result));
+        });
     }
 
     fn start_pack(&mut self) {
-        let form = PackForm {
-            input: self.pack.input.clone(),
-            output: self.pack.output.clone(),
-            identity: self.pack.identity.clone(),
-            incremental: self.pack.incremental,
-            compression_level: self.pack.compression_level,
-            segment_mib: self.pack.segment_mib,
-            deferred_prefixes: self.pack.deferred_prefixes.clone(),
+        let options = match self.workspace.pack_options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
         };
+        let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
-        self.begin_work("Starting pack…");
+        self.begin_work("Starting release build…");
         std::thread::spawn(move || {
             let result = (|| {
-                let identity = Identity::load(&form.identity).map_err(|error| error.to_string())?;
-                let mut options = PackOptions::new(&form.input, &form.output);
-                options.incremental = form.incremental;
-                options.compression_level = form.compression_level;
-                options.segment_target_bytes = form
-                    .segment_mib
-                    .checked_mul(1024 * 1024)
-                    .ok_or_else(|| "segment size overflow".to_owned())?;
-                options.deferred_prefixes = form
-                    .deferred_prefixes
-                    .split([',', '\n'])
-                    .map(str::trim)
-                    .filter(|prefix| !prefix.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                pack_directory_with_progress(&options, &identity, |progress| {
+                let identity = Identity::load(&identity_path).map_err(|error| error.to_string())?;
+                let report = pack_directory_with_progress(&options, &identity, |progress| {
                     let _ = sender.send(Message::Progress(progress));
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                let plan =
+                    plan_directory(&options, &identity).map_err(|error| error.to_string())?;
+                let summary = inspect_release(&options.output_directory, &identity, false)?;
+                Ok((report, plan, summary))
             })();
             let _ = sender.send(Message::Packed(result));
         });
     }
 
-    fn start_load(&mut self) {
-        let release = self.browse.release.clone();
-        let identity = self.browse.identity.clone();
+    fn start_verify(&mut self) {
+        let release = PathBuf::from(&self.workspace.release);
+        let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
-        self.begin_work("Opening snapshot…");
+        self.begin_work("Verifying release…");
         std::thread::spawn(move || {
-            let result = open_release(&release, &identity).and_then(|package| {
-                let assets = package.list_assets().map_err(|error| error.to_string())?;
-                let deferred_segments = package
-                    .list_segments()
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .filter(|segment| segment.availability == hakutaku_core::Availability::Deferred)
-                    .count();
-                Ok((package, assets, deferred_segments))
-            });
-            let _ = sender.send(Message::Loaded(result));
+            let result = Identity::load(identity_path)
+                .map_err(|error| error.to_string())
+                .and_then(|identity| inspect_release(&release, &identity, true));
+            let _ = sender.send(Message::Verified(result));
         });
     }
 
-    fn start_extract(&mut self, output: PathBuf) {
-        let Some(package) = self.browse.package.clone() else {
-            return;
-        };
-        let paths: Vec<String> = if self.browse.selected.is_empty() {
-            self.browse
-                .assets
-                .iter()
-                .map(|asset| asset.path.clone())
-                .collect()
-        } else {
-            self.browse
-                .selected
-                .iter()
-                .filter_map(|index| self.browse.assets.get(*index))
-                .map(|asset| asset.path.clone())
-                .collect()
-        };
+    fn start_identity_load(&mut self) {
+        let path = PathBuf::from(&self.workspace.identity);
         let sender = self.sender.clone();
-        self.begin_work("Extracting…");
+        self.begin_work("Loading publisher identity…");
         std::thread::spawn(move || {
-            let result =
-                extract_assets(&package, &paths, &output).map_err(|error| error.to_string());
-            let _ = sender.send(Message::Extracted(result));
+            let result = identity_info(&path);
+            let _ = sender.send(Message::IdentityLoaded(result));
         });
     }
 
-    fn start_bench(&mut self) {
-        let release = self.bench.release.clone();
-        let identity = self.bench.identity.clone();
-        let sender = self.sender.clone();
-        self.begin_work("Benchmarking runtime reads…");
-        self.bench.result = None;
-        std::thread::spawn(move || {
-            let result = benchmark_release(&release, &identity);
-            let _ = sender.send(Message::Benchmarked(result));
-        });
-    }
-
-    fn create_identity(&mut self, path: PathBuf) {
+    fn start_identity_create(&mut self, path: PathBuf) {
         let sender = self.sender.clone();
         self.begin_work("Creating publisher identity…");
         std::thread::spawn(move || {
-            let display = path.display().to_string();
             let result = Identity::generate()
                 .and_then(|identity| identity.save(&path))
-                .map(|()| display)
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())
+                .and_then(|()| identity_info(&path));
             let _ = sender.send(Message::IdentityCreated(result));
+        });
+    }
+
+    fn start_identity_backup(&mut self, target: PathBuf) {
+        let source = PathBuf::from(&self.workspace.identity);
+        let sender = self.sender.clone();
+        self.begin_work("Backing up publisher identity…");
+        std::thread::spawn(move || {
+            let display = target.display().to_string();
+            let result = copy_new_file(&source, &target, true).map(|()| display);
+            let _ = sender.send(Message::IdentityBackedUp(result));
+        });
+    }
+
+    fn start_import(&mut self, sources: Vec<PathBuf>) {
+        let directory = PathBuf::from(&self.workspace.assets);
+        let sender = self.sender.clone();
+        self.begin_work("Importing resources…");
+        std::thread::spawn(move || {
+            let result = import_resources(&sources, &directory);
+            let _ = sender.send(Message::Imported(result));
+        });
+    }
+
+    fn start_replace(&mut self, replacement: Replacement) {
+        let sender = self.sender.clone();
+        self.begin_work("Replacing resource…");
+        std::thread::spawn(move || {
+            let result = replace_file(&replacement.source, &replacement.target)
+                .map(|()| replacement.logical_path);
+            let _ = sender.send(Message::Replaced(result));
         });
     }
 
@@ -353,6 +427,11 @@ impl App {
         self.busy = true;
         self.status = status.into();
         self.started = Some(Instant::now());
+    }
+
+    fn finish_work(&mut self) {
+        self.busy = false;
+        self.progress = None;
     }
 }
 
@@ -375,9 +454,9 @@ impl eframe::App for App {
             .min_height(28.0)
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Pack, "  Pack  ");
-                    ui.selectable_value(&mut self.tab, Tab::Browse, " Browse ");
-                    ui.selectable_value(&mut self.tab, Tab::Bench, " Bench ");
+                    ui.selectable_value(&mut self.tab, Tab::Resources, " Resources ");
+                    ui.selectable_value(&mut self.tab, Tab::Release, " Release ");
+                    ui.selectable_value(&mut self.tab, Tab::Identity, " Identity ");
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("About").clicked() {
                             self.show_about = true;
@@ -399,12 +478,306 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(context, |ui| {
             ui.multiply_opacity(self.tab_fade);
             ui.add_enabled_ui(!self.busy, |ui| match self.tab {
-                Tab::Pack => self.pack_page(ui),
-                Tab::Browse => self.browse_page(ui),
-                Tab::Bench => self.bench_page(ui),
+                Tab::Resources => self.resources_page(ui),
+                Tab::Release => self.release_page(ui),
+                Tab::Identity => self.identity_page(ui),
             });
         });
+        self.status_bar(context);
+        self.replace_confirmation(context);
+        self.about_window(context);
+    }
+}
 
+impl App {
+    fn resources_page(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.heading("Game Resources");
+        self.workspace_paths(ui, true);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.workspace.ready(), egui::Button::new("Scan"))
+                .clicked()
+            {
+                self.start_plan();
+            }
+            if ui
+                .add_enabled(
+                    !self.workspace.assets.is_empty(),
+                    egui::Button::new("Import…"),
+                )
+                .clicked()
+                && let Some(files) = rfd::FileDialog::new().pick_files()
+            {
+                self.start_import(files);
+            }
+            let selected = self.selected_source();
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Replace…"))
+                .clicked()
+                && let Some((logical_path, target)) = selected.clone()
+                && let Some(source) = rfd::FileDialog::new().pick_file()
+            {
+                self.resources.pending_replace = Some(Replacement {
+                    source,
+                    target,
+                    logical_path,
+                });
+            }
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Reveal"))
+                .clicked()
+                && let Some((_, path)) = selected
+                && let Err(error) = reveal_file(&path)
+            {
+                self.status = format!("Reveal failed: {error}");
+            }
+            ui.separator();
+            ui.add_sized(
+                [220.0, 22.0],
+                egui::TextEdit::singleline(&mut self.resources.search)
+                    .hint_text("Filter resources…"),
+            );
+            ui.checkbox(&mut self.resources.show_unchanged, "Show unchanged");
+        });
+        ui.separator();
+        let has_plan = self.resources.plan.is_some();
+        fade_visible(ui, "resource-plan", has_plan, |ui| {
+            let Some(plan) = &self.resources.plan else {
+                return;
+            };
+            resource_summary(ui, plan);
+            ui.add_space(4.0);
+            let query = self.resources.search.to_ascii_lowercase();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("resource-list")
+                    .striped(true)
+                    .num_columns(5)
+                    .show(ui, |ui| {
+                        ui.strong("Path");
+                        ui.strong("Size");
+                        ui.strong("Access");
+                        ui.strong("Install");
+                        ui.strong("State");
+                        ui.end_row();
+                        for (index, asset) in plan.assets.iter().enumerate() {
+                            if (!self.resources.show_unchanged
+                                && asset.change == AssetChange::Unchanged)
+                                || (!query.is_empty()
+                                    && !asset.path.to_ascii_lowercase().contains(&query))
+                            {
+                                continue;
+                            }
+                            let selected = self.resources.selected == Some(index);
+                            if ui.selectable_label(selected, &asset.path).clicked() {
+                                self.resources.selected = Some(index);
+                            }
+                            ui.label(format_size(
+                                asset.source_len.or(asset.released_len).unwrap_or(0),
+                            ));
+                            ui.label(format!("{:?}", asset.access));
+                            ui.label(format!("{:?}", asset.availability));
+                            ui.label(change_label(asset.change));
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+        if !has_plan {
+            ui.label("Open an asset directory and scan it to review the next release.");
+        }
+    }
+
+    fn release_page(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.heading("Release Management");
+        self.workspace_paths(ui, true);
+        ui.horizontal(|ui| {
+            ui.label("Options:");
+            ui.checkbox(&mut self.workspace.incremental, "Reuse current release");
+            ui.separator();
+            ui.label("zstd");
+            ui.add(egui::DragValue::new(&mut self.workspace.compression_level).range(-7..=22));
+            ui.separator();
+            ui.label("Segment MiB");
+            ui.add(egui::DragValue::new(&mut self.workspace.segment_mib).range(1..=4096));
+        });
+        ui.horizontal(|ui| {
+            let ready = self.workspace.ready();
+            if ui
+                .add_enabled(ready, egui::Button::new("Preview"))
+                .clicked()
+            {
+                self.start_plan();
+            }
+            if ui
+                .add_enabled(ready, egui::Button::new("Build Release"))
+                .clicked()
+            {
+                self.start_pack();
+            }
+            let can_verify =
+                !self.workspace.release.is_empty() && !self.workspace.identity.is_empty();
+            if ui
+                .add_enabled(can_verify, egui::Button::new("Verify Release"))
+                .clicked()
+            {
+                self.start_verify();
+            }
+        });
+        ui.separator();
+        fade_visible(ui, "release-preview", self.resources.plan.is_some(), |ui| {
+            let Some(plan) = &self.resources.plan else {
+                return;
+            };
+            ui.heading("Build Preview");
+            resource_summary(ui, plan);
+        });
+        fade_visible(
+            ui,
+            "release-report",
+            self.release.last_report.is_some(),
+            |ui| {
+                let Some(report) = &self.release.last_report else {
+                    return;
+                };
+                ui.add_space(8.0);
+                ui.heading("Last Build");
+                egui::Grid::new("build-report")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        metric(ui, "Release", report.release_sequence.to_string());
+                        metric(ui, "Files", report.file_count.to_string());
+                        metric(ui, "Reused blocks", report.reused_blocks.to_string());
+                        metric(ui, "New blocks", report.new_blocks.to_string());
+                        metric(ui, "New segments", report.new_segments.to_string());
+                        metric(ui, "Written", format_size(report.new_segment_bytes));
+                    });
+            },
+        );
+        fade_visible(
+            ui,
+            "release-summary",
+            self.release.summary.is_some(),
+            |ui| {
+                let Some(summary) = &self.release.summary else {
+                    return;
+                };
+                ui.add_space(8.0);
+                ui.heading("Active Release");
+                release_summary(ui, summary);
+            },
+        );
+    }
+
+    fn identity_page(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.heading("Publisher Identity");
+        path_row(
+            ui,
+            "Identity:",
+            &mut self.workspace.identity,
+            PathPicker::Identity,
+            22.0,
+        );
+        ui.small(
+            RichText::new("Contains the signing key and content root key. Never ship it.")
+                .color(Color32::from_rgb(215, 178, 120)),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.workspace.identity.is_empty(),
+                    egui::Button::new("Inspect"),
+                )
+                .clicked()
+            {
+                self.start_identity_load();
+            }
+            if ui.button("Create New…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("publisher.hakutaku-key")
+                    .save_file()
+            {
+                self.start_identity_create(path);
+            }
+            if ui
+                .add_enabled(
+                    !self.workspace.identity.is_empty(),
+                    egui::Button::new("Backup…"),
+                )
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("publisher.hakutaku-key")
+                    .save_file()
+            {
+                self.start_identity_backup(path);
+            }
+        });
+        ui.separator();
+        fade_visible(ui, "identity-info", self.identity_info.is_some(), |ui| {
+            let Some(info) = &self.identity_info else {
+                return;
+            };
+            egui::Grid::new("identity-info-grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    metric(ui, "File", info.path.clone());
+                    metric(ui, "Project ID", info.project_id.clone());
+                    metric(ui, "Public key", info.public_key.clone());
+                });
+            ui.add_space(8.0);
+            ui.label("Keep at least one offline backup. Losing this file breaks future updates.");
+        });
+    }
+
+    fn workspace_paths(&mut self, ui: &mut egui::Ui, deferred: bool) {
+        path_row(
+            ui,
+            "Assets:",
+            &mut self.workspace.assets,
+            PathPicker::Directory,
+            22.0,
+        );
+        path_row(
+            ui,
+            "Release:",
+            &mut self.workspace.release,
+            PathPicker::Directory,
+            22.0,
+        );
+        path_row(
+            ui,
+            "Identity:",
+            &mut self.workspace.identity,
+            PathPicker::Identity,
+            22.0,
+        );
+        if deferred {
+            ui.horizontal(|ui| {
+                ui.label("Deferred:");
+                ui.add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::TextEdit::singleline(&mut self.workspace.deferred_prefixes)
+                        .hint_text("optional directory prefixes, comma-separated"),
+                );
+            });
+        }
+    }
+
+    fn selected_source(&self) -> Option<(String, PathBuf)> {
+        let asset = self
+            .resources
+            .selected
+            .and_then(|index| self.resources.plan.as_ref()?.assets.get(index))?;
+        asset.source_len?;
+        Some((
+            asset.path.clone(),
+            Path::new(&self.workspace.assets).join(&asset.path),
+        ))
+    }
+
+    fn status_bar(&self, context: &egui::Context) {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::side_top_panel(&context.style())
@@ -413,43 +786,6 @@ impl eframe::App for App {
             .min_height(32.0)
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.scope(|ui| {
-                        ui.multiply_opacity(self.tab_fade);
-                        match self.tab {
-                            Tab::Pack => {
-                                let ready = !self.pack.input.is_empty()
-                                    && !self.pack.output.is_empty()
-                                    && !self.pack.identity.is_empty();
-                                if ui
-                                    .add_enabled(ready && !self.busy, egui::Button::new("Pack"))
-                                    .clicked()
-                                {
-                                    self.start_pack();
-                                }
-                            }
-                            Tab::Browse => {
-                                let ready = !self.browse.release.is_empty()
-                                    && !self.browse.identity.is_empty();
-                                if ui
-                                    .add_enabled(ready && !self.busy, egui::Button::new("Load"))
-                                    .clicked()
-                                {
-                                    self.start_load();
-                                }
-                            }
-                            Tab::Bench => {
-                                let ready = !self.bench.release.is_empty()
-                                    && !self.bench.identity.is_empty();
-                                if ui
-                                    .add_enabled(ready && !self.busy, egui::Button::new("Run"))
-                                    .clicked()
-                                {
-                                    self.start_bench();
-                                }
-                            }
-                        }
-                    });
-                    ui.separator();
                     if self.busy
                         && let Some(progress) = &self.progress
                         && progress.total_bytes > 0
@@ -458,208 +794,70 @@ impl eframe::App for App {
                             progress.completed_bytes as f32 / progress.total_bytes as f32;
                         ui.add(
                             egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                                .desired_width(ui.available_width())
+                                .desired_width(ui.available_width() - 60.0)
                                 .text(format!("{:.0}%", fraction * 100.0)),
                         );
                     } else {
                         ui.label(&self.status);
-                        if let Some(started) = self.started.filter(|_| self.busy) {
+                    }
+                    if self.busy
+                        && let Some(started) = self.started
+                    {
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             ui.label(format!("{:.1}s", started.elapsed().as_secs_f64()));
-                        }
+                        });
                     }
                 });
             });
+    }
 
-        let mut show_about = self.show_about;
+    fn replace_confirmation(&mut self, context: &egui::Context) {
+        let Some(replacement) = self.resources.pending_replace.clone() else {
+            return;
+        };
+        egui::Window::new("Replace Resource")
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(format!("Replace {}?", replacement.logical_path));
+                ui.label("The existing source file will be replaced atomically.");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.resources.pending_replace = None;
+                    }
+                    if ui.button("Replace").clicked() {
+                        self.resources.pending_replace = None;
+                        self.start_replace(replacement);
+                    }
+                });
+            });
+    }
+
+    fn about_window(&mut self, context: &egui::Context) {
+        let mut show = self.show_about;
+        let mut close_clicked = false;
         egui::Window::new("About Hakutaku")
-            .open(&mut show_about)
+            .title_bar(false)
+            .open(&mut show)
             .resizable(false)
             .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(context, |ui| {
                 ui.heading("Hakutaku");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Authenticated random-access resources for offline games");
+                ui.label("Authenticated resource and release management for offline games");
                 ui.hyperlink("https://github.com/maincoretech/hakutaku");
                 ui.add_space(8.0);
                 ui.label("AES-256-GCM · Ed25519 · BLAKE3 · zstd");
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close_clicked = true;
+                }
             });
-        self.show_about = show_about;
-    }
-}
-
-impl App {
-    fn pack_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.heading("Pack Release");
-        let row_height = 22.0;
-        path_row(
-            ui,
-            "Assets:",
-            &mut self.pack.input,
-            PathPicker::Directory,
-            row_height,
-        );
-        path_row(
-            ui,
-            "Release:",
-            &mut self.pack.output,
-            PathPicker::Directory,
-            row_height,
-        );
-        ui.horizontal(|ui| {
-            ui.label("Identity:");
-            let width = (ui.available_width() - 72.0).max(60.0);
-            ui.add_sized(
-                [width, row_height],
-                egui::TextEdit::singleline(&mut self.pack.identity)
-                    .hint_text("publisher.hakutaku-key"),
-            );
-            if ui.add(row_button("…", row_height)).clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Hakutaku Identity", &["hakutaku-key"])
-                    .pick_file()
-            {
-                self.pack.identity = path.display().to_string();
-            }
-            if ui.add(row_button("New", row_height)).clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_file_name("publisher.hakutaku-key")
-                    .save_file()
-            {
-                self.create_identity(path);
-            }
-        });
-        ui.small(
-            RichText::new("The identity contains the signing key and must never be shipped.")
-                .color(Color32::from_rgb(215, 178, 120)),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Deferred:");
-            ui.add_sized(
-                [ui.available_width(), row_height],
-                egui::TextEdit::singleline(&mut self.pack.deferred_prefixes)
-                    .hint_text("optional prefixes, comma-separated"),
-            );
-        });
-        ui.small("Deferred prefixes are isolated into on-demand segments.");
-        ui.horizontal(|ui| {
-            ui.label("Options:");
-            ui.checkbox(&mut self.pack.incremental, "Reuse current release");
-            ui.separator();
-            ui.label("zstd");
-            ui.add(egui::DragValue::new(&mut self.pack.compression_level).range(-7..=22));
-            ui.separator();
-            ui.label("Segment MiB");
-            ui.add(egui::DragValue::new(&mut self.pack.segment_mib).range(1..=4096));
-        });
-    }
-
-    fn browse_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        ui.heading("Browse Release");
-        let row_height = 22.0;
-        path_row(
-            ui,
-            "Release:",
-            &mut self.browse.release,
-            PathPicker::Directory,
-            row_height,
-        );
-        path_row(
-            ui,
-            "Identity:",
-            &mut self.browse.identity,
-            PathPicker::Identity,
-            row_height,
-        );
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [240.0, row_height],
-                egui::TextEdit::singleline(&mut self.browse.search).hint_text("Filter assets…"),
-            );
-            let label = if self.browse.selected.is_empty() {
-                "Extract All".to_owned()
-            } else {
-                format!("Extract Selected ({})", self.browse.selected.len())
-            };
-            if ui
-                .add_enabled(self.browse.package.is_some(), egui::Button::new(label))
-                .clicked()
-                && let Some(directory) = rfd::FileDialog::new().pick_folder()
-            {
-                self.start_extract(directory);
-            }
-        });
-        ui.separator();
-        let query = self.browse.search.to_ascii_lowercase();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("asset-list")
-                .striped(true)
-                .num_columns(3)
-                .show(ui, |ui| {
-                    ui.strong("Path");
-                    ui.strong("Size");
-                    ui.strong("Class");
-                    ui.end_row();
-                    for (index, asset) in self.browse.assets.iter().enumerate() {
-                        if !query.is_empty() && !asset.path.to_ascii_lowercase().contains(&query) {
-                            continue;
-                        }
-                        let selected = self.browse.selected.contains(&index);
-                        if ui.selectable_label(selected, &asset.path).clicked() {
-                            if selected {
-                                self.browse.selected.remove(&index);
-                            } else {
-                                self.browse.selected.insert(index);
-                            }
-                        }
-                        ui.label(format_size(asset.len));
-                        ui.label(format!("{:?}", asset.access));
-                        ui.end_row();
-                    }
-                });
-        });
-    }
-
-    fn bench_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.heading("Runtime Benchmark");
-        let row_height = 22.0;
-        path_row(
-            ui,
-            "Release:",
-            &mut self.bench.release,
-            PathPicker::Directory,
-            row_height,
-        );
-        path_row(
-            ui,
-            "Identity:",
-            &mut self.bench.identity,
-            PathPicker::Identity,
-            row_height,
-        );
-        ui.label("Authenticated reads through the same core used by the engine.");
-        if let Some(result) = &self.bench.result {
-            ui.add_space(16.0);
-            egui::Grid::new("bench-result")
-                .striped(true)
-                .show(ui, |ui| {
-                    metric(ui, "Open + signature", format!("{:.2} ms", result.open_ms));
-                    metric(
-                        ui,
-                        "Sequential read",
-                        format!("{:.1} MiB/s", result.sequential_mib_s),
-                    );
-                    metric(
-                        ui,
-                        "Random 4 KiB",
-                        format!("{:.0} IOPS", result.random_iops),
-                    );
-                    metric(ui, "Bytes read", format_size(result.bytes));
-                    metric(ui, "Random requests", result.requests.to_string());
-                });
+        if close_clicked {
+            show = false;
         }
+        self.show_about = show;
     }
 }
 
@@ -667,10 +865,6 @@ impl App {
 enum PathPicker {
     Directory,
     Identity,
-}
-
-fn row_button(text: impl Into<egui::WidgetText>, height: f32) -> egui::Button<'static> {
-    egui::Button::new(text).min_size(egui::vec2(0.0, height))
 }
 
 fn path_row(
@@ -684,7 +878,10 @@ fn path_row(
         ui.label(label);
         let width = (ui.available_width() - 34.0).max(60.0);
         ui.add_sized([width, row_height], egui::TextEdit::singleline(value));
-        if ui.add(row_button("…", row_height)).clicked() {
+        if ui
+            .add(egui::Button::new("…").min_size(egui::vec2(0.0, row_height)))
+            .clicked()
+        {
             let path = match picker {
                 PathPicker::Directory => rfd::FileDialog::new().pick_folder(),
                 PathPicker::Identity => rfd::FileDialog::new()
@@ -698,101 +895,306 @@ fn path_row(
     });
 }
 
+fn fade_visible(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    visible: bool,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    let opacity = ui.ctx().animate_bool(egui::Id::new(("fade", id)), visible);
+    if visible || opacity > 0.0 {
+        if opacity < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        ui.scope(|ui| {
+            ui.multiply_opacity(opacity);
+            contents(ui);
+        });
+    }
+}
+
+fn resource_summary(ui: &mut egui::Ui, plan: &ReleasePlan) {
+    let count = |state| {
+        plan.assets
+            .iter()
+            .filter(|asset| asset.change == state)
+            .count()
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!(
+            "{} source files",
+            plan.assets.len() - count(AssetChange::Removed)
+        ));
+        ui.separator();
+        ui.label(format_size(plan.source_bytes));
+        ui.separator();
+        ui.label(format!(
+            "{} added · {} modified · {} removed · {} unchanged",
+            count(AssetChange::Added),
+            count(AssetChange::Modified),
+            count(AssetChange::Removed),
+            count(AssetChange::Unchanged)
+        ));
+        ui.separator();
+        ui.label(format!(
+            "{} changed source",
+            format_size(plan.changed_source_bytes)
+        ));
+        if let Some(sequence) = plan.previous_release {
+            ui.separator();
+            ui.label(format!("compared with release {sequence}"));
+        }
+    });
+}
+
+fn release_summary(ui: &mut egui::Ui, summary: &ReleaseSummary) {
+    let required = summary
+        .segments
+        .iter()
+        .filter(|segment| segment.availability == Availability::Required);
+    let required_count = required.clone().count();
+    let required_bytes = required.map(|segment| segment.len).sum();
+    let deferred = summary
+        .segments
+        .iter()
+        .filter(|segment| segment.availability == Availability::Deferred);
+    let deferred_count = deferred.clone().count();
+    let deferred_bytes = deferred.map(|segment| segment.len).sum();
+    egui::Grid::new("release-summary")
+        .striped(true)
+        .show(ui, |ui| {
+            metric(ui, "Release", summary.sequence.to_string());
+            metric(ui, "Assets", summary.assets.to_string());
+            metric(
+                ui,
+                "Required",
+                format!(
+                    "{required_count} segment(s), {}",
+                    format_size(required_bytes)
+                ),
+            );
+            metric(
+                ui,
+                "Deferred",
+                format!(
+                    "{deferred_count} segment(s), {}",
+                    format_size(deferred_bytes)
+                ),
+            );
+        });
+}
+
 fn metric(ui: &mut egui::Ui, label: &str, value: String) {
     ui.label(label);
     ui.strong(value);
     ui.end_row();
 }
 
-fn open_release(release: &str, identity_path: &str) -> Result<Package, String> {
-    let identity = Identity::load(identity_path).map_err(|error| error.to_string())?;
-    Package::open_directory(
-        Path::new(release).join("game.haku"),
-        Path::new(release).join("data"),
+fn change_label(change: AssetChange) -> &'static str {
+    match change {
+        AssetChange::Added => "Added",
+        AssetChange::Modified => "Modified",
+        AssetChange::Unchanged => "Unchanged",
+        AssetChange::Removed => "Removed",
+    }
+}
+
+fn plan_status(plan: &ReleasePlan) -> String {
+    let source_files = plan
+        .assets
+        .iter()
+        .filter(|asset| asset.change != AssetChange::Removed)
+        .count();
+    let changed = plan
+        .assets
+        .iter()
+        .filter(|asset| asset.change != AssetChange::Unchanged)
+        .count();
+    format!("Scanned {source_files} source files; {changed} change(s)")
+}
+
+fn pack_status(report: &PackReport) -> String {
+    if report.changed {
+        format!(
+            "Release {} built: {} reused, {} new blocks, {} new segment(s)",
+            report.release_sequence, report.reused_blocks, report.new_blocks, report.new_segments
+        )
+    } else {
+        format!(
+            "No changes; release {} remains active",
+            report.release_sequence
+        )
+    }
+}
+
+fn inspect_release(
+    release: &Path,
+    identity: &Identity,
+    verify: bool,
+) -> Result<ReleaseSummary, String> {
+    let package = Package::open_directory(
+        release.join("game.haku"),
+        release.join("data"),
         identity.root_key(),
         identity.public_key(),
-        ResourceBudget::default(),
+        ResourceBudget::memory_constrained(),
     )
-    .map_err(|error| error.to_string())
-}
-
-fn extract_assets(package: &Package, paths: &[String], output: &Path) -> Result<usize, String> {
-    for path in paths {
-        let target = output.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut source = package
-            .asset(path)
-            .map_err(|error| error.to_string())?
-            .cursor();
-        let mut destination = std::fs::File::create(target).map_err(|error| error.to_string())?;
-        std::io::copy(&mut source, &mut destination).map_err(|error| error.to_string())?;
-    }
-    Ok(paths.len())
-}
-
-fn benchmark_release(release: &str, identity_path: &str) -> Result<BenchResult, String> {
-    let opened = Instant::now();
-    let package = open_release(release, identity_path)?;
-    let open_ms = opened.elapsed().as_secs_f64() * 1000.0;
-    let assets = package.list_assets().map_err(|error| error.to_string())?;
-
-    package.trim();
-    let sequential_start = Instant::now();
-    let mut bytes = 0_u64;
-    let mut buffer = vec![0_u8; 256 * 1024];
-    for info in &assets {
-        let mut source = package
-            .asset(&info.path)
-            .map_err(|error| error.to_string())?
-            .cursor();
-        loop {
-            let read =
-                std::io::Read::read(&mut source, &mut buffer).map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            bytes = bytes.saturating_add(read as u64);
-        }
-    }
-    let sequential_seconds = sequential_start.elapsed().as_secs_f64().max(f64::EPSILON);
-    let sequential_mib_s = bytes as f64 / (1024.0 * 1024.0) / sequential_seconds;
-
-    package.trim();
-    let non_empty: Vec<_> = assets.iter().filter(|asset| asset.len > 0).collect();
-    let requests = if non_empty.is_empty() { 0 } else { 2_000 };
-    let mut buffer = [0_u8; 4096];
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    let random_start = Instant::now();
-    for request in 0..requests {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let info = non_empty[(state as usize) % non_empty.len()];
-        let readable = info.len.min(buffer.len() as u64);
-        let maximum_offset = info.len - readable;
-        let offset = if maximum_offset == 0 {
-            0
-        } else {
-            state % (maximum_offset + 1)
-        };
+    .map_err(|error| error.to_string())?;
+    if verify {
         package
-            .asset(&info.path)
-            .and_then(|asset| asset.read_at(offset, &mut buffer[..readable as usize]))
+            .verify_segments()
             .map_err(|error| error.to_string())?;
-        if request % 32 == 0 {
-            package.trim();
-        }
     }
-    let random_seconds = random_start.elapsed().as_secs_f64().max(f64::EPSILON);
-    Ok(BenchResult {
-        open_ms,
-        sequential_mib_s,
-        random_iops: requests as f64 / random_seconds,
-        bytes,
-        requests,
+    Ok(ReleaseSummary {
+        sequence: package.release_sequence(),
+        assets: package
+            .list_assets()
+            .map_err(|error| error.to_string())?
+            .len(),
+        segments: package.list_segments().map_err(|error| error.to_string())?,
     })
+}
+
+fn identity_info(path: &Path) -> Result<IdentityInfo, String> {
+    let identity = Identity::load(path).map_err(|error| error.to_string())?;
+    Ok(IdentityInfo {
+        path: path.display().to_string(),
+        project_id: encode_hex(&identity.project_id().0),
+        public_key: encode_hex(&identity.public_key()),
+    })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn import_resources(sources: &[PathBuf], directory: &Path) -> Result<usize, String> {
+    if !directory.is_dir() {
+        return Err(format!(
+            "asset directory does not exist: {}",
+            directory.display()
+        ));
+    }
+    let mut targets = Vec::with_capacity(sources.len());
+    let mut names = HashSet::with_capacity(sources.len());
+    for source in sources {
+        if !source.is_file() {
+            return Err(format!("not a regular file: {}", source.display()));
+        }
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("file has no name: {}", source.display()))?;
+        if !names.insert(name.to_owned()) {
+            return Err(format!("duplicate file name: {}", name.to_string_lossy()));
+        }
+        let target = directory.join(name);
+        if target.exists() {
+            return Err(format!("resource already exists: {}", target.display()));
+        }
+        targets.push((source, target));
+    }
+    let mut imported = Vec::with_capacity(targets.len());
+    for (source, target) in targets {
+        if let Err(error) = copy_new_file(source, &target, false) {
+            for path in imported {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        imported.push(target);
+    }
+    Ok(sources.len())
+}
+
+fn copy_new_file(source: &Path, target: &Path, private: bool) -> Result<(), String> {
+    let mut source = File::open(source).map_err(|error| error.to_string())?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if private { 0o600 } else { 0o666 });
+    }
+    let mut target_file = options.open(target).map_err(|error| error.to_string())?;
+    let result = (|| {
+        std::io::copy(&mut source, &mut target_file).map_err(|error| error.to_string())?;
+        target_file.flush().map_err(|error| error.to_string())?;
+        target_file.sync_all().map_err(|error| error.to_string())
+    })();
+    drop(target_file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(target);
+    }
+    result
+}
+
+fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("resource has no parent: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| format!("resource has no file name: {}", target.display()))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.hakutaku-part-{}", std::process::id()));
+    let backup = parent.join(format!(".{name}.hakutaku-backup-{}", std::process::id()));
+    let permissions = target
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .permissions();
+    copy_new_file(source, &temporary, false)?;
+    if let Err(error) = std::fs::set_permissions(&temporary, permissions) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if let Err(error) = std::fs::rename(target, &backup) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if let Err(error) = std::fs::rename(&temporary, target) {
+        let restore = std::fs::rename(&backup, target);
+        let _ = std::fs::remove_file(&temporary);
+        return match restore {
+            Ok(()) => Err(error.to_string()),
+            Err(restore_error) => Err(format!(
+                "{error}; restoring {} also failed: {restore_error}",
+                target.display()
+            )),
+        };
+    }
+    std::fs::remove_file(backup).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn reveal_file(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn format_size(bytes: u64) -> String {
@@ -807,5 +1209,61 @@ fn format_size(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hakutaku-gui-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn resource_import_never_overwrites_and_replace_is_atomic() {
+        let root = scratch("resources");
+        let source = root.join("source");
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&assets).unwrap();
+        let first = source.join("first.bin");
+        let replacement = source.join("replacement.bin");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&replacement, b"replacement").unwrap();
+
+        assert_eq!(
+            import_resources(std::slice::from_ref(&first), &assets).unwrap(),
+            1
+        );
+        assert!(import_resources(std::slice::from_ref(&first), &assets).is_err());
+        let target = assets.join("first.bin");
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        replace_file(&replacement, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(std::fs::read_dir(&assets).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_identity_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("private");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.key");
+        let backup = root.join("backup.key");
+        std::fs::write(&source, b"secret").unwrap();
+        copy_new_file(&source, &backup, true).unwrap();
+        assert_eq!(
+            backup.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

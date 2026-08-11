@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Developer GUI for packing and inspecting Hakutaku game packages"
+description = "Resource and release manager for Hakutaku game packages"
 
 [[bin]]
 name = "hakutaku-gui"
