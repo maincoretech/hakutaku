@@ -848,21 +848,23 @@ impl App {
         let mut close_clicked = false;
         egui::Window::new("About Hakutaku")
             .title_bar(false)
-            .open(&mut show)
-            .resizable(false)
             .collapsible(false)
+            .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(260.0)
+            .default_height(0.0)
+            .open(&mut show)
             .show(context, |ui| {
-                ui.heading("Hakutaku");
+                ui.label("Hakutaku");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Authenticated resource and release management for offline games");
                 ui.hyperlink("https://github.com/maincoretech/hakutaku");
-                ui.add_space(8.0);
-                ui.label("AES-256-GCM · Ed25519 · BLAKE3 · zstd");
-                ui.add_space(8.0);
-                if ui.button("Close").clicked() {
-                    close_clicked = true;
-                }
+                ui.label("Authenticated resource and release manager for offline games");
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                });
             });
         if close_clicked {
             show = false;
