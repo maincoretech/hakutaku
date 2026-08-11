@@ -11,8 +11,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MASTER_CONTEXT: &str = "Hakutaku project master v1";
 const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"Hakutaku snapshot signature v1";
+const CATALOG_AAD_DOMAIN: &[u8] = b"Hakutaku catalog aad v1";
 const PAGE_AAD_DOMAIN: &[u8] = b"Hakutaku page aad v1";
 const BLOCK_AAD_DOMAIN: &[u8] = b"Hakutaku block aad v1";
+const CATALOG_AAD_LEN: usize = CATALOG_AAD_DOMAIN.len() + 16 + 8 + 8 + 8 + 4;
+const PAGE_AAD_LEN: usize = PAGE_AAD_DOMAIN.len() + 16 + 8 + 1 + 1 + 4 + 4 + 4;
+const BLOCK_AAD_LEN: usize = BLOCK_AAD_DOMAIN.len() + 16 + 16 + 4 + 1 + 4 + 4;
 
 /// Domain-separated keys derived from one project's runtime root key.
 pub struct ProjectKeys {
@@ -168,17 +172,17 @@ pub fn page_aad(
     nonce_ordinal: u32,
     stored_len: u32,
     plain_len: u32,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(PAGE_AAD_DOMAIN.len() + 16 + 8 + 1 + 1 + 4 + 4 + 4);
-    aad.extend_from_slice(PAGE_AAD_DOMAIN);
-    aad.extend_from_slice(&project_id.0);
-    aad.extend_from_slice(&release_sequence.to_le_bytes());
-    aad.push(kind as u8);
-    aad.push(codec as u8);
-    aad.extend_from_slice(&nonce_ordinal.to_le_bytes());
-    aad.extend_from_slice(&stored_len.to_le_bytes());
-    aad.extend_from_slice(&plain_len.to_le_bytes());
-    aad
+) -> [u8; PAGE_AAD_LEN] {
+    encode_aad([
+        PAGE_AAD_DOMAIN,
+        &project_id.0,
+        &release_sequence.to_le_bytes(),
+        &[kind as u8],
+        &[codec as u8],
+        &nonce_ordinal.to_le_bytes(),
+        &stored_len.to_le_bytes(),
+        &plain_len.to_le_bytes(),
+    ])
 }
 
 #[must_use]
@@ -190,29 +194,41 @@ pub fn block_aad(
     codec: Codec,
     stored_len: u32,
     plain_len: u32,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(BLOCK_AAD_DOMAIN.len() + 16 + 16 + 4 + 1 + 4 + 4);
-    aad.extend_from_slice(BLOCK_AAD_DOMAIN);
-    aad.extend_from_slice(&project_id.0);
-    aad.extend_from_slice(segment_uid);
-    aad.extend_from_slice(&block_ordinal.to_le_bytes());
-    aad.push(codec as u8);
-    aad.extend_from_slice(&stored_len.to_le_bytes());
-    aad.extend_from_slice(&plain_len.to_le_bytes());
-    aad
+) -> [u8; BLOCK_AAD_LEN] {
+    encode_aad([
+        BLOCK_AAD_DOMAIN,
+        &project_id.0,
+        segment_uid,
+        &block_ordinal.to_le_bytes(),
+        &[codec as u8],
+        &stored_len.to_le_bytes(),
+        &plain_len.to_le_bytes(),
+    ])
 }
 
 #[must_use]
 /// Encodes authenticated metadata for the encrypted catalog.
-pub fn catalog_aad(header: &SnapshotHeader) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(24 + 16 + 8 + 8 + 8 + 4);
-    aad.extend_from_slice(b"Hakutaku catalog aad v1");
-    aad.extend_from_slice(&header.project_id.0);
-    aad.extend_from_slice(&header.release_sequence.to_le_bytes());
-    aad.extend_from_slice(&header.catalog_stored_len.to_le_bytes());
-    aad.extend_from_slice(&header.catalog_plain_len.to_le_bytes());
-    aad.extend_from_slice(&header.page_count.to_le_bytes());
-    aad
+pub fn catalog_aad(header: &SnapshotHeader) -> [u8; CATALOG_AAD_LEN] {
+    encode_aad([
+        CATALOG_AAD_DOMAIN,
+        &header.project_id.0,
+        &header.release_sequence.to_le_bytes(),
+        &header.catalog_stored_len.to_le_bytes(),
+        &header.catalog_plain_len.to_le_bytes(),
+        &header.page_count.to_le_bytes(),
+    ])
+}
+
+fn encode_aad<const N: usize, const P: usize>(parts: [&[u8]; P]) -> [u8; N] {
+    let mut encoded = [0_u8; N];
+    let mut offset = 0;
+    for part in parts {
+        let end = offset + part.len();
+        encoded[offset..end].copy_from_slice(part);
+        offset = end;
+    }
+    debug_assert_eq!(offset, N);
+    encoded
 }
 
 #[cfg(test)]
@@ -242,5 +258,34 @@ mod tests {
             verify_snapshot_signature(&header(), &[], &[7; 32]),
             Err(Error::Signature)
         ));
+    }
+
+    #[test]
+    fn authenticated_metadata_has_canonical_fixed_width_encoding() {
+        let header = header();
+        let catalog = catalog_aad(&header);
+        let page = page_aad(
+            header.project_id,
+            2,
+            PageKind::BlockMap,
+            Codec::Zstd,
+            3,
+            5,
+            7,
+        );
+        let block = block_aad(header.project_id, &[8; 16], 9, Codec::Raw, 11, 13);
+
+        assert_eq!(catalog.len(), CATALOG_AAD_LEN);
+        assert!(catalog.starts_with(CATALOG_AAD_DOMAIN));
+        assert_eq!(
+            &catalog[catalog.len() - 4..],
+            &header.page_count.to_le_bytes()
+        );
+        assert_eq!(page.len(), PAGE_AAD_LEN);
+        assert!(page.starts_with(PAGE_AAD_DOMAIN));
+        assert_eq!(&page[page.len() - 4..], &7_u32.to_le_bytes());
+        assert_eq!(block.len(), BLOCK_AAD_LEN);
+        assert!(block.starts_with(BLOCK_AAD_DOMAIN));
+        assert_eq!(&block[block.len() - 4..], &13_u32.to_le_bytes());
     }
 }

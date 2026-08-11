@@ -191,7 +191,7 @@ pub struct AssetCursor {
     position: u64,
     current_block: Option<CursorBlock>,
     previous_streaming_block: Option<CursorBlock>,
-    buffers: BlockBuffers,
+    reader: BlockReader,
 }
 
 struct CursorBlock {
@@ -210,12 +210,18 @@ impl CursorBlock {
 }
 
 #[derive(Default)]
-struct BlockBuffers {
+struct BlockReader {
     ciphertext: Vec<u8>,
     plaintext: Vec<u8>,
+    segment: Option<ReaderSegment>,
 }
 
-impl BlockBuffers {
+struct ReaderSegment {
+    ordinal: u16,
+    handle: Arc<SegmentHandle>,
+}
+
+impl BlockReader {
     fn prepare_ciphertext(&mut self, len: usize) -> &mut Vec<u8> {
         if self.ciphertext.capacity() < len && self.plaintext.capacity() >= len {
             std::mem::swap(&mut self.ciphertext, &mut self.plaintext);
@@ -245,6 +251,25 @@ impl BlockBuffers {
         if bytes.capacity() > self.plaintext.capacity() {
             self.plaintext = bytes;
         }
+    }
+
+    fn segment_handle(
+        &mut self,
+        package: &PackageInner,
+        ordinal: u16,
+        record: &SegmentRecord,
+    ) -> Result<Arc<SegmentHandle>> {
+        if let Some(segment) = &self.segment
+            && segment.ordinal == ordinal
+        {
+            return Ok(Arc::clone(&segment.handle));
+        }
+        let handle = package.open_segment(record)?;
+        self.segment = Some(ReaderSegment {
+            ordinal,
+            handle: Arc::clone(&handle),
+        });
+        Ok(handle)
     }
 }
 
@@ -569,14 +594,14 @@ impl PackageInner {
 
     #[cfg(test)]
     fn load_block(&self, reference: &BlockRef, access: AccessClass) -> Result<BlockData> {
-        self.load_block_buffered(reference, access, &mut BlockBuffers::default())
+        self.load_block_buffered(reference, access, &mut BlockReader::default())
     }
 
     fn load_block_buffered(
         &self,
         reference: &BlockRef,
         access: AccessClass,
-        buffers: &mut BlockBuffers,
+        reader: &mut BlockReader,
     ) -> Result<BlockData> {
         let key = BlockKey {
             segment_ordinal: reference.segment_ordinal,
@@ -608,8 +633,8 @@ impl PackageInner {
         if reference.physical_offset < SEGMENT_HEADER_SIZE as u64 || stored_end > segment.file_len {
             return Err(Error::InvalidFormat("block physical range"));
         }
-        let handle = self.open_segment(&segment)?;
-        let ciphertext = buffers.prepare_ciphertext(reference.stored_len as usize);
+        let handle = reader.segment_handle(self, reference.segment_ordinal, &segment)?;
+        let ciphertext = reader.prepare_ciphertext(reference.stored_len as usize);
         handle
             .file
             .read_exact_at(reference.physical_offset, ciphertext)?;
@@ -630,7 +655,7 @@ impl PackageInner {
             ciphertext,
             "segment block",
         )?;
-        let plaintext = decode_buffered(reference.codec, buffers, reference.plain_len as usize)?;
+        let plaintext = decode_buffered(reference.codec, reader, reference.plain_len as usize)?;
 
         let admit = match access {
             AccessClass::Hot => true,
@@ -650,7 +675,7 @@ impl PackageInner {
         &self,
         reference: &BlockRef,
         access: AccessClass,
-        buffers: &mut BlockBuffers,
+        reader: &mut BlockReader,
     ) -> Result<()> {
         if self.budget.prefetch_cache_bytes == 0
             || reference.plain_len as usize > self.budget.prefetch_cache_bytes
@@ -666,7 +691,7 @@ impl PackageInner {
         {
             return Ok(());
         }
-        let plaintext = self.load_block_buffered(reference, access, buffers)?;
+        let plaintext = self.load_block_buffered(reference, access, reader)?;
         if lock(&self.block_cache).get(&key).is_none() {
             lock(&self.prefetch_cache).insert(key, plaintext.into_shared());
         }
@@ -771,13 +796,13 @@ impl Asset {
         }
         let mut written = 0_usize;
         let mut logical = offset;
-        let mut buffers = BlockBuffers::default();
+        let mut reader = BlockReader::default();
         while written < requested {
             let reference = self.reference_for_offset(logical)?;
             let block = self.package.inner.load_block_buffered(
                 &reference,
                 self.record.access,
-                &mut buffers,
+                &mut reader,
             )?;
             let within = usize::try_from(logical - reference.logical_offset)
                 .map_err(|_| Error::InvalidFormat("block logical offset"))?;
@@ -787,7 +812,7 @@ impl Asset {
             destination[written..written + amount].copy_from_slice(&bytes[within..within + amount]);
             written += amount;
             logical += amount as u64;
-            buffers.recycle(block);
+            reader.recycle(block);
         }
         Ok(written)
     }
@@ -817,12 +842,12 @@ impl Asset {
             .checked_add(requested as u64)
             .ok_or(Error::InvalidRange)?;
         let mut logical = offset;
-        let mut buffers = BlockBuffers::default();
+        let mut reader = BlockReader::default();
         while logical < end {
             let reference = self.reference_for_offset(logical)?;
             self.package
                 .inner
-                .prefetch_block(&reference, self.record.access, &mut buffers)?;
+                .prefetch_block(&reference, self.record.access, &mut reader)?;
             logical = reference
                 .logical_offset
                 .checked_add(u64::from(reference.plain_len))
@@ -839,7 +864,7 @@ impl Asset {
             position: 0,
             current_block: None,
             previous_streaming_block: None,
-            buffers: BlockBuffers::default(),
+            reader: BlockReader::default(),
         }
     }
 
@@ -925,22 +950,22 @@ impl Read for AssetCursor {
                     .map_err(std::io::Error::other)?;
                 if self.asset.record.access == AccessClass::Streaming {
                     if let Some(previous) = self.previous_streaming_block.take() {
-                        self.buffers.recycle(previous.data);
+                        self.reader.recycle(previous.data);
                     }
                     self.previous_streaming_block = self.current_block.take();
                 } else {
                     if let Some(previous) = self.previous_streaming_block.take() {
-                        self.buffers.recycle(previous.data);
+                        self.reader.recycle(previous.data);
                     }
                     if let Some(current) = self.current_block.take() {
-                        self.buffers.recycle(current.data);
+                        self.reader.recycle(current.data);
                     }
                 }
                 let block = self
                     .asset
                     .package
                     .inner
-                    .load_block_buffered(&reference, self.asset.record.access, &mut self.buffers)
+                    .load_block_buffered(&reference, self.asset.record.access, &mut self.reader)
                     .map_err(std::io::Error::other)?;
                 self.current_block = Some(CursorBlock {
                     reference,
@@ -1111,28 +1136,24 @@ fn decode_owned(codec: Codec, stored: Vec<u8>, expected_len: usize) -> Result<Ve
     }
 }
 
-fn decode_buffered(
-    codec: Codec,
-    buffers: &mut BlockBuffers,
-    expected_len: usize,
-) -> Result<Vec<u8>> {
+fn decode_buffered(codec: Codec, reader: &mut BlockReader, expected_len: usize) -> Result<Vec<u8>> {
     match codec {
         Codec::Raw => {
-            if buffers.ciphertext.len() != expected_len {
+            if reader.ciphertext.len() != expected_len {
                 return Err(Error::InvalidFormat("RAW plaintext length"));
             }
-            Ok(buffers.take_raw())
+            Ok(reader.take_raw())
         }
         Codec::Zstd => {
-            let stored = std::mem::take(&mut buffers.ciphertext);
+            let stored = std::mem::take(&mut reader.ciphertext);
             let result = decompress_zstd_exact_into(
                 &stored,
-                buffers.prepare_plaintext(expected_len),
+                reader.prepare_plaintext(expected_len),
                 expected_len,
             );
-            buffers.ciphertext = stored;
+            reader.ciphertext = stored;
             result?;
-            Ok(buffers.take_plaintext())
+            Ok(reader.take_plaintext())
         }
     }
 }
@@ -1409,6 +1430,19 @@ mod tests {
     }
 
     #[test]
+    fn block_reader_retains_its_active_segment_across_global_trim() {
+        let (package, _) = package_with_budget(ResourceBudget::default());
+        let record = package.inner.catalog.segment(0).unwrap();
+        let mut reader = BlockReader::default();
+
+        let first = reader.segment_handle(&package.inner, 0, &record).unwrap();
+        package.trim();
+        let retained = reader.segment_handle(&package.inner, 0, &record).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &retained));
+    }
+
+    #[test]
     fn decode_helpers_enforce_exact_plaintext_lengths() {
         let shared = Arc::new(b"shared".to_vec());
         assert!(Arc::ptr_eq(
@@ -1429,11 +1463,11 @@ mod tests {
         let compressed = zstd::bulk::compress(b"compressed", 1).unwrap();
         assert!(decode_owned(Codec::Zstd, compressed, 11).is_err());
         assert!(decode_owned(Codec::Zstd, b"not-zstd".to_vec(), 10).is_err());
-        let mut buffers = BlockBuffers {
+        let mut reader = BlockReader {
             ciphertext: b"raw".to_vec(),
-            ..BlockBuffers::default()
+            ..BlockReader::default()
         };
-        assert!(decode_buffered(Codec::Raw, &mut buffers, 2).is_err());
+        assert!(decode_buffered(Codec::Raw, &mut reader, 2).is_err());
     }
 
     #[test]

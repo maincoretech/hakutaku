@@ -39,6 +39,12 @@ compaction mechanism; the runtime never performs garbage collection.
 
 - Sequential and complete reads recycle ciphertext and decompression buffers
   instead of allocating them again at every block boundary.
+- Catalog, page, and block authentication data is encoded into fixed-size stack
+  arrays. Runtime block authentication and packing no longer allocate a small
+  heap buffer per block.
+- A reader retains the handle for its active immutable segment, avoiding the
+  shared idle-handle cache lock and lookup at every block boundary. This state
+  lives behind `PositionedFile`; Core still has no platform-specific I/O path.
 - Cached plaintext retains its decoded `Vec` allocation directly; cache
   admission does not copy it into a second byte allocation.
 - A Streaming cursor keeps its current and immediately previous block. Decoder
@@ -52,7 +58,8 @@ compaction mechanism; the runtime never performs garbage collection.
   prefetch cannot evict those entries.
 
 `Package::trim` releases page, plaintext, prefetch, probation, and idle-handle
-caches together.
+caches together. Active readers keep only their current segment handle until
+the reader is dropped or moves to another segment.
 
 ## Benchmark protocol
 
@@ -86,3 +93,23 @@ fixture.
 
 The dedup fixture remains four identical 4 MiB files: 16 MiB logical content
 produces 26 new blocks, 78 reused references, and 4,198,816 segment bytes.
+
+### Cursor-local crypto and segment state
+
+The following A/B used a fresh archive of `0438e78` as the before build and the
+current worktree as the after build. Both were measured in the same session;
+each value is the median of three runs. Filesystem cache remains warm.
+
+| Metric | `0438e78` | Fixed AAD + active handle | Change |
+|---|---:|---:|---:|
+| Full pack and staged verification | 124.473 ms | 117.054 ms | -6.0% |
+| Signed snapshot open | 0.070 ms | 0.069 ms | noise |
+| Sequential 128 KiB | 1,552.7 MiB/s | 1,588.8 MiB/s | +2.3% |
+| Sequential 256 KiB | 1,534.4 MiB/s | 1,587.8 MiB/s | +3.5% |
+| Uniform random 4 KiB | 6,339 IOPS | 6,521 IOPS | +2.9% |
+| Two-block short seek 4 KiB | 21,652,849 IOPS | 21,851,953 IOPS | noise |
+
+An attempted cursor-local block-map page window was rejected: its same-session
+A/B changed sequential throughput by only +0.1%/+0.9% and random reads by
+-0.4%, while increasing retained state. This prevents an unproven optimization
+from becoming part of the runtime architecture.
