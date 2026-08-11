@@ -1,0 +1,28 @@
+[package]
+name = "hakutaku-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Developer GUI for packing and inspecting Hakutaku game packages"
+
+[[bin]]
+name = "hakutaku-gui"
+path = "src/main.rs"
+
+[dependencies]
+hakutaku-core.workspace = true
+hakutaku-pack.workspace = true
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.31.1"
+# macOS and Windows use their native dialog implementations without optional
+# Linux portal/async dependencies. Linux GUI support is a later target; do not
+# pull an unused RNG stack into the v1 lockfile merely for that future backend.
+rfd = { version = "0.15.4", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

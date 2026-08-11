@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/pack", "crates/cli", "crates/gui"]
+default-members = ["crates/core", "crates/pack", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/maincoretech/hakutaku"
+
+[workspace.dependencies]
+hakutaku-core = { path = "crates/core" }
+hakutaku-pack = { path = "crates/pack" }
+blake3 = "1.8"
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
+zeroize = { version = "1.8", default-features = false }
+zstd = { version = "0.13.3", default-features = false }
+
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

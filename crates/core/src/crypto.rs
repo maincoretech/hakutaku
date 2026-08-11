@@ -1,0 +1,185 @@
+//! Fixed Hakutaku v1 cryptographic profile.
+//!
+//! AES-256-GCM is the only content cipher. There is deliberately no runtime
+//! algorithm identifier or negotiation path.
+
+use crate::format::{Codec, PageKind, ProjectId, SegmentHeader, SnapshotHeader};
+use crate::{Error, Result};
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::signature::{self, UnparsedPublicKey};
+use zeroize::{Zeroize, Zeroizing};
+
+const MASTER_CONTEXT: &str = "Hakutaku project master v1";
+const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"Hakutaku snapshot signature v1";
+const PAGE_AAD_DOMAIN: &[u8] = b"Hakutaku page aad v1";
+const BLOCK_AAD_DOMAIN: &[u8] = b"Hakutaku block aad v1";
+
+pub struct ProjectKeys {
+    master: Zeroizing<[u8; 32]>,
+}
+
+/// Prepared AES-256-GCM key. Construct once per active snapshot or segment.
+pub struct Aes256Key(LessSafeKey);
+
+impl Aes256Key {
+    pub fn new(key: &[u8; 32]) -> Result<Self> {
+        Ok(Self(LessSafeKey::new(
+            UnboundKey::new(&aead::AES_256_GCM, key)
+                .map_err(|_| Error::Authentication("AES-256 key"))?,
+        )))
+    }
+
+    pub fn seal(&self, nonce: Nonce, aad: &[u8], plaintext: &mut Vec<u8>) -> Result<()> {
+        self.0
+            .seal_in_place_append_tag(nonce, Aad::from(aad), plaintext)
+            .map_err(|_| Error::Authentication("AES-256-GCM seal"))
+    }
+
+    pub fn open(
+        &self,
+        nonce: Nonce,
+        aad: &[u8],
+        ciphertext_and_tag: &mut Vec<u8>,
+        scope: &'static str,
+    ) -> Result<()> {
+        let plain_len = self
+            .0
+            .open_in_place(nonce, Aad::from(aad), ciphertext_and_tag)
+            .map_err(|_| Error::Authentication(scope))?
+            .len();
+        ciphertext_and_tag.truncate(plain_len);
+        Ok(())
+    }
+}
+
+impl ProjectKeys {
+    #[must_use]
+    pub fn new(mut root_key: [u8; 32], project_id: ProjectId) -> Self {
+        let mut material = Zeroizing::new([0_u8; 48]);
+        material[..32].copy_from_slice(&root_key);
+        material[32..].copy_from_slice(&project_id.0);
+        let master = Zeroizing::new(blake3::derive_key(MASTER_CONTEXT, material.as_ref()));
+        root_key.zeroize();
+        Self { master }
+    }
+
+    #[must_use]
+    pub fn snapshot_key(&self, salt: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+        self.derive(b"snapshot", &[salt])
+    }
+
+    #[must_use]
+    pub fn segment_key(&self, header: &SegmentHeader) -> Zeroizing<[u8; 32]> {
+        self.derive(b"segment", &[&header.segment_uid, &header.salt])
+    }
+
+    #[must_use]
+    pub fn path_key(&self) -> [u8; 32] {
+        *self.derive(b"path", &[])
+    }
+
+    fn derive(&self, domain: &[u8], fields: &[&[u8]]) -> Zeroizing<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new_keyed(&self.master);
+        hasher.update(domain);
+        for field in fields {
+            hasher.update(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(field);
+        }
+        Zeroizing::new(*hasher.finalize().as_bytes())
+    }
+}
+
+pub fn nonce(prefix: [u8; 8], ordinal: u32) -> Nonce {
+    let mut bytes = [0_u8; 12];
+    bytes[..8].copy_from_slice(&prefix);
+    bytes[8..].copy_from_slice(&ordinal.to_le_bytes());
+    Nonce::assume_unique_for_key(bytes)
+}
+
+#[must_use]
+pub fn signing_key_id(public_key: &[u8; 32]) -> [u8; 16] {
+    let mut result = [0_u8; 16];
+    result.copy_from_slice(&blake3::hash(public_key).as_bytes()[..16]);
+    result
+}
+
+#[must_use]
+pub fn snapshot_signature_message(zeroed_header: &[u8], catalog_ciphertext: &[u8]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(zeroed_header);
+    hasher.update(catalog_ciphertext);
+    let digest = hasher.finalize();
+    let mut message = Vec::with_capacity(SNAPSHOT_SIGNATURE_DOMAIN.len() + 32);
+    message.extend_from_slice(SNAPSHOT_SIGNATURE_DOMAIN);
+    message.extend_from_slice(digest.as_bytes());
+    message
+}
+
+pub fn verify_snapshot_signature(
+    header: &SnapshotHeader,
+    catalog_ciphertext: &[u8],
+    public_key: &[u8; 32],
+) -> Result<()> {
+    if signing_key_id(public_key) != header.signing_key_id {
+        return Err(Error::Signature);
+    }
+    let encoded = header.encode(true);
+    let message = snapshot_signature_message(&encoded, catalog_ciphertext);
+    UnparsedPublicKey::new(&signature::ED25519, public_key)
+        .verify(&message, &header.signature)
+        .map_err(|_| Error::Signature)
+}
+
+#[must_use]
+pub fn page_aad(
+    project_id: ProjectId,
+    release_sequence: u64,
+    kind: PageKind,
+    codec: Codec,
+    nonce_ordinal: u32,
+    stored_len: u32,
+    plain_len: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(PAGE_AAD_DOMAIN.len() + 16 + 8 + 1 + 1 + 4 + 4 + 4);
+    aad.extend_from_slice(PAGE_AAD_DOMAIN);
+    aad.extend_from_slice(&project_id.0);
+    aad.extend_from_slice(&release_sequence.to_le_bytes());
+    aad.push(kind as u8);
+    aad.push(codec as u8);
+    aad.extend_from_slice(&nonce_ordinal.to_le_bytes());
+    aad.extend_from_slice(&stored_len.to_le_bytes());
+    aad.extend_from_slice(&plain_len.to_le_bytes());
+    aad
+}
+
+#[must_use]
+pub fn block_aad(
+    project_id: ProjectId,
+    segment_uid: &[u8; 16],
+    block_ordinal: u32,
+    codec: Codec,
+    stored_len: u32,
+    plain_len: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(BLOCK_AAD_DOMAIN.len() + 16 + 16 + 4 + 1 + 4 + 4);
+    aad.extend_from_slice(BLOCK_AAD_DOMAIN);
+    aad.extend_from_slice(&project_id.0);
+    aad.extend_from_slice(segment_uid);
+    aad.extend_from_slice(&block_ordinal.to_le_bytes());
+    aad.push(codec as u8);
+    aad.extend_from_slice(&stored_len.to_le_bytes());
+    aad.extend_from_slice(&plain_len.to_le_bytes());
+    aad
+}
+
+#[must_use]
+pub fn catalog_aad(header: &SnapshotHeader) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(24 + 16 + 8 + 8 + 8 + 4);
+    aad.extend_from_slice(b"Hakutaku catalog aad v1");
+    aad.extend_from_slice(&header.project_id.0);
+    aad.extend_from_slice(&header.release_sequence.to_le_bytes());
+    aad.extend_from_slice(&header.catalog_stored_len.to_le_bytes());
+    aad.extend_from_slice(&header.catalog_plain_len.to_le_bytes());
+    aad.extend_from_slice(&header.page_count.to_le_bytes());
+    aad
+}

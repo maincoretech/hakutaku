@@ -1,0 +1,20 @@
+[package]
+name = "hakutaku-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal authenticated random-access runtime for Hakutaku game packages"
+
+[dependencies]
+blake3.workspace = true
+ring.workspace = true
+zeroize.workspace = true
+zstd.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

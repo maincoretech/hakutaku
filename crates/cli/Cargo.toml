@@ -1,0 +1,23 @@
+[package]
+name = "hakutaku-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line publisher and verifier for Hakutaku packages"
+
+[[bin]]
+name = "hakutaku"
+path = "src/main.rs"
+
+[dependencies]
+hakutaku-core.workspace = true
+hakutaku-pack.workspace = true
+lexopt = "0.3.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

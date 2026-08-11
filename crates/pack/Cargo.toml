@@ -1,0 +1,26 @@
+[package]
+name = "hakutaku-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic full and incremental packer for Hakutaku game packages"
+
+[dependencies]
+hakutaku-core.workspace = true
+blake3.workspace = true
+fastcdc = { version = "3.2.1", default-features = false }
+ring.workspace = true
+zeroize = { workspace = true, features = ["alloc"] }
+zstd.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[[bench]]
+name = "runtime"
+harness = false
