@@ -154,7 +154,21 @@ pub struct Asset {
 pub struct AssetCursor {
     asset: Asset,
     position: u64,
-    current_block: Option<(BlockRef, Arc<[u8]>)>,
+    current_block: Option<(BlockRef, BlockData)>,
+}
+
+enum BlockData {
+    Shared(Arc<[u8]>),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for BlockData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Shared(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 impl Package {
@@ -276,6 +290,14 @@ impl Package {
             file_index,
             record: self.inner.catalog.file(file_index)?,
         })
+    }
+
+    pub fn contains_asset(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .catalog
+            .find_file(path, &self.inner.path_key)?
+            .is_some())
     }
 
     pub fn list_assets(&self) -> Result<Vec<AssetInfo>> {
@@ -405,13 +427,13 @@ impl PackageInner {
             &mut ciphertext,
             "snapshot page",
         )?;
-        let decoded = decode(page.codec, &ciphertext, page.plain_len as usize)?;
+        let decoded = decode_owned(page.codec, ciphertext, page.plain_len as usize)?;
         let decoded: Arc<[u8]> = Arc::from(decoded);
         lock(&self.page_cache).insert(page_index, Arc::clone(&decoded));
         Ok(decoded)
     }
 
-    fn load_block(&self, reference: &BlockRef, access: AccessClass) -> Result<Arc<[u8]>> {
+    fn load_block(&self, reference: &BlockRef, access: AccessClass) -> Result<BlockData> {
         let key = BlockKey {
             segment_ordinal: reference.segment_ordinal,
             block_ordinal: reference.segment_block_ordinal,
@@ -422,7 +444,7 @@ impl PackageInner {
             if value.len() != reference.plain_len as usize {
                 return Err(Error::InvalidFormat("cached block length mismatch"));
             }
-            return Ok(value);
+            return Ok(BlockData::Shared(value));
         }
 
         let segment = self.catalog.segment(u32::from(reference.segment_ordinal))?;
@@ -458,11 +480,7 @@ impl PackageInner {
             &mut ciphertext,
             "segment block",
         )?;
-        let plaintext: Arc<[u8]> = Arc::from(decode(
-            reference.codec,
-            &ciphertext,
-            reference.plain_len as usize,
-        )?);
+        let plaintext = decode_owned(reference.codec, ciphertext, reference.plain_len as usize)?;
 
         let admit = match access {
             AccessClass::Hot => true,
@@ -470,9 +488,12 @@ impl PackageInner {
             AccessClass::Streaming | AccessClass::Transient => false,
         };
         if admit {
+            let plaintext: Arc<[u8]> = Arc::from(plaintext);
             lock(&self.block_cache).insert(key, Arc::clone(&plaintext));
+            Ok(BlockData::Shared(plaintext))
+        } else {
+            Ok(BlockData::Owned(plaintext))
         }
-        Ok(plaintext)
     }
 
     fn second_normal_access(&self, key: BlockKey) -> bool {
@@ -570,6 +591,7 @@ impl Asset {
                 .load_block(&reference, self.record.access)?;
             let within = usize::try_from(logical - reference.logical_offset)
                 .map_err(|_| Error::InvalidFormat("block logical offset"))?;
+            let block = block.as_ref();
             if within >= block.len() {
                 return Err(Error::InvalidFormat(
                     "block does not cover requested offset",
@@ -677,6 +699,7 @@ impl Read for AssetCursor {
             let Some((reference, block)) = self.current_block.as_ref() else {
                 return Err(std::io::Error::other("cursor block was not loaded"));
             };
+            let block = block.as_ref();
             let within = usize::try_from(self.position - reference.logical_offset)
                 .map_err(std::io::Error::other)?;
             let amount = (block.len() - within).min(requested - written);
@@ -688,6 +711,23 @@ impl Read for AssetCursor {
     }
 }
 
+impl AssetCursor {
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.asset.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.asset.is_empty()
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+}
+
 impl Seek for AssetCursor {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         let target = match position {
@@ -695,8 +735,15 @@ impl Seek for AssetCursor {
             SeekFrom::End(delta) => i128::from(self.asset.len()) + i128::from(delta),
             SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
         };
-        self.position = u64::try_from(target)
+        let target = u64::try_from(target)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "negative seek"))?;
+        if target > self.asset.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek is beyond the end of the asset",
+            ));
+        }
+        self.position = target;
         if self.current_block.as_ref().is_some_and(|(reference, _)| {
             let end = reference
                 .logical_offset
@@ -715,15 +762,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn decode(codec: Codec, stored: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+fn decode_owned(codec: Codec, stored: Vec<u8>, expected_len: usize) -> Result<Vec<u8>> {
     match codec {
         Codec::Raw => {
             if stored.len() != expected_len {
                 return Err(Error::InvalidFormat("RAW plaintext length"));
             }
-            Ok(stored.to_vec())
+            Ok(stored)
         }
-        Codec::Zstd => decompress_zstd_exact(stored, expected_len),
+        Codec::Zstd => decompress_zstd_exact(&stored, expected_len),
     }
 }
 

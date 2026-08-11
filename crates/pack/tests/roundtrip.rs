@@ -2,7 +2,7 @@ use hakutaku_core::crypto::{self, Aes256Key, ProjectKeys};
 use hakutaku_core::format::{Catalog, Codec, SnapshotHeader, map_page_record, validate_map_page};
 use hakutaku_core::{Package, ResourceBudget};
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,6 +68,16 @@ fn full_incremental_and_unchanged_roundtrip() {
     let unchanged = pack_directory(&options, &identity).unwrap();
     assert!(!unchanged.changed);
     assert_eq!(unchanged.release_sequence, second.release_sequence);
+}
+
+#[test]
+fn runtime_material_reconstructs_the_identity_key() {
+    let identity = Identity::generate().unwrap();
+    let material = identity.runtime_key_material().unwrap();
+    let reconstructed =
+        std::array::from_fn(|index| material.key_share_a[index] ^ material.key_share_b[index]);
+    assert_eq!(reconstructed, identity.root_key());
+    assert_eq!(material.public_key, identity.public_key());
 }
 
 #[test]
@@ -245,6 +255,8 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
     )
     .unwrap();
     package.verify_segments().unwrap();
+    assert!(package.contains_asset("empty.txt").unwrap());
+    assert!(!package.contains_asset("missing.txt").unwrap());
     assert_eq!(package.asset("empty.txt").unwrap().read().unwrap(), []);
     assert_eq!(
         package.asset("script/main.json").unwrap().read().unwrap(),
@@ -256,6 +268,14 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
     );
     let expected_video = std::fs::read(input.join("video/opening.mp4")).unwrap();
     let mut cursor = package.asset("video/opening.mp4").unwrap().cursor();
+    assert_eq!(cursor.len(), expected_video.len() as u64);
+    assert_eq!(cursor.position(), 0);
+    assert!(
+        cursor
+            .seek(SeekFrom::Start(expected_video.len() as u64 + 1))
+            .is_err()
+    );
+    assert_eq!(cursor.position(), 0);
     let mut actual_video = Vec::new();
     let mut small = [0_u8; 32 * 1024];
     loop {

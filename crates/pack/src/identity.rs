@@ -11,6 +11,13 @@ const MAGIC: &[u8; 8] = b"HAKID001";
 const HEADER_SIZE: usize = 96;
 const CHECKSUM_SIZE: usize = 32;
 
+/// Runtime-only key material embedded into a packaged executable.
+pub struct RuntimeKeyMaterial {
+    pub key_share_a: [u8; 32],
+    pub key_share_b: [u8; 32],
+    pub public_key: [u8; 32],
+}
+
 /// Publisher-only identity. Never ship this file with a game.
 pub struct Identity {
     project_id: ProjectId,
@@ -139,6 +146,25 @@ impl Identity {
     #[must_use]
     pub fn root_key(&self) -> [u8; 32] {
         *self.root_key
+    }
+
+    pub fn runtime_key_material(&self) -> Result<RuntimeKeyMaterial> {
+        let mut key_share_a = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut key_share_a)
+            .map_err(|_| Error::Crypto("runtime key share generation"))?;
+        let mut key_share_b = [0_u8; 32];
+        for (output, (root, share)) in key_share_b
+            .iter_mut()
+            .zip(self.root_key.iter().zip(key_share_a))
+        {
+            *output = root ^ share;
+        }
+        Ok(RuntimeKeyMaterial {
+            key_share_a,
+            key_share_b,
+            public_key: self.public_key,
+        })
     }
 
     pub(crate) fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
