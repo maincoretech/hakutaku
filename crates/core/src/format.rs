@@ -152,7 +152,7 @@ impl LayoutKind {
 }
 
 /// Runtime caching and access hint attached to an asset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AccessClass {
     /// Small launch-critical content retained aggressively.

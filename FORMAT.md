@@ -164,6 +164,9 @@ Paths are non-empty UTF-8 separated by `/`. Absolute paths, empty components,
 The reference packer classifies files up to 32 KiB as Hot, known audio/video as
 Streaming, and remaining files as Normal. These are cache hints, not security
 or compatibility semantics; readers must accept every declared access class.
+The reference packer also writes each availability/access combination through
+an independent bounded segment stream. This placement policy improves
+incremental reclamation but is not a wire-format invariant.
 
 ### PathSlotV1 — 16 bytes
 
@@ -327,7 +330,8 @@ Unreferenced content-addressed segments are deleted after that commit, never
 before it. On Unix the affected directories are synchronized after segment
 publication, snapshot replacement, recovery, and garbage collection.
 
-The packer may reuse a signed block from the previous snapshot or an identical
-block already written during the current build. Reuse is permitted only when
-the segment availability matches, preserving the required/deferred install
-boundary.
+The packer may reuse a signed block from the previous snapshot when segment
+availability matches. Within one build, identical new blocks are shared only
+when both availability and access class match. Historical immutable placement
+is preserved by incremental builds; a full build rewrites all blocks into the
+current placement classes.

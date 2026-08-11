@@ -22,6 +22,9 @@ const FASTCDC_AVG: u32 = 128 * 1024;
 const FASTCDC_MAX: u32 = 512 * 1024;
 const COMPRESSION_SAVINGS: usize = 64;
 const DEFAULT_SEGMENT_TARGET: u64 = 512 * 1024 * 1024;
+const HOT_SEGMENT_TARGET: u64 = 64 * 1024 * 1024;
+const NORMAL_SEGMENT_TARGET: u64 = 256 * 1024 * 1024;
+const TRANSIENT_SEGMENT_TARGET: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 /// Inputs and policy controls for one deterministic package build.
@@ -102,6 +105,12 @@ pub struct PackReport {
     pub new_segments: u32,
     /// Complete byte size of newly created segment files.
     pub new_segment_bytes: u64,
+    /// Total bytes occupied by every segment retained by this release.
+    pub retained_segment_bytes: u64,
+    /// Unique encrypted block bytes referenced by this release.
+    pub referenced_block_bytes: u64,
+    /// Payload bytes retained only because a live block shares their segment.
+    pub stranded_segment_bytes: u64,
 }
 
 /// Builds a package without progress notifications.
@@ -178,8 +187,7 @@ where
         current_reuse: HashMap::new(),
         used_existing_segments: BTreeMap::new(),
         new_segment_records: Vec::new(),
-        new_segment_ids: Vec::new(),
-        current_segment: None,
+        active_segments: Vec::new(),
         pending_blocks: Vec::new(),
         chunk_ids: Vec::new(),
         file_records: Vec::with_capacity(files.len()),
@@ -208,8 +216,8 @@ where
         });
         context.add_file(source)?;
     }
-    context.finish_current_segment()?;
-    if !context.new_segment_ids.is_empty() {
+    context.finish_active_segments()?;
+    if !context.new_segment_records.is_empty() {
         sync_directory(&data_directory)?;
     }
     let source_fingerprint = *context.fingerprint.finalize().as_bytes();
@@ -218,11 +226,10 @@ where
         .as_ref()
         .is_some_and(|old| old.source_fingerprint() == source_fingerprint)
     {
-        let active_segments = old_package.as_ref().expect("checked above").segment_ids()?;
-        let active_release_sequence = old_package
-            .as_ref()
-            .expect("checked above")
-            .release_sequence();
+        let old = old_package.as_ref().expect("checked above");
+        let active_segments = old.segment_ids()?;
+        let active_release_sequence = old.release_sequence();
+        let storage = package_storage_stats(old)?;
         drop(old_package);
         cleanup_unreferenced_segments(&data_directory, &active_segments)?;
         return Ok(PackReport {
@@ -236,6 +243,9 @@ where
             new_blocks: 0,
             new_segments: 0,
             new_segment_bytes: 0,
+            retained_segment_bytes: storage.retained,
+            referenced_block_bytes: storage.referenced,
+            stranded_segment_bytes: storage.stranded,
         });
     }
 
@@ -298,16 +308,50 @@ struct PendingBlock {
     reference: BlockRef,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SegmentClass {
+    availability: Availability,
+    access: AccessClass,
+}
+
+impl SegmentClass {
+    const fn new(availability: Availability, access: AccessClass) -> Self {
+        Self {
+            availability,
+            access,
+        }
+    }
+
+    const fn target_bytes(self, configured: u64) -> u64 {
+        let class_target = match self.access {
+            AccessClass::Hot => HOT_SEGMENT_TARGET,
+            AccessClass::Normal => NORMAL_SEGMENT_TARGET,
+            AccessClass::Streaming => configured,
+            AccessClass::Transient => TRANSIENT_SEGMENT_TARGET,
+        };
+        if configured < class_target {
+            configured
+        } else {
+            class_target
+        }
+    }
+}
+
+struct ActiveSegment {
+    class: SegmentClass,
+    index: usize,
+    writer: NewSegment,
+}
+
 struct BuildContext<'a> {
     options: &'a PackOptions,
     identity: &'a Identity,
     keys: &'a ProjectKeys,
     reuse_index: HashMap<([u8; 32], Availability), ReusableBlock>,
-    current_reuse: HashMap<([u8; 32], Availability), PendingBlock>,
+    current_reuse: HashMap<([u8; 32], SegmentClass), PendingBlock>,
     used_existing_segments: BTreeMap<SegmentId, SegmentRecord>,
-    new_segment_records: Vec<SegmentRecord>,
-    new_segment_ids: Vec<SegmentId>,
-    current_segment: Option<NewSegment>,
+    new_segment_records: Vec<Option<SegmentRecord>>,
+    active_segments: Vec<ActiveSegment>,
     pending_blocks: Vec<PendingBlock>,
     chunk_ids: Vec<[u8; 32]>,
     file_records: Vec<FileRecord>,
@@ -326,7 +370,12 @@ impl BuildContext<'_> {
         self.used_existing_segments
             .keys()
             .copied()
-            .chain(self.new_segment_records.iter().map(|record| record.id))
+            .chain(
+                self.new_segment_records
+                    .iter()
+                    .flatten()
+                    .map(|record| record.id),
+            )
             .collect()
     }
 
@@ -354,10 +403,10 @@ impl BuildContext<'_> {
         if source.len > 0 {
             match layout {
                 LayoutKind::Fixed => {
-                    self.add_fixed_file(source, fixed_block_len as usize, availability)?
+                    self.add_fixed_file(source, fixed_block_len as usize, availability, access)?
                 }
                 LayoutKind::ContentDefined => {
-                    self.add_content_defined_file(source, availability)?
+                    self.add_content_defined_file(source, availability, access)?
                 }
             }
         }
@@ -386,6 +435,7 @@ impl BuildContext<'_> {
         source: &SourceFile,
         block_size: usize,
         availability: Availability,
+        access: AccessClass,
     ) -> Result<()> {
         let mut reader =
             BufReader::with_capacity(block_size.min(1024 * 1024), File::open(&source.host_path)?);
@@ -396,7 +446,7 @@ impl BuildContext<'_> {
             if read == 0 {
                 break;
             }
-            self.add_chunk(logical_offset, &buffer[..read], availability)?;
+            self.add_chunk(logical_offset, &buffer[..read], availability, access)?;
             logical_offset = logical_offset
                 .checked_add(read as u64)
                 .ok_or_else(|| Error::InvalidInput("file offset overflow".into()))?;
@@ -409,6 +459,7 @@ impl BuildContext<'_> {
         &mut self,
         source: &SourceFile,
         availability: Availability,
+        access: AccessClass,
     ) -> Result<()> {
         let bytes = std::fs::read(&source.host_path)?;
         validate_source_len(bytes.len() as u64, source)?;
@@ -417,7 +468,12 @@ impl BuildContext<'_> {
                 .offset
                 .checked_add(chunk.length)
                 .ok_or_else(|| Error::InvalidInput("FastCDC range overflow".into()))?;
-            self.add_chunk(chunk.offset as u64, &bytes[chunk.offset..end], availability)?;
+            self.add_chunk(
+                chunk.offset as u64,
+                &bytes[chunk.offset..end],
+                availability,
+                access,
+            )?;
         }
         Ok(())
     }
@@ -427,11 +483,13 @@ impl BuildContext<'_> {
         logical_offset: u64,
         plaintext: &[u8],
         availability: Availability,
+        access: AccessClass,
     ) -> Result<()> {
         let chunk_id = *blake3::hash(plaintext).as_bytes();
         self.fingerprint.update(&chunk_id);
         self.chunk_ids.push(chunk_id);
-        let reuse_key = (chunk_id, availability);
+        let class = SegmentClass::new(availability, access);
+        let reuse_key = (chunk_id, class);
         if let Some(reused) = self.current_reuse.get(&reuse_key).copied() {
             let mut reused = reused;
             reused.reference.logical_offset = logical_offset;
@@ -439,7 +497,9 @@ impl BuildContext<'_> {
             self.reused_blocks = self.reused_blocks.saturating_add(1);
             return Ok(());
         }
-        if let Some(reused) = self.reuse_index.get(&reuse_key)
+        // Existing immutable blocks keep their historical placement. A full
+        // build is the explicit operation that rewrites them into new classes.
+        if let Some(reused) = self.reuse_index.get(&(chunk_id, availability))
             && reused.block.plain_len as usize == plaintext.len()
         {
             let mut reference = reused.block;
@@ -463,31 +523,27 @@ impl BuildContext<'_> {
             .checked_add(16)
             .ok_or_else(|| Error::InvalidInput("block length overflow".into()))?
             as u64;
-        let rotate = self.current_segment.as_ref().is_some_and(|segment| {
-            segment.availability != availability
-                || (segment.block_count > 0
-                    && segment.payload_len.saturating_add(estimated_stored)
-                        > self.options.segment_target_bytes)
-        });
-        if rotate {
-            self.finish_current_segment()?;
+        let target_bytes = class.target_bytes(self.options.segment_target_bytes);
+        if let Some(position) = self.active_segment_position(class)
+            && self.active_segments[position].writer.block_count > 0
+            && self.active_segments[position]
+                .writer
+                .payload_len
+                .saturating_add(estimated_stored)
+                > target_bytes
+        {
+            self.finish_active_segment(position)?;
         }
-        if self.current_segment.is_none() {
-            let index = self.new_segment_records.len();
-            self.current_segment = Some(NewSegment::create(
-                &self.options.output_directory.join("data"),
-                index,
-                self.identity.project_id(),
-                self.keys,
-                availability,
-            )?);
-        }
-        let segment_index = self.new_segment_records.len();
-        let reference = self
-            .current_segment
-            .as_mut()
-            .expect("segment initialized")
-            .write_block(logical_offset, plaintext.len(), codec, encoded)?;
+        let position = match self.active_segment_position(class) {
+            Some(position) => position,
+            None => self.start_segment(class)?,
+        };
+        let active = &mut self.active_segments[position];
+        let segment_index = active.index;
+        let reference =
+            active
+                .writer
+                .write_block(logical_offset, plaintext.len(), codec, encoded)?;
         let pending = PendingBlock {
             locator: SegmentLocator::New(segment_index),
             reference,
@@ -498,14 +554,49 @@ impl BuildContext<'_> {
         Ok(())
     }
 
-    fn finish_current_segment(&mut self) -> Result<()> {
-        let Some(segment) = self.current_segment.take() else {
-            return Ok(());
-        };
-        let (record, bytes) = segment.finish()?;
+    fn active_segment_position(&self, class: SegmentClass) -> Option<usize> {
+        self.active_segments
+            .iter()
+            .position(|segment| segment.class == class)
+    }
+
+    fn start_segment(&mut self, class: SegmentClass) -> Result<usize> {
+        let index = self.new_segment_records.len();
+        let writer = NewSegment::create(
+            &self.options.output_directory.join("data"),
+            index,
+            self.identity.project_id(),
+            self.keys,
+            class.availability,
+        )?;
+        self.new_segment_records.push(None);
+        self.active_segments.push(ActiveSegment {
+            class,
+            index,
+            writer,
+        });
+        Ok(self.active_segments.len() - 1)
+    }
+
+    fn finish_active_segment(&mut self, position: usize) -> Result<()> {
+        let segment = self.active_segments.swap_remove(position);
+        let (record, bytes) = segment.writer.finish()?;
         self.new_segment_bytes = self.new_segment_bytes.saturating_add(bytes);
-        self.new_segment_ids.push(record.id);
-        self.new_segment_records.push(record);
+        store_segment_record(&mut self.new_segment_records, segment.index, record)?;
+        Ok(())
+    }
+
+    fn finish_active_segments(&mut self) -> Result<()> {
+        while !self.active_segments.is_empty() {
+            let position = self
+                .active_segments
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, segment)| segment.index)
+                .map(|(position, _)| position)
+                .expect("active segments are non-empty");
+            self.finish_active_segment(position)?;
+        }
         Ok(())
     }
 
@@ -517,7 +608,7 @@ impl BuildContext<'_> {
     ) -> Result<PackReport> {
         let mut segments: Vec<SegmentRecord> =
             self.used_existing_segments.values().cloned().collect();
-        segments.extend(self.new_segment_records.iter().cloned());
+        segments.extend(self.new_segment_records.iter().flatten().cloned());
         segments.sort_by_key(|record| record.id);
         let ordinals: HashMap<SegmentId, u16> = segments
             .iter()
@@ -531,9 +622,11 @@ impl BuildContext<'_> {
         for block in &mut self.pending_blocks {
             let id = match block.locator {
                 SegmentLocator::Existing(id) => id,
-                SegmentLocator::New(index) => *self
-                    .new_segment_ids
+                SegmentLocator::New(index) => self
+                    .new_segment_records
                     .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|record| record.id)
                     .ok_or_else(|| Error::InvalidInput("new segment index".into()))?,
             };
             block.reference.segment_ordinal = *ordinals
@@ -545,6 +638,7 @@ impl BuildContext<'_> {
             .iter()
             .map(|item| item.reference)
             .collect();
+        let storage = storage_stats(&segments, &block_refs)?;
         let reuse_records: Vec<ReuseRecord> = self
             .chunk_ids
             .iter()
@@ -650,11 +744,102 @@ impl BuildContext<'_> {
                 .map_err(|_| Error::InvalidInput("too many blocks".into()))?,
             reused_blocks: self.reused_blocks,
             new_blocks: self.new_blocks,
-            new_segments: u32::try_from(self.new_segment_records.len())
-                .map_err(|_| Error::InvalidInput("too many new segments".into()))?,
+            new_segments: u32::try_from(
+                self.new_segment_records
+                    .iter()
+                    .filter(|record| record.is_some())
+                    .count(),
+            )
+            .map_err(|_| Error::InvalidInput("too many new segments".into()))?,
             new_segment_bytes: self.new_segment_bytes,
+            retained_segment_bytes: storage.retained,
+            referenced_block_bytes: storage.referenced,
+            stranded_segment_bytes: storage.stranded,
         })
     }
+}
+
+fn store_segment_record(
+    records: &mut [Option<SegmentRecord>],
+    index: usize,
+    record: SegmentRecord,
+) -> Result<()> {
+    let slot = records
+        .get_mut(index)
+        .ok_or_else(|| Error::InvalidInput("new segment index".into()))?;
+    if slot.is_some() {
+        return Err(Error::InvalidInput("new segment finalized twice".into()));
+    }
+    *slot = Some(record);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StorageStats {
+    retained: u64,
+    referenced: u64,
+    stranded: u64,
+}
+
+fn package_storage_stats(package: &Package) -> Result<StorageStats> {
+    let segment_count = package.segment_ids()?.len();
+    let mut segments = Vec::with_capacity(segment_count);
+    for index in 0..segment_count {
+        let ordinal = u16::try_from(index)
+            .map_err(|_| Error::InvalidInput("too many referenced segments".into()))?;
+        segments.push(package.segment_record(ordinal)?);
+    }
+    let blocks = package
+        .reuse_records()?
+        .into_iter()
+        .map(|record| record.block)
+        .collect::<Vec<_>>();
+    storage_stats(&segments, &blocks)
+}
+
+fn storage_stats(segments: &[SegmentRecord], blocks: &[BlockRef]) -> Result<StorageStats> {
+    let retained = segments.iter().try_fold(0_u64, |total, segment| {
+        total
+            .checked_add(segment.file_len)
+            .ok_or_else(|| Error::InvalidInput("retained segment size overflow".into()))
+    })?;
+    let payload = segments.iter().try_fold(0_u64, |total, segment| {
+        total
+            .checked_add(segment.payload_len)
+            .ok_or_else(|| Error::InvalidInput("segment payload size overflow".into()))
+    })?;
+    let mut unique = HashMap::new();
+    for block in blocks {
+        let segment = segments
+            .get(block.segment_ordinal as usize)
+            .ok_or_else(|| Error::InvalidInput("block references missing segment".into()))?;
+        if block.segment_block_ordinal >= segment.block_count {
+            return Err(Error::InvalidInput(
+                "block references missing segment block".into(),
+            ));
+        }
+        let key = (block.segment_ordinal, block.segment_block_ordinal);
+        if let Some(previous) = unique.insert(key, block.stored_len)
+            && previous != block.stored_len
+        {
+            return Err(Error::InvalidInput(
+                "shared block has inconsistent stored lengths".into(),
+            ));
+        }
+    }
+    let referenced = unique.values().try_fold(0_u64, |total, stored_len| {
+        total
+            .checked_add(u64::from(*stored_len))
+            .ok_or_else(|| Error::InvalidInput("referenced block size overflow".into()))
+    })?;
+    let stranded = payload
+        .checked_sub(referenced)
+        .ok_or_else(|| Error::InvalidInput("referenced blocks exceed segment payload".into()))?;
+    Ok(StorageStats {
+        retained,
+        referenced,
+        stranded,
+    })
 }
 
 struct NewSegment {
@@ -1466,6 +1651,129 @@ mod tests {
         invalid.deferred_prefixes = vec!["/absolute".into()];
         assert!(validate_options(&invalid).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn segment_classes_balance_access_patterns_and_configured_limits() {
+        let required = Availability::Required;
+        assert_eq!(
+            SegmentClass::new(required, AccessClass::Hot).target_bytes(DEFAULT_SEGMENT_TARGET),
+            HOT_SEGMENT_TARGET
+        );
+        assert_eq!(
+            SegmentClass::new(required, AccessClass::Normal).target_bytes(DEFAULT_SEGMENT_TARGET),
+            NORMAL_SEGMENT_TARGET
+        );
+        assert_eq!(
+            SegmentClass::new(required, AccessClass::Streaming)
+                .target_bytes(DEFAULT_SEGMENT_TARGET),
+            DEFAULT_SEGMENT_TARGET
+        );
+        assert_eq!(
+            SegmentClass::new(required, AccessClass::Transient)
+                .target_bytes(DEFAULT_SEGMENT_TARGET),
+            TRANSIENT_SEGMENT_TARGET
+        );
+        assert_eq!(
+            SegmentClass::new(required, AccessClass::Streaming).target_bytes(1024 * 1024),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn semantic_classes_share_no_new_segments() {
+        let root = scratch("semantic-segments");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(input.join("dlc")).unwrap();
+        std::fs::write(input.join("hot.txt"), vec![1; 1024]).unwrap();
+        std::fs::write(input.join("normal.bin"), vec![2; 40 * 1024]).unwrap();
+        std::fs::write(input.join("stream.mp4"), vec![3; 40 * 1024]).unwrap();
+        std::fs::write(input.join("dlc/stream.mp4"), vec![4; 40 * 1024]).unwrap();
+        let mut options = PackOptions::new(&input, &output);
+        options.deferred_prefixes.push("dlc".into());
+        let identity = Identity::generate().unwrap();
+        let report = pack_directory(&options, &identity).unwrap();
+        assert_eq!(report.new_segments, 4);
+        assert_eq!(report.stranded_segment_bytes, 0);
+        assert_eq!(
+            report.retained_segment_bytes - report.referenced_block_bytes,
+            4 * SEGMENT_HEADER_SIZE as u64
+        );
+        std::fs::write(input.join("hot.txt"), vec![5; 1024]).unwrap();
+        let incremental = pack_directory(&options, &identity).unwrap();
+        assert_eq!(incremental.new_segments, 1);
+        assert_eq!(incremental.stranded_segment_bytes, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_class_rotates_at_its_configured_segment_limit() {
+        let root = scratch("segment-rotation");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let mut bytes = vec![0_u8; 2 * 1024 * 1024];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for chunk in bytes.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        std::fs::write(input.join("movie.mp4"), bytes).unwrap();
+        let mut options = PackOptions::new(&input, &output);
+        options.segment_target_bytes = 1024 * 1024;
+        let report = pack_directory(&options, &Identity::generate().unwrap()).unwrap();
+        assert_eq!(report.new_segments, 3);
+        assert_eq!(report.stranded_segment_bytes, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_stats_deduplicate_references_and_measure_stranded_payload() {
+        let segments = vec![SegmentRecord {
+            id: SegmentId([1; 32]),
+            uid: [2; 16],
+            salt: [3; 16],
+            nonce_prefix: [4; 8],
+            file_len: SEGMENT_HEADER_SIZE as u64 + 1000,
+            payload_len: 1000,
+            block_count: 2,
+            availability: Availability::Required,
+        }];
+        let block = BlockRef {
+            logical_offset: 0,
+            segment_ordinal: 0,
+            segment_block_ordinal: 0,
+            physical_offset: SEGMENT_HEADER_SIZE as u64,
+            stored_len: 400,
+            plain_len: 384,
+            codec: Codec::Raw,
+            cipher_digest: [5; 16],
+        };
+        assert_eq!(
+            storage_stats(&segments, &[block, block]).unwrap(),
+            StorageStats {
+                retained: SEGMENT_HEADER_SIZE as u64 + 1000,
+                referenced: 400,
+                stranded: 600,
+            }
+        );
+        let mut inconsistent = block;
+        inconsistent.stored_len = 401;
+        assert!(storage_stats(&segments, &[block, inconsistent]).is_err());
+        let mut missing = block;
+        missing.segment_ordinal = 1;
+        assert!(storage_stats(&segments, &[missing]).is_err());
+        let mut missing = block;
+        missing.segment_block_ordinal = 2;
+        assert!(storage_stats(&segments, &[missing]).is_err());
+
+        let mut records = vec![None];
+        store_segment_record(&mut records, 0, segments[0].clone()).unwrap();
+        assert!(store_segment_record(&mut records, 0, segments[0].clone()).is_err());
+        assert!(store_segment_record(&mut records, 1, segments[0].clone()).is_err());
     }
 
     struct ScriptedReader(VecDeque<std::io::Result<Vec<u8>>>);

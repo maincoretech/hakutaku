@@ -106,7 +106,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     })?;
     if report.changed {
         println!(
-            "release {}: {} files, {} blocks ({} reused, {} new), {} new segment(s), {} MiB written",
+            "release {}: {} files, {} blocks ({} reused, {} new), {} new segment(s), {} MiB written; {} MiB retained, {} MiB stranded",
             report.release_sequence,
             report.file_count,
             report.block_count,
@@ -114,6 +114,8 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             report.new_blocks,
             report.new_segments,
             report.new_segment_bytes / (1024 * 1024),
+            report.retained_segment_bytes / (1024 * 1024),
+            report.stranded_segment_bytes / (1024 * 1024),
         );
     } else {
         println!(

@@ -48,12 +48,18 @@ Only `game.haku` and `data/*.taku` belong in the shipped game. The
 `*.hakutaku-key` identity contains both the content root key and publisher
 signing key; never ship or commit it.
 
-Incremental packing reuses chunks from the active release. Identical chunks are
-also deduplicated during the first release, so copied assets are encrypted and
-stored only once. Files up to 32 KiB are marked `Hot`, media uses fixed
+Incremental packing reuses chunks from the active release. Identical chunks in
+the same placement class are also deduplicated during the first release, so
+copied assets with the same access policy are encrypted and stored only once.
+Files up to 32 KiB are marked `Hot`, media uses fixed
 `Streaming` blocks, and other assets enter the bounded second-hit `Normal`
-cache. A deferred prefix is isolated into separately signed segment records;
-required and deferred blocks never share a segment.
+cache. The reference packer keeps each availability/access class in its own
+bounded segment stream: 64 MiB for Hot, 256 MiB for Normal, 128 MiB for
+Transient, and up to the configured limit (512 MiB by default) for Streaming.
+These are upper bounds rather than padded target sizes. Deferred content is
+also isolated; required and deferred blocks never share a segment.
+See [`docs/io-performance.md`](docs/io-performance.md) for the local Unity- and
+Unreal-shaped I/O regression baseline.
 
 ## Runtime and update integration
 

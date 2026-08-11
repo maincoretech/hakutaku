@@ -1,4 +1,4 @@
-use hakutaku_core::{Package, ResourceBudget};
+use hakutaku_core::{Asset, Package, ResourceBudget};
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -33,19 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open_elapsed = open_started.elapsed();
     let asset = package.asset("opening.mp4")?;
 
-    package.trim();
-    let sequential_started = Instant::now();
-    let mut cursor = asset.cursor();
-    let mut buffer = vec![0_u8; 256 * 1024];
-    let mut sequential_bytes = 0_u64;
-    loop {
-        let read = cursor.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        sequential_bytes += read as u64;
-    }
-    let sequential_elapsed = sequential_started.elapsed();
+    let sequential_256k = sequential_mib_s(&package, &asset, 256 * 1024)?;
+    let sequential_128k = sequential_mib_s(&package, &asset, 128 * 1024)?;
 
     package.trim();
     let random_started = Instant::now();
@@ -64,10 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hakutaku runtime benchmark: stream-32m-v1");
     println!("pack_ms={:.3}", milliseconds(pack_elapsed));
     println!("open_ms={:.3}", milliseconds(open_elapsed));
-    println!(
-        "sequential_mib_s={:.1}",
-        sequential_bytes as f64 / (1024.0 * 1024.0) / sequential_elapsed.as_secs_f64()
-    );
+    println!("sequential_128k_mib_s={sequential_128k:.1}");
+    println!("sequential_256k_mib_s={sequential_256k:.1}");
     println!(
         "random_4k_iops={:.0}",
         RANDOM_REQUESTS as f64 / random_elapsed.as_secs_f64()
@@ -97,6 +84,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dedup.reused_blocks,
     );
     Ok(())
+}
+
+fn sequential_mib_s(
+    package: &Package,
+    asset: &Asset,
+    request_bytes: usize,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    package.trim();
+    let started = Instant::now();
+    let mut cursor = asset.cursor();
+    let mut buffer = vec![0_u8; request_bytes];
+    let mut bytes = 0_u64;
+    loop {
+        let read = cursor.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+    }
+    Ok(bytes as f64 / (1024.0 * 1024.0) / started.elapsed().as_secs_f64())
 }
 
 fn write_fixture(path: &Path, bytes: usize) -> std::io::Result<()> {
