@@ -1,5 +1,9 @@
 # Hakutaku
 
+<p align="center">
+  <img src="assets/icons/hakutaku.png" width="160" alt="Hakutaku project icon">
+</p>
+
 Hakutaku is an authenticated, random-access resource package designed for
 offline games. A release consists of one signed `game.haku` snapshot and a
 small set of immutable, content-addressed `.taku` segments.

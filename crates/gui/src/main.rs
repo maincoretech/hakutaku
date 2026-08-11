@@ -16,7 +16,8 @@ fn main() {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([860.0, 620.0])
         .with_resizable(true)
-        .with_min_inner_size([680.0, 480.0]);
+        .with_min_inner_size([680.0, 480.0])
+        .with_icon(application_icon());
     let result = eframe::run_native(
         "Hakutaku",
         eframe::NativeOptions {
@@ -30,6 +31,15 @@ fn main() {
     );
     if let Err(error) = result {
         eprintln!("Hakutaku GUI failed: {error}");
+    }
+}
+
+fn application_icon() -> egui::IconData {
+    const SIZE: u32 = 256;
+    egui::IconData {
+        rgba: include_bytes!("../../../assets/icons/hakutaku-256.rgba").to_vec(),
+        width: SIZE,
+        height: SIZE,
     }
 }
 
@@ -1215,6 +1225,17 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_application_icon_is_valid_rgba() {
+        let icon = application_icon();
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert_eq!(icon.rgba[3], 0, "canvas corner must be transparent");
+        let center_alpha = ((128 * 256 + 128) * 4 + 3) as usize;
+        assert_eq!(icon.rgba[center_alpha], 255, "icon center must be opaque");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

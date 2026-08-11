@@ -140,8 +140,9 @@ jobs:
         shell: bash
         run: |
           app="hakutaku-gui-${{ matrix.suffix }}.app"
-          mkdir -p "$app/Contents/MacOS"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp "target/${{ matrix.target }}/release/hakutaku-gui" "$app/Contents/MacOS/hakutaku-gui"
+          cp assets/icons/hakutaku.icns "$app/Contents/Resources/hakutaku.icns"
           chmod +x "$app/Contents/MacOS/hakutaku-gui"
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -150,6 +151,7 @@ jobs:
             '<key>CFBundleExecutable</key><string>hakutaku-gui</string>' \
             '<key>CFBundleName</key><string>Hakutaku</string>' \
             '<key>CFBundleIdentifier</key><string>tech.maincore.hakutaku</string>' \
+            '<key>CFBundleIconFile</key><string>hakutaku.icns</string>' \
             '<key>CFBundleVersion</key><string>1</string>' \
             '<key>NSHighResolutionCapable</key><true/>' \
             '</dict></plist>' > "$app/Contents/Info.plist"
