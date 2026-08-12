@@ -16,8 +16,11 @@ fn main() {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([860.0, 620.0])
         .with_resizable(true)
-        .with_min_inner_size([680.0, 480.0])
-        .with_icon(application_icon());
+        .with_min_inner_size([680.0, 480.0]);
+    #[cfg(target_os = "macos")]
+    let viewport = viewport.with_icon(egui::IconData::default());
+    #[cfg(not(target_os = "macos"))]
+    let viewport = viewport.with_icon(application_icon());
     let result = eframe::run_native(
         "Hakutaku",
         eframe::NativeOptions {
@@ -34,6 +37,7 @@ fn main() {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn application_icon() -> egui::IconData {
     const SIZE: u32 = 256;
     egui::IconData {
