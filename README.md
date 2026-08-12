@@ -119,6 +119,12 @@ cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
 cargo bench --workspace
 ```
 
+Every successful push to `main` creates the next patch tag and publishes the
+CLI and GUI builds, together with `SHA256SUMS`, on GitHub Releases. The first
+automated tag follows `workspace.package.version`; later releases increment its
+patch component. Raise the workspace version explicitly to start a new minor or
+major line.
+
 Both library crates deny missing public API documentation. CI therefore keeps
 public rustdoc coverage at 100%. The canonical wire-format parser is held at
 100% line coverage; the combined runtime and publisher baseline is 97.5% or

@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -163,3 +162,82 @@ jobs:
           path: |
             hakutaku-gui-${{ matrix.suffix }}*
             !hakutaku-gui-${{ matrix.suffix }}.app/**
+
+  release:
+    name: Tag and publish release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [quality, coverage, mobile-core, build-cli, build-gui]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: hakutaku-main-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: hakutaku-*
+          path: release-assets
+          merge-multiple: true
+      - name: Select next patch version
+        id: version
+        shell: bash
+        run: |
+          existing_tag="$(git tag --points-at "$GITHUB_SHA" --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+          if [[ -n "$existing_tag" ]]; then
+            echo "tag=$existing_tag" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base_version="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml)"
+          if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid workspace package version: $base_version" >&2
+            exit 1
+          fi
+
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+          if [[ -z "$latest_tag" ]]; then
+            next_version="$base_version"
+          else
+            latest_version="${latest_tag#v}"
+            highest="$(printf '%s\n%s\n' "$base_version" "$latest_version" | sort -V | tail -n 1)"
+            if [[ "$highest" == "$base_version" && "$base_version" != "$latest_version" ]]; then
+              next_version="$base_version"
+            else
+              IFS=. read -r major minor patch <<< "$latest_version"
+              next_version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+
+          echo "tag=v$next_version" >> "$GITHUB_OUTPUT"
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd release-assets
+          shopt -s nullglob
+          assets=(*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "no release assets were downloaded" >&2
+            exit 1
+          fi
+          sha256sum "${assets[@]}" > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Hakutaku $RELEASE_TAG" \
+              --generate-notes
+          fi
