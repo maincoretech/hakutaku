@@ -149,7 +149,7 @@ jobs:
             '<plist version="1.0"><dict>' \
             '<key>CFBundleExecutable</key><string>hakutaku-gui</string>' \
             '<key>CFBundleName</key><string>Hakutaku</string>' \
-            '<key>CFBundleIdentifier</key><string>tech.maincore.hakutaku</string>' \
+            '<key>CFBundleIdentifier</key><string>moe.maincore.hakutaku</string>' \
             '<key>CFBundleIconFile</key><string>hakutaku.icns</string>' \
             '<key>CFBundleVersion</key><string>1</string>' \
             '<key>NSHighResolutionCapable</key><true/>' \
