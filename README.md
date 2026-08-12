@@ -5,8 +5,13 @@
 </p>
 
 Hakutaku is an authenticated, random-access resource package designed for
-offline games. A release consists of one signed `game.haku` snapshot and a
-small set of immutable, content-addressed `.taku` segments.
+offline games and optimized for visual-novel content. Its packing and runtime
+policies account for many small scripts and UI assets, seekable voice, music,
+and video streams, large backgrounds and character images, scene-local
+lookahead, and patch-friendly resource replacement. A release consists of one
+signed `game.haku` snapshot and a small set of immutable, content-addressed
+`.taku` segments. The wire format remains general enough for other offline
+games; the reference policy is tuned for visual novels.
 
 The repository is intentionally split by responsibility:
 
