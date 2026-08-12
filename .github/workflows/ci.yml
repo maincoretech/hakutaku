@@ -34,9 +34,9 @@ jobs:
         run: cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
       - name: Wire-format line coverage
         run: >-
-          cargo llvm-cov -p hakutaku-core -p hakutaku-pack
+          cargo llvm-cov -p hakutaku-core --lib
           --ignore-filename-regex
-          '(cli|gui)/src/main\.rs$|/(cache|crypto|error|io|package|identity|packer)\.rs$'
+          '/(cache|crypto|error|io|package)\.rs$'
           --fail-under-lines 100
 
   mobile-core:

@@ -71,7 +71,7 @@ bounded segment stream: 64 MiB for Hot, 256 MiB for Normal, 128 MiB for
 Transient, and up to the configured limit (512 MiB by default) for Streaming.
 These are upper bounds rather than padded target sizes. Deferred content is
 also isolated; required and deferred blocks never share a segment.
-See [PERFORMANCE.md](PERFORMANCE.md) for the allocation policy and the local
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the allocation policy and the local
 Unity- and Unreal-shaped I/O regression baseline.
 
 ## Runtime and update integration
@@ -101,7 +101,7 @@ collection. Interrupted `.part` files are removed only after the exclusive
 build lock is acquired. If a process is killed while packing, confirm no packer
 is still running before removing a reported stale `.hakutaku.lock`.
 
-See [FORMAT.md](FORMAT.md) for the normative v1 byte layout, parser limits,
+See [docs/FORMAT.md](docs/FORMAT.md) for the normative v1 byte layout, parser limits,
 nonce/AAD rules, and verification chain.
 
 ## Validation
