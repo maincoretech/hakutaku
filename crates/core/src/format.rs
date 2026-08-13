@@ -837,13 +837,18 @@ impl Catalog {
         let path_slot_offset = read_u32(&bytes, 52)? as usize;
         let path_pool_offset = read_u32(&bytes, 56)? as usize;
         let page_offset = read_u32(&bytes, 60)? as usize;
-        // All factors were bounded above, so these additions fit even on
-        // 32-bit mobile targets (the maximum canonical catalog is < 80 MiB).
+        // Segment and file counts have explicit maxima, while the slot count
+        // is only required to be a power of two. Keep its multiplication
+        // checked so a hostile header cannot wrap usize on 32-bit targets.
         let expected_file = CATALOG_HEADER_SIZE + segment_count as usize * SEGMENT_RECORD_SIZE;
         let expected_slots = expected_file + file_count as usize * FILE_RECORD_SIZE;
-        let expected_pool = expected_slots + path_slot_count as usize * PATH_SLOT_SIZE;
-        let expected_pages = expected_pool + path_pool_len as usize;
-        let expected_len = expected_pages + page_count as usize * PAGE_RECORD_SIZE;
+        let expected_pool =
+            checked_table_end(expected_slots, path_slot_count as usize, PATH_SLOT_SIZE)?;
+        let expected_pages = expected_pool
+            .checked_add(path_pool_len as usize)
+            .ok_or(Error::InvalidFormat("catalog size overflow"))?;
+        let expected_len =
+            checked_table_end(expected_pages, page_count as usize, PAGE_RECORD_SIZE)?;
         if (
             segment_offset,
             file_offset,
@@ -1718,6 +1723,10 @@ mod tests {
             assert!(Catalog::parse(damaged.into()).is_err());
         }
         assert!(Catalog::parse(bytes[..CATALOG_HEADER_SIZE - 1].into()).is_err());
+
+        let mut oversized_slots = bytes.clone();
+        oversized_slots[28..32].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        assert!(Catalog::parse(oversized_slots.into()).is_err());
 
         let segment_offset = CATALOG_HEADER_SIZE;
         let file_offset = segment_offset + SEGMENT_RECORD_SIZE;

@@ -1,6 +1,7 @@
 use hakutaku_core::{Package, ResourceBudget};
 use hakutaku_pack::{Identity, PackOptions, pack_directory_with_progress};
 use lexopt::prelude::*;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -15,7 +16,15 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut parser = lexopt::Parser::from_env();
+    run_from(std::env::args_os().skip(1))
+}
+
+fn run_from<I, T>(args: I) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let mut parser = lexopt::Parser::from_args(args);
     let Some(command) = parser.next()? else {
         print_help();
         return Ok(());
@@ -247,4 +256,47 @@ fn print_help() {
          extract -p DIR -k ID -o DIR\n  \
          verify -p DIR -k ID      verify snapshot and complete segments"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(args: &[&str]) -> String {
+        run_from(args.iter().copied()).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn top_level_help_and_empty_invocation_succeed() {
+        assert!(run_from(std::iter::empty::<&str>()).is_ok());
+        assert!(run_from(["help"]).is_ok());
+        assert!(run_from(["--help"]).is_ok());
+        assert!(run_from(["-h"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_commands_and_options() {
+        assert!(error(&["unknown"]).contains("unknown command"));
+        assert!(error(&["pack", "--unknown"]).contains("unknown pack option"));
+        assert!(error(&["list", "--unknown"]).contains("unknown option"));
+    }
+
+    #[test]
+    fn commands_require_their_declared_arguments() {
+        assert!(error(&["identity", "create"]).contains("missing argument"));
+        assert!(error(&["pack"]).contains("missing required --identity"));
+        assert!(error(&["list"]).contains("missing required --package"));
+        assert!(error(&["segments"]).contains("missing required --package"));
+        assert!(
+            error(&["extract", "-p", "release", "-k", "publisher-key"])
+                .contains("missing required --output")
+        );
+        assert!(error(&["verify"]).contains("missing required --package"));
+    }
+
+    #[test]
+    fn pack_help_does_not_require_publisher_inputs() {
+        assert!(run_from(["pack", "--help"]).is_ok());
+        assert!(run_from(["pack", "-h"]).is_ok());
+    }
 }

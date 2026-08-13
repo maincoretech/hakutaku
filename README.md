@@ -121,6 +121,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc -p hakutaku-core -p hakutaku-pack --no-deps
 cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
+cargo llvm-cov -p hakutaku-cli --fail-under-lines 45
 cargo bench --workspace
 ```
 
@@ -133,6 +134,12 @@ major line.
 Both library crates deny missing public API documentation. CI therefore keeps
 public rustdoc coverage at 100%. The canonical wire-format parser is held at
 100% line coverage; the combined runtime and publisher baseline is 97.5% or
-higher. The remaining lines are operating-system and cryptographic-provider
-failure returns that cannot be triggered deterministically without replacing
-the production backends.
+higher, and CLI argument handling has a 45% regression floor. The remaining
+lines are operating-system and cryptographic-provider failure returns that
+cannot be triggered deterministically without replacing the production
+backends.
+
+## License
+
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.

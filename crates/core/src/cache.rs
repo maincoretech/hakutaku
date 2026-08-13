@@ -39,7 +39,9 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
             return;
         }
         while self.used.saturating_add(value.len()) > self.budget {
-            self.evict_one();
+            if !self.evict_one() {
+                return;
+            }
         }
         let slot = self
             .entries
@@ -65,9 +67,15 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         self.index.clear();
     }
 
-    fn evict_one(&mut self) {
-        debug_assert!(!self.index.is_empty());
-        loop {
+    /// Evicts one live entry, returning `false` if the cache has no indexed
+    /// entry. The bounded scan also keeps inconsistent bookkeeping from
+    /// turning internal maintenance into division by zero or an endless loop.
+    fn evict_one(&mut self) -> bool {
+        if self.index.is_empty() || self.entries.is_empty() {
+            return false;
+        }
+        let scan_limit = self.entries.len().saturating_mul(2).max(1);
+        for _ in 0..scan_limit {
             self.hand %= self.entries.len();
             if let Some(entry) = self.entries[self.hand].as_mut() {
                 if entry.referenced {
@@ -77,11 +85,12 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
                     self.used = self.used.saturating_sub(entry.value.len());
                     self.index.remove(&entry.key);
                     self.hand = (self.hand + 1) % self.entries.len();
-                    return;
+                    return true;
                 }
             }
             self.hand = (self.hand + 1) % self.entries.len();
         }
+        false
     }
 }
 
@@ -127,7 +136,30 @@ mod tests {
         cache.entries.insert(0, None);
         *cache.index.get_mut(&1).unwrap() += 1;
         cache.hand = 0;
-        cache.evict_one();
+        assert!(cache.evict_one());
         assert!(cache.index.is_empty());
+    }
+
+    #[test]
+    fn evicting_an_empty_cache_is_a_noop() {
+        let mut cache = ClockCache::<u8>::new(8);
+
+        assert!(!cache.evict_one());
+        assert_eq!(cache.used, 0);
+        assert_eq!(cache.hand, 0);
+    }
+
+    #[test]
+    fn inconsistent_cache_bookkeeping_cannot_spin_forever() {
+        let mut cache = ClockCache::<u8>::new(8);
+        cache.entries.push(None);
+        cache.index.insert(1, 0);
+
+        assert!(!cache.evict_one());
+
+        cache.index.clear();
+        cache.used = cache.budget;
+        cache.insert(2, bytes(1, 2));
+        assert!(!cache.index.contains_key(&2));
     }
 }
