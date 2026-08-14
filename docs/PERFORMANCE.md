@@ -29,7 +29,7 @@ Targets are upper bounds; tail segments are never padded.
 | Normal, up to 64 MiB | FastCDC, 32–512 KiB, 128 KiB average | 256 MiB |
 | Normal, larger | fixed 1 MiB | 256 MiB |
 | Streaming | fixed 256 KiB | configured limit, default 512 MiB |
-| Transient | caller-declared | 128 MiB |
+| Transient | short voice/SFX, fixed 256 KiB | 128 MiB |
 
 The publisher reports retained segment bytes, unique referenced encrypted block
 bytes, and stranded payload after every build. A full rebuild is the single
@@ -56,6 +56,9 @@ compaction mechanism; the runtime never performs garbage collection.
   memory-constrained prefetch budgets are 2 MiB and 512 KiB respectively.
 - Hot and admitted Normal content retain their separate cache policy; streaming
   prefetch cannot evict those entries.
+- Repeated offset-based reads can retain an `AssetReadSession`; the one-shot
+  `Asset::read_at` deliberately remains allocation-simple, while cursors and
+  sessions reuse their active segment, buffers, and Streaming block window.
 
 `Package::trim` releases page, plaintext, prefetch, probation, and idle-handle
 caches together. Active readers keep only their current segment handle until
@@ -113,3 +116,44 @@ An attempted cursor-local block-map page window was rejected: its same-session
 A/B changed sequential throughput by only +0.1%/+0.9% and random reads by
 -0.4%, while increasing retained state. This prevents an unproven optimization
 from becoming part of the runtime architecture.
+
+## Visual-novel workload matrix
+
+`vn_runtime` builds 10k, 50k, and 100k-asset catalogs dominated by small voice
+entries plus representative script, background, character, voice, BGM, and
+video files. It measures first and repeated package open, 1,000 random path
+lookups, first reads by VN asset class, 1,000 sequential voices, BGM/video
+sequential reads with short seeks, and interleaved voice/image/script cursors.
+A counting `SegmentSource` reports physical backend bytes, logical requested
+bytes, and read amplification. It also compares an unchanged strict incremental
+pack with the same work after seeding and reusing the local development cache.
+
+```sh
+HAKUTAKU_VN_BENCH=1 cargo bench -p hakutaku-pack --bench vn_runtime
+```
+
+Set `HAKUTAKU_VN_BENCH_COUNTS=10000` for a quick smoke fixture. First-open and
+second-open results distinguish a colder process-level pass from an immediately
+warm pass, but Hakutaku does not claim portable cold-storage numbers: obtaining
+those requires a fresh process plus an OS-specific cache reset or reboot on the
+actual target device.
+
+Apple Silicon macOS, 2026-08-14, 10k smoke fixture (single run, warm filesystem
+cache):
+
+| Metric | Result |
+|---|---:|
+| Initial strict pack | 502.831 ms |
+| Unchanged strict incremental | 277.719 ms |
+| Development-cache seed | 278.581 ms |
+| Development-cache hit | 136.550 ms |
+| Signed package open, first / immediate repeat | 1.623 / 1.638 ms |
+| 1,000 random path lookups | 0.241 ms, 0 backend bytes |
+| Background / character read amplification | 1.022x / 1.022x |
+| Representative voice / 1,000 voices | 1.304x / 1.759x |
+| BGM / video sequential plus short seek | 1.126x / 1.063x |
+
+The cached unchanged build was 50.8% faster than strict incremental on this
+metadata-heavy fixture. This is a smoke marker, not a claim about 20–40 GiB
+projects; the full count matrix and target storage should be measured before a
+release decision.

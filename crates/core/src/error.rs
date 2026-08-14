@@ -21,6 +21,13 @@ pub enum Error {
     Authentication(&'static str),
     /// The publisher signature or its key identifier is invalid.
     Signature,
+    /// A validly signed snapshot is older than the caller's accepted floor.
+    ReleaseRollback {
+        /// Lowest release sequence accepted by the caller.
+        minimum: u64,
+        /// Sequence presented by the authenticated snapshot.
+        actual: u64,
+    },
     /// A segment belongs to another project.
     ProjectMismatch,
     /// A required immutable segment cannot be opened.
@@ -46,6 +53,10 @@ impl fmt::Display for Error {
             Self::LimitExceeded(limit) => write!(f, "Hakutaku limit exceeded: {limit}"),
             Self::Authentication(scope) => write!(f, "authentication failed for {scope}"),
             Self::Signature => f.write_str("snapshot publisher signature is invalid"),
+            Self::ReleaseRollback { minimum, actual } => write!(
+                f,
+                "snapshot release {actual} is older than required release {minimum}"
+            ),
             Self::ProjectMismatch => f.write_str("package belongs to a different project"),
             Self::SegmentUnavailable(id) => write!(f, "segment is unavailable: {id}"),
             Self::AssetNotFound => f.write_str("asset was not found"),
@@ -87,6 +98,10 @@ mod tests {
             Error::LimitExceeded("files"),
             Error::Authentication("catalog"),
             Error::Signature,
+            Error::ReleaseRollback {
+                minimum: 4,
+                actual: 3,
+            },
             Error::ProjectMismatch,
             Error::SegmentUnavailable(SegmentId([1; 32])),
             Error::AssetNotFound,
@@ -101,6 +116,7 @@ mod tests {
             "Hakutaku limit exceeded: files",
             "authentication failed for catalog",
             "snapshot publisher signature is invalid",
+            "snapshot release 3 is older than required release 4",
             "package belongs to a different project",
             "segment is unavailable:",
             "asset was not found",
@@ -112,8 +128,8 @@ mod tests {
             assert!(error.to_string().contains(expected));
         }
         assert!(std::error::Error::source(&cases[0]).is_some());
-        assert!(std::error::Error::source(&cases[11]).is_some());
-        for error in &cases[1..11] {
+        assert!(std::error::Error::source(&cases[12]).is_some());
+        for error in &cases[1..12] {
             assert!(std::error::Error::source(error).is_none());
         }
         assert!(matches!(

@@ -1,5 +1,5 @@
-use hakutaku_core::{Package, ResourceBudget};
-use hakutaku_pack::{Identity, PackOptions, pack_directory_with_progress};
+use hakutaku_core::{OpenPolicy, Package, ResourceBudget};
+use hakutaku_pack::{Identity, PackOptions, RuntimeKeyMaterial, pack_directory_with_progress};
 use lexopt::prelude::*;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -63,7 +63,22 @@ fn identity_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::erro
             println!("do not ship this identity file with the game");
             Ok(())
         }
-        _ => Err("usage: hakutaku identity create <publisher.hakutaku-key>".into()),
+        Some(Value(command)) if command == "export-runtime" => {
+            let publisher: PathBuf = parser.value()?.into();
+            let output: PathBuf = parser.value()?.into();
+            if parser.next()?.is_some() {
+                return Err("identity export-runtime accepts publisher and output paths".into());
+            }
+            let identity = Identity::load(publisher)?;
+            identity.runtime_key_material()?.save(&output)?;
+            println!("created runtime keys {}", output.display());
+            println!("contains decryption material but no signing private key");
+            Ok(())
+        }
+        _ => Err(
+            "usage: hakutaku identity create <publisher.hakutaku-key> | identity export-runtime <publisher.hakutaku-key> <game.hakutaku-runtime-key>"
+                .into(),
+        ),
     }
 }
 
@@ -72,6 +87,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     let mut output = None;
     let mut identity = None;
     let mut incremental = true;
+    let mut development_cache = false;
     let mut level = 3;
     let mut segment_mib = 512_u64;
     let mut deferred_prefixes = Vec::new();
@@ -81,6 +97,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             Long("output") | Short('o') => output = Some(PathBuf::from(parser.value()?)),
             Long("identity") | Short('k') => identity = Some(PathBuf::from(parser.value()?)),
             Long("full") => incremental = false,
+            Long("dev-cache") => development_cache = true,
             Long("zstd-level") => level = parser.value()?.parse()?,
             Long("segment-mib") => segment_mib = parser.value()?.parse()?,
             Long("deferred-prefix") => {
@@ -88,7 +105,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             }
             Long("help") | Short('h') => {
                 println!(
-                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--zstd-level 3] [--segment-mib 512] [--deferred-prefix PATH]"
+                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--dev-cache] [--zstd-level 3] [--segment-mib 512] [--deferred-prefix PATH]"
                 );
                 return Ok(());
             }
@@ -101,6 +118,12 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
         required_path(output, "--output")?,
     );
     options.incremental = incremental;
+    if development_cache && !incremental {
+        return Err(
+            "--dev-cache cannot be combined with --full; full builds always reread sources".into(),
+        );
+    }
+    options.development_cache = development_cache;
     options.compression_level = level;
     options.segment_target_bytes = segment_mib
         .checked_mul(1024 * 1024)
@@ -136,11 +159,11 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
 }
 
 fn list_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
-    let (release, identity, extra) = package_arguments(parser)?;
-    if extra.is_some() {
-        return Err("list accepts only --package and --identity".into());
+    let arguments = package_arguments(parser)?;
+    if arguments.output.is_some() {
+        return Err("list accepts only --package, --keys, and --minimum-release".into());
     }
-    let package = open_package(&release, &identity)?;
+    let package = open_package(&arguments)?;
     for asset in package.list_assets()? {
         println!("{:>12}  {:?}  {}", asset.len, asset.access, asset.path);
     }
@@ -148,11 +171,11 @@ fn list_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
 }
 
 fn segments_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
-    let (release, identity, extra) = package_arguments(parser)?;
-    if extra.is_some() {
-        return Err("segments accepts only --package and --identity".into());
+    let arguments = package_arguments(parser)?;
+    if arguments.output.is_some() {
+        return Err("segments accepts only --package, --keys, and --minimum-release".into());
     }
-    let package = open_package(&release, &identity)?;
+    let package = open_package(&arguments)?;
     for segment in package.list_segments()? {
         println!(
             "{:>12}  {:?}  {}",
@@ -163,16 +186,18 @@ fn segments_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::erro
 }
 
 fn extract_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
-    let (release, identity, output) = package_arguments(parser)?;
-    let output = required_path(output, "--output")?;
-    let package = open_package(&release, &identity)?;
+    let arguments = package_arguments(parser)?;
+    let output = required_path(arguments.output.clone(), "--output")?;
+    std::fs::create_dir_all(&output)?;
+    let output = output.canonicalize()?;
+    let package = open_package(&arguments)?;
     for asset in package.list_assets()? {
-        let target = output.join(&asset.path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let target = safe_extraction_target(&output, &asset.path)?;
         let mut source = package.asset(&asset.path)?.cursor();
-        let mut destination = std::fs::File::create(&target)?;
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
         std::io::copy(&mut source, &mut destination)?;
     }
     println!("extracted to {}", output.display());
@@ -180,11 +205,11 @@ fn extract_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error
 }
 
 fn verify_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
-    let (release, identity, extra) = package_arguments(parser)?;
-    if extra.is_some() {
-        return Err("verify accepts only --package and --identity".into());
+    let arguments = package_arguments(parser)?;
+    if arguments.output.is_some() {
+        return Err("verify accepts only --package, --keys, and --minimum-release".into());
     }
-    let package = open_package(&release, &identity)?;
+    let package = open_package(&arguments)?;
     package.verify_segments()?;
     println!(
         "valid release {} ({} assets)",
@@ -194,39 +219,82 @@ fn verify_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+struct PackageArguments {
+    release: PathBuf,
+    keys: PathBuf,
+    output: Option<PathBuf>,
+    minimum_release: Option<u64>,
+}
+
 fn package_arguments(
     parser: &mut lexopt::Parser,
-) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Box<dyn std::error::Error>> {
+) -> Result<PackageArguments, Box<dyn std::error::Error>> {
     let mut release = None;
-    let mut identity = None;
+    let mut keys = None;
     let mut output = None;
+    let mut minimum_release = None;
     while let Some(argument) = parser.next()? {
         match argument {
             Long("package") | Short('p') => release = Some(PathBuf::from(parser.value()?)),
-            Long("identity") | Short('k') => identity = Some(PathBuf::from(parser.value()?)),
+            Long("keys") | Short('k') => keys = Some(PathBuf::from(parser.value()?)),
             Long("output") | Short('o') => output = Some(PathBuf::from(parser.value()?)),
+            Long("minimum-release") => minimum_release = Some(parser.value()?.parse()?),
             other => return Err(format!("unknown option: {other:?}").into()),
         }
     }
-    Ok((
-        required_path(release, "--package")?,
-        required_path(identity, "--identity")?,
+    Ok(PackageArguments {
+        release: required_path(release, "--package")?,
+        keys: required_path(keys, "--keys")?,
         output,
-    ))
+        minimum_release,
+    })
 }
 
-fn open_package(
-    release: &Path,
-    identity_path: &Path,
-) -> Result<Package, Box<dyn std::error::Error>> {
-    let identity = Identity::load(identity_path)?;
-    Ok(Package::open_directory(
-        release.join("game.haku"),
-        release.join("data"),
-        identity.root_key(),
-        identity.public_key(),
+fn open_package(arguments: &PackageArguments) -> Result<Package, Box<dyn std::error::Error>> {
+    let keys = RuntimeKeyMaterial::load(&arguments.keys)?;
+    let package = Package::open_directory_with_policy(
+        arguments.release.join("game.haku"),
+        arguments.release.join("data"),
+        keys.root_key(),
+        keys.public_key,
         ResourceBudget::default(),
-    )?)
+        OpenPolicy {
+            minimum_release_sequence: arguments.minimum_release,
+        },
+    )?;
+    if package.project_id() != keys.project_id {
+        return Err(hakutaku_core::Error::ProjectMismatch.into());
+    }
+    Ok(package)
+}
+
+fn safe_extraction_target(
+    root: &Path,
+    logical_path: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    hakutaku_core::format::validate_canonical_path(logical_path)?;
+    let mut components = logical_path.split('/').peekable();
+    let mut parent = root.to_path_buf();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            let target = parent.join(component);
+            if !target.starts_with(root) {
+                return Err("extraction target escaped output root".into());
+            }
+            return Ok(target);
+        }
+        parent.push(component);
+        match std::fs::create_dir(&parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        parent = parent.canonicalize()?;
+        if !parent.starts_with(root) {
+            return Err("extraction directory escaped output root".into());
+        }
+    }
+    Err("empty extraction path".into())
 }
 
 fn required_path(
@@ -250,17 +318,26 @@ fn print_help() {
         "Hakutaku authenticated game resources\n\n\
          commands:\n  \
          identity create <file>   create a publisher-only identity\n  \
+         identity export-runtime <publisher> <runtime-keys>\n  \
          pack -i DIR -o DIR -k ID build or increment a release\n  \
-         list -p DIR -k ID        list logical assets\n  \
-         segments -p DIR -k ID    list signed segment inventory\n  \
-         extract -p DIR -k ID -o DIR\n  \
-         verify -p DIR -k ID      verify snapshot and complete segments"
+         list -p DIR -k KEYS      list logical assets\n  \
+         segments -p DIR -k KEYS  list signed segment inventory\n  \
+         extract -p DIR -k KEYS -o DIR\n  \
+         verify -p DIR -k KEYS    verify snapshot and complete segments"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hakutaku-cli-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
 
     fn error(args: &[&str]) -> String {
         run_from(args.iter().copied()).unwrap_err().to_string()
@@ -284,6 +361,7 @@ mod tests {
     #[test]
     fn commands_require_their_declared_arguments() {
         assert!(error(&["identity", "create"]).contains("missing argument"));
+        assert!(error(&["identity", "export-runtime"]).contains("missing argument"));
         assert!(error(&["pack"]).contains("missing required --identity"));
         assert!(error(&["list"]).contains("missing required --package"));
         assert!(error(&["segments"]).contains("missing required --package"));
@@ -298,5 +376,28 @@ mod tests {
     fn pack_help_does_not_require_publisher_inputs() {
         assert!(run_from(["pack", "--help"]).is_ok());
         assert!(run_from(["pack", "-h"]).is_ok());
+    }
+
+    #[test]
+    fn extraction_targets_remain_beneath_the_canonical_root() {
+        let root = scratch("extract-root");
+        let outside = scratch("extract-outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = root.canonicalize().unwrap();
+        let target = safe_extraction_target(&root, "voice/ch01/line.opus").unwrap();
+        assert!(target.starts_with(&root));
+        assert!(safe_extraction_target(&root, "../escape").is_err());
+        assert!(safe_extraction_target(&root, "C:/escape").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+            assert!(safe_extraction_target(&root, "linked/escape.bin").is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 }

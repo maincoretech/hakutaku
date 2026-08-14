@@ -1,3 +1,4 @@
+use crate::build_cache::{self, BuildCache, CachedChunk, CachedEntry};
 use crate::source::{SourceFile, classify, collect_files};
 use crate::{Error, Identity, Result};
 use hakutaku_core::crypto::{self, Aes256Key, ProjectKeys};
@@ -10,6 +11,7 @@ use hakutaku_core::format::{
 use hakutaku_core::{Package, ResourceBudget, SEGMENT_FILE_EXTENSION, segment_file_name};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ const DEFAULT_SEGMENT_TARGET: u64 = 512 * 1024 * 1024;
 const HOT_SEGMENT_TARGET: u64 = 64 * 1024 * 1024;
 const NORMAL_SEGMENT_TARGET: u64 = 256 * 1024 * 1024;
 const TRANSIENT_SEGMENT_TARGET: u64 = 128 * 1024 * 1024;
+const BUILD_CACHE_FILE: &str = ".hakutaku-build-cache";
 
 #[derive(Clone, Debug)]
 /// Inputs and policy controls for one deterministic package build.
@@ -32,6 +35,10 @@ pub struct PackOptions {
     pub output_directory: PathBuf,
     /// Whether unchanged encrypted blocks may be reused from the previous release.
     pub incremental: bool,
+    /// Trusts a local size/mtime/file-identity cache to skip unchanged source
+    /// bodies. Intended only for development builds; final builds should leave
+    /// this disabled to retain byte-for-byte source verification.
+    pub development_cache: bool,
     /// Zstandard compression level used when compression is canonical and beneficial.
     pub compression_level: i32,
     /// Approximate maximum payload bytes written to one new segment.
@@ -50,6 +57,7 @@ impl PackOptions {
             input_directory: input_directory.into(),
             output_directory: output_directory.into(),
             incremental: true,
+            development_cache: false,
             compression_level: 3,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET,
             deferred_prefixes: Vec::new(),
@@ -133,6 +141,7 @@ where
     F: FnMut(PackProgress),
 {
     validate_options(options)?;
+    validate_identity_location(options, identity)?;
     std::fs::create_dir_all(&options.output_directory)?;
     let _lock = BuildLock::acquire(&options.output_directory)?;
     recover_interrupted_release(&options.output_directory)?;
@@ -164,7 +173,22 @@ where
     } else {
         None
     };
-    let reuse_index = load_reuse_index(old_package.as_ref())?;
+    let build_cache = if options.development_cache {
+        old_package
+            .as_ref()
+            .map(|package| {
+                BuildCache::load(
+                    &options.output_directory.join(BUILD_CACHE_FILE),
+                    identity.project_id(),
+                    package.release_sequence(),
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let reuse = load_reuse_index(old_package.as_ref())?;
     let release_sequence = old_package.as_ref().map_or(Ok(1), |package| {
         package
             .release_sequence()
@@ -180,7 +204,8 @@ where
         options,
         identity,
         keys: &keys,
-        reuse_index,
+        reuse_index: reuse.blocks,
+        reuse_segments: reuse.segments,
         current_reuse: HashMap::new(),
         used_existing_segments: BTreeMap::new(),
         new_segment_records: Vec::new(),
@@ -211,7 +236,12 @@ where
             completed_bytes: context.completed_bytes,
             total_bytes,
         });
-        context.add_file(source)?;
+        context.add_file(
+            source,
+            build_cache
+                .as_ref()
+                .and_then(|cache| cache.get(&source.logical_path)),
+        )?;
     }
     context.finish_active_segments()?;
     if !context.new_segment_records.is_empty() {
@@ -227,6 +257,9 @@ where
         let active_segments = old.segment_ids()?;
         let active_release_sequence = old.release_sequence();
         let storage = package_storage_stats(old)?;
+        if options.development_cache {
+            save_build_cache(options, identity, active_release_sequence, &files, &context)?;
+        }
         drop(old_package);
         cleanup_unreferenced_segments(&data_directory, &active_segments)?;
         return Ok(PackReport {
@@ -261,9 +294,18 @@ where
         total_bytes,
     });
     let staged_snapshot = snapshot_path.with_extension(format!("haku.part-{}", std::process::id()));
-    if let Err(error) = verify_staged_release(&staged_snapshot, &data_directory, &files, identity) {
+    if let Err(error) = verify_staged_release(
+        &staged_snapshot,
+        &data_directory,
+        &files,
+        identity,
+        !options.development_cache,
+    ) {
         let _ = std::fs::remove_file(&staged_snapshot);
         return Err(error);
+    }
+    if options.development_cache {
+        save_build_cache(options, identity, report.release_sequence, &files, &context)?;
     }
     if let Err(error) = commit_snapshot(&snapshot_path) {
         let _ = std::fs::remove_file(&staged_snapshot);
@@ -284,7 +326,12 @@ where
 #[derive(Clone)]
 struct ReusableBlock {
     block: BlockRef,
-    segment: SegmentRecord,
+    segment_ordinal: u16,
+}
+
+struct ReuseIndex {
+    blocks: HashMap<([u8; 32], Availability), ReusableBlock>,
+    segments: Vec<SegmentRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -339,6 +386,7 @@ struct BuildContext<'a> {
     identity: &'a Identity,
     keys: &'a ProjectKeys,
     reuse_index: HashMap<([u8; 32], Availability), ReusableBlock>,
+    reuse_segments: Vec<SegmentRecord>,
     current_reuse: HashMap<([u8; 32], SegmentClass), PendingBlock>,
     used_existing_segments: BTreeMap<SegmentId, SegmentRecord>,
     new_segment_records: Vec<Option<SegmentRecord>>,
@@ -370,7 +418,7 @@ impl BuildContext<'_> {
             .collect()
     }
 
-    fn add_file(&mut self, source: &SourceFile) -> Result<()> {
+    fn add_file(&mut self, source: &SourceFile, cached: Option<&CachedEntry>) -> Result<()> {
         let (layout, fixed_block_len, access) = classify(source);
         let availability = self.options.availability(&source.logical_path);
         let first_block = u32::try_from(self.pending_blocks.len())
@@ -392,12 +440,38 @@ impl BuildContext<'_> {
 
         let before = self.pending_blocks.len();
         if source.len > 0 {
-            match layout {
-                LayoutKind::Fixed => {
-                    self.add_fixed_file(source, fixed_block_len as usize, availability, access)?
+            if let Some(cached) = cached.filter(|cached| {
+                self.cached_entry_usable(
+                    source,
+                    cached,
+                    layout,
+                    fixed_block_len,
+                    availability,
+                    access,
+                )
+            }) {
+                for chunk in &cached.chunks {
+                    self.record_chunk(chunk.chunk_id);
+                    if !self.try_reuse_chunk(
+                        chunk.logical_offset,
+                        chunk.plain_len,
+                        chunk.chunk_id,
+                        availability,
+                        access,
+                    )? {
+                        return Err(Error::InvalidInput(
+                            "development cache lost a reusable block".into(),
+                        ));
+                    }
                 }
-                LayoutKind::ContentDefined => {
-                    self.add_content_defined_file(source, availability, access)?
+            } else {
+                match layout {
+                    LayoutKind::Fixed => {
+                        self.add_fixed_file(source, fixed_block_len as usize, availability, access)?
+                    }
+                    LayoutKind::ContentDefined => {
+                        self.add_content_defined_file(source, availability, access)?
+                    }
                 }
             }
         }
@@ -421,6 +495,54 @@ impl BuildContext<'_> {
         Ok(())
     }
 
+    fn cached_entry_usable(
+        &self,
+        source: &SourceFile,
+        cached: &CachedEntry,
+        layout: LayoutKind,
+        fixed_block_len: u32,
+        availability: Availability,
+        access: AccessClass,
+    ) -> bool {
+        if cached.stamp != source.stamp()
+            || cached.layout != layout
+            || cached.fixed_block_len != fixed_block_len
+            || cached.availability != availability
+            || cached.access != access
+        {
+            return false;
+        }
+        let mut expected_offset = 0_u64;
+        for chunk in &cached.chunks {
+            if chunk.logical_offset != expected_offset || chunk.plain_len == 0 {
+                return false;
+            }
+            expected_offset = match expected_offset.checked_add(u64::from(chunk.plain_len)) {
+                Some(offset) => offset,
+                None => return false,
+            };
+            let class = SegmentClass::new(availability, access);
+            let current = self
+                .current_reuse
+                .get(&(chunk.chunk_id, class))
+                .is_some_and(|pending| pending.reference.plain_len == chunk.plain_len);
+            let existing = self
+                .reuse_index
+                .get(&(chunk.chunk_id, availability))
+                .is_some_and(|reused| {
+                    reused.block.plain_len == chunk.plain_len
+                        && self
+                            .reuse_segments
+                            .get(reused.segment_ordinal as usize)
+                            .is_some()
+                });
+            if !current && !existing {
+                return false;
+            }
+        }
+        expected_offset == source.len
+    }
+
     fn add_fixed_file(
         &mut self,
         source: &SourceFile,
@@ -429,7 +551,7 @@ impl BuildContext<'_> {
         access: AccessClass,
     ) -> Result<()> {
         let mut reader =
-            BufReader::with_capacity(block_size.min(1024 * 1024), File::open(&source.host_path)?);
+            BufReader::with_capacity(block_size.min(1024 * 1024), source.open_verified()?);
         let mut buffer = vec![0_u8; block_size];
         let mut logical_offset = 0_u64;
         loop {
@@ -443,6 +565,7 @@ impl BuildContext<'_> {
                 .ok_or_else(|| Error::InvalidInput("file offset overflow".into()))?;
         }
         validate_source_len(logical_offset, source)?;
+        source.validate_open_file(reader.get_ref())?;
         Ok(())
     }
 
@@ -452,8 +575,14 @@ impl BuildContext<'_> {
         availability: Availability,
         access: AccessClass,
     ) -> Result<()> {
-        let bytes = std::fs::read(&source.host_path)?;
+        let mut file = source.open_verified()?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(source.len)
+                .map_err(|_| Error::InvalidInput("source file is too large".into()))?,
+        );
+        file.read_to_end(&mut bytes)?;
         validate_source_len(bytes.len() as u64, source)?;
+        source.validate_open_file(&file)?;
         for chunk in fastcdc::v2020::FastCDC::new(&bytes, FASTCDC_MIN, FASTCDC_AVG, FASTCDC_MAX) {
             let end = chunk
                 .offset
@@ -477,36 +606,19 @@ impl BuildContext<'_> {
         access: AccessClass,
     ) -> Result<()> {
         let chunk_id = *blake3::hash(plaintext).as_bytes();
-        self.fingerprint.update(&chunk_id);
-        self.chunk_ids.push(chunk_id);
+        self.record_chunk(chunk_id);
+        if self.try_reuse_chunk(
+            logical_offset,
+            u32::try_from(plaintext.len())
+                .map_err(|_| Error::InvalidInput("block plaintext length".into()))?,
+            chunk_id,
+            availability,
+            access,
+        )? {
+            return Ok(());
+        }
         let class = SegmentClass::new(availability, access);
         let reuse_key = (chunk_id, class);
-        if let Some(reused) = self.current_reuse.get(&reuse_key).copied() {
-            let mut reused = reused;
-            reused.reference.logical_offset = logical_offset;
-            self.pending_blocks.push(reused);
-            self.reused_blocks = self.reused_blocks.saturating_add(1);
-            return Ok(());
-        }
-        // Existing immutable blocks keep their historical placement. A full
-        // build is the explicit operation that rewrites them into new classes.
-        if let Some(reused) = self.reuse_index.get(&(chunk_id, availability))
-            && reused.block.plain_len as usize == plaintext.len()
-        {
-            let mut reference = reused.block;
-            reference.logical_offset = logical_offset;
-            self.used_existing_segments
-                .entry(reused.segment.id)
-                .or_insert_with(|| reused.segment.clone());
-            let pending = PendingBlock {
-                locator: SegmentLocator::Existing(reused.segment.id),
-                reference,
-            };
-            self.pending_blocks.push(pending);
-            self.current_reuse.insert(reuse_key, pending);
-            self.reused_blocks = self.reused_blocks.saturating_add(1);
-            return Ok(());
-        }
 
         let (codec, encoded) = compress_block(&mut self.compressor, plaintext)?;
         let estimated_stored = encoded
@@ -543,6 +655,56 @@ impl BuildContext<'_> {
         self.current_reuse.insert(reuse_key, pending);
         self.new_blocks = self.new_blocks.saturating_add(1);
         Ok(())
+    }
+
+    fn record_chunk(&mut self, chunk_id: [u8; 32]) {
+        self.fingerprint.update(&chunk_id);
+        self.chunk_ids.push(chunk_id);
+    }
+
+    fn try_reuse_chunk(
+        &mut self,
+        logical_offset: u64,
+        plain_len: u32,
+        chunk_id: [u8; 32],
+        availability: Availability,
+        access: AccessClass,
+    ) -> Result<bool> {
+        let class = SegmentClass::new(availability, access);
+        let reuse_key = (chunk_id, class);
+        if let Some(reused) = self.current_reuse.get(&reuse_key).copied()
+            && reused.reference.plain_len == plain_len
+        {
+            let mut reused = reused;
+            reused.reference.logical_offset = logical_offset;
+            self.pending_blocks.push(reused);
+            self.reused_blocks = self.reused_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        // Existing immutable blocks keep their historical placement. A full
+        // build is the explicit operation that rewrites them into new classes.
+        if let Some(reused) = self.reuse_index.get(&(chunk_id, availability))
+            && reused.block.plain_len == plain_len
+        {
+            let segment = self
+                .reuse_segments
+                .get(reused.segment_ordinal as usize)
+                .ok_or_else(|| Error::InvalidInput("reuse segment ordinal".into()))?;
+            let mut reference = reused.block;
+            reference.logical_offset = logical_offset;
+            self.used_existing_segments
+                .entry(segment.id)
+                .or_insert_with(|| segment.clone());
+            let pending = PendingBlock {
+                locator: SegmentLocator::Existing(segment.id),
+                reference,
+            };
+            self.pending_blocks.push(pending);
+            self.current_reuse.insert(reuse_key, pending);
+            self.reused_blocks = self.reused_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn active_segment_position(&self, class: SegmentClass) -> Option<usize> {
@@ -630,14 +792,7 @@ impl BuildContext<'_> {
             .map(|item| item.reference)
             .collect();
         let storage = storage_stats(&segments, &block_refs)?;
-        let reuse_records: Vec<ReuseRecord> = self
-            .chunk_ids
-            .iter()
-            .copied()
-            .zip(block_refs.iter().copied())
-            .map(|(chunk_id, block)| ReuseRecord { chunk_id, block })
-            .collect();
-        validate_pair_count(block_refs.len(), reuse_records.len())?;
+        validate_pair_count(block_refs.len(), self.chunk_ids.len())?;
 
         let path_slots =
             build_path_slots(&self.file_paths, &self.file_records, &self.keys.path_key())?;
@@ -652,7 +807,7 @@ impl BuildContext<'_> {
             nonce_prefix,
             &snapshot_key,
             &block_refs,
-            &reuse_records,
+            &self.chunk_ids,
             self.options.compression_level,
         )?;
         let catalog = CatalogData {
@@ -1006,23 +1161,36 @@ impl Drop for NewSegment {
     }
 }
 
-fn load_reuse_index(
-    old: Option<&Package>,
-) -> Result<HashMap<([u8; 32], Availability), ReusableBlock>> {
+fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
     let Some(old) = old else {
-        return Ok(HashMap::new());
+        return Ok(ReuseIndex {
+            blocks: HashMap::new(),
+            segments: Vec::new(),
+        });
     };
-    let mut index = HashMap::new();
+    let segments = old
+        .list_segments()?
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, _)| {
+            let ordinal = u16::try_from(ordinal)
+                .map_err(|_| Error::InvalidInput("too many reuse segments".into()))?;
+            old.segment_record(ordinal).map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut blocks = HashMap::new();
     for reuse in old.reuse_records()? {
-        let segment = old.segment_record(reuse.block.segment_ordinal)?;
-        index
+        let segment = segments
+            .get(reuse.block.segment_ordinal as usize)
+            .ok_or_else(|| Error::InvalidInput("reuse segment ordinal".into()))?;
+        blocks
             .entry((reuse.chunk_id, segment.availability))
             .or_insert(ReusableBlock {
                 block: reuse.block,
-                segment,
+                segment_ordinal: reuse.block.segment_ordinal,
             });
     }
-    Ok(index)
+    Ok(ReuseIndex { blocks, segments })
 }
 
 struct EncryptedPages {
@@ -1038,76 +1206,127 @@ fn build_pages(
     nonce_prefix: [u8; 8],
     snapshot_key: &Aes256Key,
     block_refs: &[BlockRef],
-    reuse_records: &[ReuseRecord],
+    chunk_ids: &[[u8; 32]],
     compression_level: i32,
 ) -> Result<EncryptedPages> {
-    let mut plaintext_pages = Vec::new();
-    for (page_index, records) in block_refs.chunks(BLOCKS_PER_MAP_PAGE).enumerate() {
-        let first = u32::try_from(page_index * BLOCKS_PER_MAP_PAGE)
-            .map_err(|_| Error::InvalidInput("map page index".into()))?;
-        plaintext_pages.push((PageKind::BlockMap, encode_map_page(first, records)?));
-    }
-    let map_page_count = u32::try_from(plaintext_pages.len())
-        .map_err(|_| Error::InvalidInput("too many map pages".into()))?;
-    for (page_index, records) in reuse_records.chunks(REUSE_PER_PAGE).enumerate() {
-        let first = u32::try_from(page_index * REUSE_PER_PAGE)
-            .map_err(|_| Error::InvalidInput("reuse page index".into()))?;
-        plaintext_pages.push((PageKind::Reuse, encode_reuse_page(first, records)?));
-    }
-    let reuse_page_count = u32::try_from(plaintext_pages.len())
-        .map_err(|_| Error::InvalidInput("too many pages".into()))?
-        .checked_sub(map_page_count)
-        .ok_or_else(|| Error::InvalidInput("page count".into()))?;
-
+    validate_pair_count(block_refs.len(), chunk_ids.len())?;
+    let page_capacity =
+        block_refs.len().div_ceil(BLOCKS_PER_MAP_PAGE) + chunk_ids.len().div_ceil(REUSE_PER_PAGE);
     let mut compressor = zstd::bulk::Compressor::new(compression_level)?;
     compressor.include_checksum(false)?;
     compressor.include_dictid(false)?;
-    let mut directory = Vec::with_capacity(plaintext_pages.len());
-    let mut ciphertexts = Vec::with_capacity(plaintext_pages.len());
+    let mut directory = Vec::with_capacity(page_capacity);
+    let mut ciphertexts = Vec::with_capacity(page_capacity);
     let mut relative_offset = 0_u64;
-    for (index, (kind, plaintext)) in plaintext_pages.into_iter().enumerate() {
-        let plain_len = u32::try_from(plaintext.len())
-            .map_err(|_| Error::InvalidInput("page plaintext length".into()))?;
-        let (codec, mut encoded) = compress_bytes(&mut compressor, &plaintext)?;
-        let stored_len = u32::try_from(encoded.len() + 16)
-            .map_err(|_| Error::InvalidInput("page ciphertext length".into()))?;
-        let nonce_ordinal = u32::try_from(index + 1)
-            .map_err(|_| Error::InvalidInput("page nonce ordinal".into()))?;
-        let aad = crypto::page_aad(
+    for (page_index, records) in block_refs.chunks(BLOCKS_PER_MAP_PAGE).enumerate() {
+        let first = u32::try_from(page_index * BLOCKS_PER_MAP_PAGE)
+            .map_err(|_| Error::InvalidInput("map page index".into()))?;
+        let plaintext = encode_map_page(first, records)?;
+        encrypt_page(
             project_id,
             release_sequence,
-            kind,
-            codec,
-            nonce_ordinal,
-            stored_len,
-            plain_len,
-        );
-        snapshot_key.seal(
-            crypto::nonce(nonce_prefix, nonce_ordinal),
-            &aad,
-            &mut encoded,
+            nonce_prefix,
+            snapshot_key,
+            &mut compressor,
+            PageKind::BlockMap,
+            plaintext,
+            &mut relative_offset,
+            &mut directory,
+            &mut ciphertexts,
         )?;
-        let digest = *blake3::hash(&encoded).as_bytes();
-        directory.push(PageRecord {
-            kind,
-            codec,
-            nonce_ordinal,
-            relative_offset,
-            stored_len,
-            plain_len,
-            digest,
-        });
-        relative_offset = relative_offset
-            .checked_add(u64::from(stored_len))
-            .ok_or_else(|| Error::InvalidInput("page region overflow".into()))?;
-        ciphertexts.push(encoded);
     }
+    let map_page_count = u32::try_from(directory.len())
+        .map_err(|_| Error::InvalidInput("too many map pages".into()))?;
+    for (page_index, chunk_page) in chunk_ids.chunks(REUSE_PER_PAGE).enumerate() {
+        let first = u32::try_from(page_index * REUSE_PER_PAGE)
+            .map_err(|_| Error::InvalidInput("reuse page index".into()))?;
+        let block_start = page_index
+            .checked_mul(REUSE_PER_PAGE)
+            .ok_or_else(|| Error::InvalidInput("reuse page index".into()))?;
+        let block_page = block_refs
+            .get(block_start..block_start + chunk_page.len())
+            .ok_or_else(|| Error::InvalidInput("reuse page block range".into()))?;
+        let records = chunk_page
+            .iter()
+            .copied()
+            .zip(block_page.iter().copied())
+            .map(|(chunk_id, block)| ReuseRecord { chunk_id, block })
+            .collect::<Vec<_>>();
+        let plaintext = encode_reuse_page(first, &records)?;
+        encrypt_page(
+            project_id,
+            release_sequence,
+            nonce_prefix,
+            snapshot_key,
+            &mut compressor,
+            PageKind::Reuse,
+            plaintext,
+            &mut relative_offset,
+            &mut directory,
+            &mut ciphertexts,
+        )?;
+    }
+    let reuse_page_count = u32::try_from(directory.len())
+        .map_err(|_| Error::InvalidInput("too many pages".into()))?
+        .checked_sub(map_page_count)
+        .ok_or_else(|| Error::InvalidInput("page count".into()))?;
     Ok(EncryptedPages {
         directory,
         ciphertexts,
         map_count: map_page_count,
         reuse_count: reuse_page_count,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypt_page(
+    project_id: ProjectId,
+    release_sequence: u64,
+    nonce_prefix: [u8; 8],
+    snapshot_key: &Aes256Key,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    kind: PageKind,
+    plaintext: Vec<u8>,
+    relative_offset: &mut u64,
+    directory: &mut Vec<PageRecord>,
+    ciphertexts: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let plain_len = u32::try_from(plaintext.len())
+        .map_err(|_| Error::InvalidInput("page plaintext length".into()))?;
+    let (codec, mut encoded) = compress_bytes(compressor, &plaintext)?;
+    let stored_len = u32::try_from(encoded.len() + 16)
+        .map_err(|_| Error::InvalidInput("page ciphertext length".into()))?;
+    let nonce_ordinal = u32::try_from(directory.len() + 1)
+        .map_err(|_| Error::InvalidInput("page nonce ordinal".into()))?;
+    let aad = crypto::page_aad(
+        project_id,
+        release_sequence,
+        kind,
+        codec,
+        nonce_ordinal,
+        stored_len,
+        plain_len,
+    );
+    snapshot_key.seal(
+        crypto::nonce(nonce_prefix, nonce_ordinal),
+        &aad,
+        &mut encoded,
+    )?;
+    let digest = *blake3::hash(&encoded).as_bytes();
+    directory.push(PageRecord {
+        kind,
+        codec,
+        nonce_ordinal,
+        relative_offset: *relative_offset,
+        stored_len,
+        plain_len,
+        digest,
+    });
+    *relative_offset = relative_offset
+        .checked_add(u64::from(stored_len))
+        .ok_or_else(|| Error::InvalidInput("page region overflow".into()))?;
+    ciphertexts.push(encoded);
+    Ok(())
 }
 
 fn build_path_slots(
@@ -1241,6 +1460,7 @@ fn verify_staged_release(
     data_directory: &Path,
     files: &[SourceFile],
     identity: &Identity,
+    verify_sources: bool,
 ) -> Result<()> {
     let package = Package::open_directory(
         snapshot,
@@ -1250,10 +1470,13 @@ fn verify_staged_release(
         ResourceBudget::memory_constrained(),
     )?;
     package.verify_segments()?;
+    if !verify_sources {
+        return Ok(());
+    }
     let mut expected = vec![0_u8; 1024 * 1024];
     let mut actual = vec![0_u8; 1024 * 1024];
     for source in files {
-        let mut source_file = File::open(&source.host_path)?;
+        let mut source_file = source.open_verified()?;
         let mut asset = package.asset(&source.logical_path)?.cursor();
         loop {
             let expected_len = source_file.read(&mut expected)?;
@@ -1268,6 +1491,68 @@ fn verify_staged_release(
                 break;
             }
         }
+        source.validate_open_file(&source_file)?;
+    }
+    Ok(())
+}
+
+fn save_build_cache(
+    options: &PackOptions,
+    identity: &Identity,
+    release_sequence: u64,
+    files: &[SourceFile],
+    context: &BuildContext<'_>,
+) -> Result<()> {
+    validate_build_cache_record_count(files.len(), context.file_records.len())?;
+    let mut entries = Vec::with_capacity(files.len());
+    for (source, record) in files.iter().zip(&context.file_records) {
+        let start = record.first_block as usize;
+        let end = start
+            .checked_add(record.block_count as usize)
+            .ok_or_else(|| Error::InvalidInput("build-cache block range".into()))?;
+        let chunk_ids = context
+            .chunk_ids
+            .get(start..end)
+            .ok_or_else(|| Error::InvalidInput("build-cache chunk range".into()))?;
+        let blocks = context
+            .pending_blocks
+            .get(start..end)
+            .ok_or_else(|| Error::InvalidInput("build-cache block range".into()))?;
+        let chunks = chunk_ids
+            .iter()
+            .copied()
+            .zip(blocks)
+            .map(|(chunk_id, pending)| CachedChunk {
+                logical_offset: pending.reference.logical_offset,
+                plain_len: pending.reference.plain_len,
+                chunk_id,
+            })
+            .collect();
+        entries.push((
+            source.logical_path.clone(),
+            CachedEntry {
+                stamp: source.stamp(),
+                layout: record.layout,
+                fixed_block_len: record.fixed_block_len,
+                access: record.access,
+                availability: options.availability(&source.logical_path),
+                chunks,
+            },
+        ));
+    }
+    build_cache::save(
+        &options.output_directory.join(BUILD_CACHE_FILE),
+        identity.project_id(),
+        release_sequence,
+        &entries,
+    )
+}
+
+fn validate_build_cache_record_count(files: usize, records: usize) -> Result<()> {
+    if files != records {
+        return Err(Error::InvalidInput(
+            "build-cache file record mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -1404,12 +1689,57 @@ pub(crate) fn validate_options(options: &PackOptions) -> Result<()> {
             "zstd level must be between -7 and 22".into(),
         ));
     }
+    let input = options.input_directory.canonicalize()?;
+    let output = resolve_candidate_path(&options.output_directory)?;
+    if output == input || output.starts_with(&input) {
+        return Err(Error::InvalidInput(format!(
+            "output directory must be outside the input asset directory: {}",
+            options.output_directory.display()
+        )));
+    }
     for prefix in &options.deferred_prefixes {
         validate_canonical_path(prefix).map_err(|_| {
             Error::InvalidInput(format!("deferred prefix is not canonical: {prefix:?}"))
         })?;
     }
     Ok(())
+}
+
+fn validate_identity_location(options: &PackOptions, identity: &Identity) -> Result<()> {
+    let Some(identity_path) = identity.source_path() else {
+        return Ok(());
+    };
+    let input = options.input_directory.canonicalize()?;
+    if identity_path == input || identity_path.starts_with(&input) {
+        return Err(Error::InvalidInput(format!(
+            "publisher identity must be outside the input asset directory: {}",
+            identity_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_candidate_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    if absolute.exists() {
+        return Ok(absolute.canonicalize()?);
+    }
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::<OsString>::new();
+    while !ancestor.exists() {
+        let name = ancestor.file_name().ok_or_else(|| {
+            Error::InvalidInput(format!("path has no existing ancestor: {}", path.display()))
+        })?;
+        suffix.push(name.to_owned());
+        ancestor = ancestor.parent().ok_or_else(|| {
+            Error::InvalidInput(format!("path has no existing ancestor: {}", path.display()))
+        })?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn random_array<const N: usize>(rng: &dyn SecureRandom) -> Result<[u8; N]> {
@@ -1536,14 +1866,15 @@ mod tests {
         );
         validate_options(&options).unwrap();
 
-        let source = |path: &str, len| SourceFile {
-            host_path: PathBuf::new(),
-            logical_path: path.into(),
-            len,
-        };
+        let source = |path: &str, len| SourceFile::test(path, len);
         assert_eq!(classify(&source("tiny", 0)).2, AccessClass::Hot);
+        assert_eq!(classify(&source("MOVIE.MP4", 1)).2, AccessClass::Streaming);
         assert_eq!(
-            classify(&source("MOVIE.MP4", HOT_FILE_LIMIT + 1)).2,
+            classify(&source("voice/line.opus", 12 * 1024)).2,
+            AccessClass::Transient
+        );
+        assert_eq!(
+            classify(&source("bgm/theme.opus", 12 * 1024)).2,
             AccessClass::Streaming
         );
         assert_eq!(
@@ -1569,6 +1900,83 @@ mod tests {
         let mut invalid = options;
         invalid.deferred_prefixes = vec!["/absolute".into()];
         assert!(validate_options(&invalid).is_err());
+
+        let nested_output = PackOptions::new(&input, input.join("release"));
+        assert!(validate_options(&nested_output).is_err());
+        let same_output = PackOptions::new(&input, &input);
+        assert!(validate_options(&same_output).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publisher_keys_are_rejected_inside_the_asset_tree_by_content_and_location() {
+        let root = scratch("identity-resource");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let identity_path = input.join("innocent-looking.bin");
+        Identity::generate().unwrap().save(&identity_path).unwrap();
+        let identity = Identity::load(&identity_path).unwrap();
+        let options = PackOptions::new(&input, &output);
+
+        assert!(validate_identity_location(&options, &identity).is_err());
+        assert!(collect_files(&input).is_err());
+        assert!(pack_directory(&options, &identity).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn development_cache_is_release_bound_and_corruption_falls_back_to_source_reads() {
+        fn mutate_cache(path: &Path, mutate: impl FnOnce(&mut [u8])) {
+            let mut bytes = std::fs::read(path).unwrap();
+            mutate(&mut bytes);
+            let payload = bytes.len() - 32;
+            let checksum = blake3::hash(&bytes[..payload]);
+            bytes[payload..].copy_from_slice(checksum.as_bytes());
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let root = scratch("development-cache");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("voice.opus"), vec![7_u8; 64 * 1024]).unwrap();
+        let identity = Identity::generate().unwrap();
+        let mut options = PackOptions::new(&input, &output);
+        options.development_cache = true;
+
+        let first = pack_directory(&options, &identity).unwrap();
+        assert!(first.changed);
+        let cache_path = output.join(BUILD_CACHE_FILE);
+        assert!(cache_path.is_file());
+        let unchanged = pack_directory(&options, &identity).unwrap();
+        assert!(!unchanged.changed);
+
+        std::fs::write(&cache_path, b"corrupt local cache").unwrap();
+        let recovered = pack_directory(&options, &identity).unwrap();
+        assert!(!recovered.changed);
+        assert!(cache_path.metadata().unwrap().len() > b"corrupt local cache".len() as u64);
+
+        // These remain structurally valid caches, but each violates a separate
+        // source/reuse invariant and must fall back to reading source bytes.
+        mutate_cache(&cache_path, |bytes| bytes[54] ^= 1);
+        assert!(!pack_directory(&options, &identity).unwrap().changed);
+        mutate_cache(&cache_path, |bytes| bytes[108] = 1);
+        assert!(!pack_directory(&options, &identity).unwrap().changed);
+        mutate_cache(&cache_path, |bytes| bytes[120..152].fill(0));
+        assert!(!pack_directory(&options, &identity).unwrap().changed);
+        assert!(validate_build_cache_record_count(1, 0).is_err());
+        assert!(validate_build_cache_record_count(1, 1).is_ok());
+        assert!(
+            verify_staged_release(
+                &root.join("missing.haku"),
+                &output.join("data"),
+                &[],
+                &identity,
+                false,
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1798,10 +2206,189 @@ mod tests {
                 &output.join("game.haku"),
                 &output.join("data"),
                 &files,
-                &first
+                &first,
+                true,
             )
             .is_err()
         );
+        let changed_files = collect_files(&input).unwrap();
+        assert!(
+            verify_staged_release(
+                &output.join("game.haku"),
+                &output.join("data"),
+                &changed_files,
+                &first,
+                true,
+            )
+            .is_err()
+        );
+
+        let second_input = root.join("second-input");
+        let second_output = root.join("second-output");
+        std::fs::create_dir_all(&second_input).unwrap();
+        let second_asset = second_input.join("asset.bin");
+        std::fs::write(&second_asset, b"before!!").unwrap();
+        let second_options = PackOptions::new(&second_input, &second_output);
+        let mut changed_during_verification = false;
+        assert!(
+            pack_directory_with_progress(&second_options, &first, |progress| {
+                if progress.phase == "Verifying" && !changed_during_verification {
+                    std::fs::write(&second_asset, b"after!!!").unwrap();
+                    changed_during_verification = true;
+                }
+            })
+            .is_err()
+        );
+        assert!(!second_output.join("game.haku").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unfinished_segment_writer_cleans_its_temporary_file() {
+        let root = scratch("segment-drop");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let identity = Identity::generate().unwrap();
+        let keys = ProjectKeys::new(identity.root_key(), identity.project_id());
+        let segment = NewSegment::create(
+            &data,
+            0,
+            identity.project_id(),
+            &keys,
+            Availability::Required,
+        )
+        .unwrap();
+        let temporary = segment.temporary_path.clone();
+        assert!(temporary.exists());
+        drop(segment);
+        assert!(!temporary.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_segment_publication_detects_corrupt_existing_content() {
+        fn deterministic_segment(
+            data: &Path,
+            index: usize,
+            project_id: ProjectId,
+            keys: &ProjectKeys,
+        ) -> NewSegment {
+            let uid = [7; 16];
+            let salt = [8; 16];
+            let nonce_prefix = [9; 8];
+            let temporary_path = data.join(format!(
+                ".segment-{}-{index}.{SEGMENT_FILE_EXTENSION}.part",
+                std::process::id()
+            ));
+            let file = OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .unwrap();
+            let mut writer = BufWriter::new(file);
+            writer.write_all(&[0; SEGMENT_HEADER_SIZE]).unwrap();
+            let header = SegmentHeader {
+                project_id,
+                segment_uid: uid,
+                salt,
+                nonce_prefix,
+                block_count: 0,
+                payload_len: 0,
+                file_len: SEGMENT_HEADER_SIZE as u64,
+            };
+            NewSegment {
+                temporary_path,
+                data_directory: data.to_path_buf(),
+                writer: Some(writer),
+                project_id,
+                uid,
+                salt,
+                nonce_prefix,
+                key: Aes256Key::new(&keys.segment_key(&header)).unwrap(),
+                availability: Availability::Required,
+                block_count: 0,
+                payload_len: 0,
+            }
+        }
+
+        let root = scratch("duplicate-segment");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let identity = Identity::generate().unwrap();
+        let keys = ProjectKeys::new(identity.root_key(), identity.project_id());
+        let mut first = deterministic_segment(&data, 0, identity.project_id(), &keys);
+        first
+            .write_block(0, 4, Codec::Raw, b"same".to_vec())
+            .unwrap();
+        let (record, _) = first.finish().unwrap();
+        let final_path = data.join(segment_file_name(record.id));
+        std::fs::write(&final_path, b"corrupt").unwrap();
+
+        let mut duplicate = deterministic_segment(&data, 1, identity.project_id(), &keys);
+        duplicate
+            .write_block(0, 4, Codec::Raw, b"same".to_vec())
+            .unwrap();
+        assert!(duplicate.finish().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pack_progress_boundaries_propagate_source_and_commit_failures() {
+        let root = scratch("progress-failures");
+        let identity = Identity::generate().unwrap();
+
+        let input = root.join("source-change/input");
+        let output = root.join("source-change/output");
+        std::fs::create_dir_all(&input).unwrap();
+        let source = input.join("asset.bin");
+        std::fs::write(&source, b"before").unwrap();
+        let mut changed = false;
+        assert!(
+            pack_directory_with_progress(
+                &PackOptions::new(&input, &output),
+                &identity,
+                |progress| {
+                    if progress.phase == "Packing" && !changed {
+                        std::fs::write(&source, b"after!!").unwrap();
+                        changed = true;
+                    }
+                },
+            )
+            .is_err()
+        );
+
+        let input = root.join("commit/input");
+        let output = root.join("commit/output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("asset.bin"), b"asset").unwrap();
+        let target = output.join("game.haku");
+        let mut blocked_commit = false;
+        assert!(
+            pack_directory_with_progress(
+                &PackOptions::new(&input, &output),
+                &identity,
+                |progress| {
+                    if progress.phase == "Verifying" && !blocked_commit {
+                        std::fs::create_dir(&target).unwrap();
+                        blocked_commit = true;
+                    }
+                },
+            )
+            .is_err()
+        );
+        assert!(target.is_dir());
+
+        let input = root.join("segment-open/input");
+        let output = root.join("segment-open/output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("asset.bin"), b"asset").unwrap();
+        let collision = output.join("data").join(format!(
+            ".segment-{}-0.{SEGMENT_FILE_EXTENSION}.part",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&collision).unwrap();
+        assert!(pack_directory(&PackOptions::new(&input, &output), &identity).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1849,11 +2436,7 @@ mod tests {
     fn packer_invariant_validators_cover_success_and_failure_paths() {
         assert_eq!(checked_path_len("asset").unwrap(), 5);
         assert!(checked_path_len(&"a".repeat(u16::MAX as usize + 1)).is_err());
-        let source = SourceFile {
-            host_path: PathBuf::new(),
-            logical_path: "asset".into(),
-            len: 4,
-        };
+        let source = SourceFile::test("asset", 4);
         validate_source_len(4, &source).unwrap();
         assert!(validate_source_len(3, &source).is_err());
         validate_pair_count(1, 1).unwrap();

@@ -3,5 +3,7 @@
 *.part
 *.part-*
 *.hakutaku-key
+*.hakutaku-runtime-key
+.hakutaku-build-cache
 .hakutaku.lock
 game.haku.previous

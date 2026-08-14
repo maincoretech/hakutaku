@@ -38,19 +38,22 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         if self.budget == 0 || value.len() > self.budget || self.index.contains_key(&key) {
             return;
         }
+        let mut vacant = None;
         while self.used.saturating_add(value.len()) > self.budget {
-            if !self.evict_one() {
+            let Some(slot) = self.evict_one() else {
                 return;
-            }
+            };
+            vacant = Some(slot);
         }
-        let slot = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.entries.push(None);
-                self.entries.len() - 1
-            });
+        let slot = vacant.unwrap_or_else(|| {
+            self.entries
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or_else(|| {
+                    self.entries.push(None);
+                    self.entries.len() - 1
+                })
+        });
         self.used += value.len();
         self.index.insert(key.clone(), slot);
         self.entries[slot] = Some(Entry {
@@ -67,12 +70,12 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         self.index.clear();
     }
 
-    /// Evicts one live entry, returning `false` if the cache has no indexed
-    /// entry. The bounded scan also keeps inconsistent bookkeeping from
-    /// turning internal maintenance into division by zero or an endless loop.
-    fn evict_one(&mut self) -> bool {
+    /// Evicts one live entry and returns its vacant slot. The bounded scan also
+    /// keeps inconsistent bookkeeping from turning internal maintenance into
+    /// division by zero or an endless loop.
+    fn evict_one(&mut self) -> Option<usize> {
         if self.index.is_empty() || self.entries.is_empty() {
-            return false;
+            return None;
         }
         let scan_limit = self.entries.len().saturating_mul(2).max(1);
         for _ in 0..scan_limit {
@@ -84,13 +87,14 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
                     let entry = self.entries[self.hand].take().expect("occupied clock slot");
                     self.used = self.used.saturating_sub(entry.value.len());
                     self.index.remove(&entry.key);
+                    let vacant = self.hand;
                     self.hand = (self.hand + 1) % self.entries.len();
-                    return true;
+                    return Some(vacant);
                 }
             }
             self.hand = (self.hand + 1) % self.entries.len();
         }
-        false
+        None
     }
 }
 
@@ -136,7 +140,7 @@ mod tests {
         cache.entries.insert(0, None);
         *cache.index.get_mut(&1).unwrap() += 1;
         cache.hand = 0;
-        assert!(cache.evict_one());
+        assert_eq!(cache.evict_one(), Some(1));
         assert!(cache.index.is_empty());
     }
 
@@ -144,7 +148,7 @@ mod tests {
     fn evicting_an_empty_cache_is_a_noop() {
         let mut cache = ClockCache::<u8>::new(8);
 
-        assert!(!cache.evict_one());
+        assert_eq!(cache.evict_one(), None);
         assert_eq!(cache.used, 0);
         assert_eq!(cache.hand, 0);
     }
@@ -155,11 +159,24 @@ mod tests {
         cache.entries.push(None);
         cache.index.insert(1, 0);
 
-        assert!(!cache.evict_one());
+        assert_eq!(cache.evict_one(), None);
 
         cache.index.clear();
         cache.used = cache.budget;
         cache.insert(2, bytes(1, 2));
         assert!(!cache.index.contains_key(&2));
+    }
+
+    #[test]
+    fn insertion_reuses_the_slot_returned_by_eviction() {
+        let mut cache = ClockCache::new(4);
+        cache.insert(1, bytes(4, 1));
+        cache.entries.insert(0, None);
+        *cache.index.get_mut(&1).unwrap() += 1;
+
+        cache.insert(2, bytes(4, 2));
+
+        assert_eq!(cache.index.get(&2), Some(&1));
+        assert_eq!(cache.entries.len(), 2);
     }
 }

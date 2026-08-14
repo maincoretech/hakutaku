@@ -1,8 +1,8 @@
 use hakutaku_core::crypto::{self, Aes256Key, ProjectKeys};
 use hakutaku_core::format::{Catalog, Codec, SnapshotHeader, map_page_record, validate_map_page};
 use hakutaku_core::{
-    AccessClass, Availability, Error as CoreError, Package, PositionedFile, ResourceBudget,
-    SegmentId, SegmentSource,
+    AccessClass, Availability, Error as CoreError, OpenPolicy, Package, PositionedFile,
+    ResourceBudget, SegmentId, SegmentSource,
 };
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
 use std::collections::HashMap;
@@ -129,6 +129,12 @@ fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
     let mut decoded_normal = Vec::new();
     normal_cursor.read_to_end(&mut decoded_normal).unwrap();
     assert_eq!(decoded_normal, normal);
+    let mut normal_session = package.asset("normal.bin").unwrap().read_session();
+    let mut normal_byte = [0_u8];
+    for offset in [0, 300_000, 600_000, 0] {
+        normal_session.read_at(offset, &mut normal_byte).unwrap();
+        assert_eq!(normal_byte[0], normal[offset as usize]);
+    }
     assert!(asset.prefetch_range(asset.len() + 1, 1).is_err());
     asset.prefetch_range(asset.len(), 1).unwrap();
     asset.prefetch_range(0, 0).unwrap();
@@ -151,6 +157,18 @@ fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
     assert_eq!(byte[0], video[0]);
     assert_eq!(reads.load(Ordering::Relaxed), reads_after_two_blocks);
 
+    package.trim();
+    let mut session = asset.read_session();
+    session.read_at(0, &mut byte).unwrap();
+    session.read_at(256 * 1024, &mut byte).unwrap();
+    let session_reads_after_two_blocks = reads.load(Ordering::Relaxed);
+    session.read_at(0, &mut byte).unwrap();
+    assert_eq!(byte[0], video[0]);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        session_reads_after_two_blocks
+    );
+
     asset.prefetch_range(512 * 1024, 1).unwrap();
     asset.prefetch_range(512 * 1024, 1).unwrap();
     let reads_after_prefetch = reads.load(Ordering::Relaxed);
@@ -159,6 +177,33 @@ fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
     prefetched_cursor.read_exact(&mut byte).unwrap();
     assert_eq!(byte[0], video[512 * 1024]);
     assert_eq!(reads.load(Ordering::Relaxed), reads_after_prefetch);
+}
+
+#[test]
+fn caller_policy_rejects_a_validly_signed_rollback() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir_all(&input).unwrap();
+    std::fs::write(input.join("script.json"), b"version one").unwrap();
+    let identity = Identity::generate().unwrap();
+    pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+
+    let rejected = Package::open_directory_with_policy(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::cache_disabled(),
+        OpenPolicy::requiring(2),
+    );
+    assert!(matches!(
+        rejected,
+        Err(CoreError::ReleaseRollback {
+            minimum: 2,
+            actual: 1
+        })
+    ));
 }
 
 #[test]

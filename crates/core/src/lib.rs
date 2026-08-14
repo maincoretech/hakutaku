@@ -18,4 +18,7 @@ pub use io::{
     DirectorySegmentSource, LocalFile, PositionedFile, SEGMENT_FILE_EXTENSION, SegmentSource,
     segment_file_name,
 };
-pub use package::{Asset, AssetCursor, AssetInfo, Package, ResourceBudget, SegmentInfo};
+pub use package::{
+    Asset, AssetCursor, AssetInfo, AssetReadSession, OpenPolicy, Package, ResourceBudget,
+    SegmentInfo,
+};

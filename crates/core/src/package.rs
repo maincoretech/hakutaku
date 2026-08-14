@@ -33,6 +33,27 @@ pub struct ResourceBudget {
     pub normal_probation_entries: usize,
 }
 
+/// Caller-owned release acceptance policy.
+///
+/// Hakutaku authenticates the signed sequence but deliberately does not own
+/// persistent rollback state. Launchers should persist the highest accepted
+/// sequence and provide it here on subsequent opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenPolicy {
+    /// Lowest signed release sequence accepted by the caller.
+    pub minimum_release_sequence: Option<u64>,
+}
+
+impl OpenPolicy {
+    #[must_use]
+    /// Requires an authenticated snapshot at or above `minimum`.
+    pub const fn requiring(minimum: u64) -> Self {
+        Self {
+            minimum_release_sequence: Some(minimum),
+        }
+    }
+}
+
 impl Default for ResourceBudget {
     fn default() -> Self {
         Self {
@@ -194,6 +215,17 @@ pub struct AssetCursor {
     reader: BlockReader,
 }
 
+/// Persistent random-access session for repeated reads from one [`Asset`].
+///
+/// Unlike [`Asset::read_at`], a session retains its active segment handle,
+/// decode buffers, and the current/previous streaming blocks between calls.
+pub struct AssetReadSession {
+    asset: Asset,
+    current_block: Option<CursorBlock>,
+    previous_streaming_block: Option<CursorBlock>,
+    reader: BlockReader,
+}
+
 struct CursorBlock {
     reference: BlockRef,
     data: BlockData,
@@ -310,6 +342,31 @@ impl Package {
         verifying_key: [u8; 32],
         budget: ResourceBudget,
     ) -> Result<Self> {
+        Self::open_with_policy(
+            snapshot,
+            source,
+            root_key,
+            verifying_key,
+            budget,
+            OpenPolicy::default(),
+        )
+    }
+
+    /// Opens and authenticates a package while enforcing caller-owned rollback policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReleaseRollback`] after signature verification when the
+    /// signed sequence is below the caller's accepted floor, in addition to the
+    /// errors returned by [`Package::open`].
+    pub fn open_with_policy(
+        snapshot: Arc<dyn PositionedFile>,
+        source: Arc<dyn SegmentSource>,
+        root_key: [u8; 32],
+        verifying_key: [u8; 32],
+        budget: ResourceBudget,
+        policy: OpenPolicy,
+    ) -> Result<Self> {
         let mut header_bytes = vec![0_u8; crate::format::SNAPSHOT_HEADER_SIZE];
         snapshot.read_exact_at(0, &mut header_bytes)?;
         let header = SnapshotHeader::parse(&header_bytes)?;
@@ -321,6 +378,14 @@ impl Package {
             &mut catalog_ciphertext,
         )?;
         crypto::verify_snapshot_signature(&header, &catalog_ciphertext, &verifying_key)?;
+        if let Some(minimum) = policy.minimum_release_sequence
+            && header.release_sequence < minimum
+        {
+            return Err(Error::ReleaseRollback {
+                minimum,
+                actual: header.release_sequence,
+            });
+        }
 
         let keys = ProjectKeys::new(root_key, header.project_id);
         let snapshot_key_bytes = keys.snapshot_key(&header.snapshot_salt);
@@ -384,7 +449,30 @@ impl Package {
         verifying_key: [u8; 32],
         budget: ResourceBudget,
     ) -> Result<Self> {
-        Self::open(
+        Self::open_directory_with_policy(
+            snapshot_path,
+            segment_directory,
+            root_key,
+            verifying_key,
+            budget,
+            OpenPolicy::default(),
+        )
+    }
+
+    /// Opens a local package while enforcing caller-owned rollback policy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates filesystem, authentication, canonical-format, and rollback failures.
+    pub fn open_directory_with_policy(
+        snapshot_path: impl AsRef<Path>,
+        segment_directory: impl AsRef<Path>,
+        root_key: [u8; 32],
+        verifying_key: [u8; 32],
+        budget: ResourceBudget,
+        policy: OpenPolicy,
+    ) -> Result<Self> {
+        Self::open_with_policy(
             Arc::new(LocalFile::open(snapshot_path)?),
             Arc::new(DirectorySegmentSource::new(
                 segment_directory.as_ref().to_path_buf(),
@@ -392,6 +480,7 @@ impl Package {
             root_key,
             verifying_key,
             budget,
+            policy,
         )
     }
 
@@ -786,6 +875,28 @@ impl Asset {
     ///
     /// Returns an error for an invalid offset, unavailable segment, or failed authentication.
     pub fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize> {
+        self.read_session().read_at(offset, destination)
+    }
+
+    #[must_use]
+    /// Creates a persistent session for repeated random-access reads.
+    pub fn read_session(&self) -> AssetReadSession {
+        AssetReadSession {
+            asset: self.clone(),
+            current_block: None,
+            previous_streaming_block: None,
+            reader: BlockReader::default(),
+        }
+    }
+
+    fn read_at_buffered(
+        &self,
+        offset: u64,
+        destination: &mut [u8],
+        current_block: &mut Option<CursorBlock>,
+        previous_streaming_block: &mut Option<CursorBlock>,
+        reader: &mut BlockReader,
+    ) -> Result<usize> {
         if offset > self.len() {
             return Err(Error::InvalidRange);
         }
@@ -796,23 +907,45 @@ impl Asset {
         }
         let mut written = 0_usize;
         let mut logical = offset;
-        let mut reader = BlockReader::default();
         while written < requested {
-            let reference = self.reference_for_offset(logical)?;
-            let block = self.package.inner.load_block_buffered(
-                &reference,
-                self.record.access,
-                &mut reader,
-            )?;
-            let within = usize::try_from(logical - reference.logical_offset)
+            let covered = current_block
+                .as_ref()
+                .is_some_and(|block| block.covers(logical));
+            if !covered {
+                if previous_streaming_block
+                    .as_ref()
+                    .is_some_and(|block| block.covers(logical))
+                {
+                    std::mem::swap(current_block, previous_streaming_block);
+                } else {
+                    let reference = self.reference_for_offset(logical)?;
+                    if self.record.access == AccessClass::Streaming {
+                        if let Some(previous) = previous_streaming_block.take() {
+                            reader.recycle(previous.data);
+                        }
+                        *previous_streaming_block = current_block.take();
+                    } else {
+                        if let Some(current) = current_block.take() {
+                            reader.recycle(current.data);
+                        }
+                    }
+                    let data = self.package.inner.load_block_buffered(
+                        &reference,
+                        self.record.access,
+                        reader,
+                    )?;
+                    *current_block = Some(CursorBlock { reference, data });
+                }
+            }
+            let block = current_block.as_ref().expect("read block loaded above");
+            let within = usize::try_from(logical - block.reference.logical_offset)
                 .map_err(|_| Error::InvalidFormat("block logical offset"))?;
-            let bytes = block.as_ref();
+            let bytes = block.data.as_ref();
             validate_block_coverage(within, bytes.len())?;
             let amount = (bytes.len() - within).min(requested - written);
             destination[written..written + amount].copy_from_slice(&bytes[within..within + amount]);
             written += amount;
             logical += amount as u64;
-            reader.recycle(block);
         }
         Ok(written)
     }
@@ -918,6 +1051,23 @@ impl Asset {
     }
 }
 
+impl AssetReadSession {
+    /// Reads through this persistent session at a logical asset offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid offset, unavailable segment, or failed authentication.
+    pub fn read_at(&mut self, offset: u64, destination: &mut [u8]) -> Result<usize> {
+        self.asset.read_at_buffered(
+            offset,
+            destination,
+            &mut self.current_block,
+            &mut self.previous_streaming_block,
+            &mut self.reader,
+        )
+    }
+}
+
 impl Read for AssetCursor {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.position > self.asset.len() {
@@ -954,9 +1104,6 @@ impl Read for AssetCursor {
                     }
                     self.previous_streaming_block = self.current_block.take();
                 } else {
-                    if let Some(previous) = self.previous_streaming_block.take() {
-                        self.reader.recycle(previous.data);
-                    }
                     if let Some(current) = self.current_block.take() {
                         self.reader.recycle(current.data);
                     }

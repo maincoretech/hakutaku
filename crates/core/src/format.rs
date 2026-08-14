@@ -352,7 +352,10 @@ impl SegmentHeader {
         require_zero(bytes, 96..SEGMENT_HEADER_SIZE, "segment reserved tail")?;
         let payload_len = read_u64(bytes, 80)?;
         let file_len = read_u64(bytes, 88)?;
-        if file_len != (SEGMENT_HEADER_SIZE as u64).saturating_add(payload_len) {
+        let expected_file_len = (SEGMENT_HEADER_SIZE as u64)
+            .checked_add(payload_len)
+            .ok_or(Error::InvalidFormat("segment file length overflow"))?;
+        if file_len != expected_file_len {
             return Err(Error::InvalidFormat("segment file length"));
         }
         Ok(Self {
@@ -899,8 +902,10 @@ impl Catalog {
         let mut expected_page_offset = 0_u64;
         for index in 0..self.segment_count {
             let segment = self.segment(index)?;
-            if segment.file_len != (SEGMENT_HEADER_SIZE as u64).saturating_add(segment.payload_len)
-            {
+            let expected_file_len = (SEGMENT_HEADER_SIZE as u64)
+                .checked_add(segment.payload_len)
+                .ok_or(Error::InvalidFormat("segment record length overflow"))?;
+            if segment.file_len != expected_file_len {
                 return Err(Error::InvalidFormat("segment record length"));
             }
         }
@@ -1221,13 +1226,37 @@ pub fn validate_canonical_path(path: &str) -> Result<()> {
         || path.ends_with('/')
         || path.contains('\\')
         || path.contains('\0')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.starts_with(' ')
+                || part.ends_with([' ', '.'])
+                || part
+                    .chars()
+                    .any(|character| character < ' ' || "<>:\"|?*".contains(character))
+                || is_windows_reserved_component(part)
+        })
     {
         return Err(Error::InvalidPath);
     }
     Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    ["COM", "LPT"].into_iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 fn parse_page_header(
@@ -1492,7 +1521,27 @@ mod tests {
     #[test]
     fn paths_are_strictly_canonical() {
         assert!(validate_canonical_path("video/opening.mp4").is_ok());
-        for invalid in ["", "/a", "a/", "a//b", "a/./b", "a/../b", "a\\b", "a\0b"] {
+        for invalid in [
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "a\\b",
+            "a\0b",
+            "C:/asset",
+            "a:b",
+            "NUL",
+            "nul.txt",
+            "voice/COM1.ogg",
+            "LPT³.bin",
+            "trailing. ",
+            "trailing.",
+            " leading/name",
+            "bad?/name",
+            "control/\u{1f}",
+        ] {
             assert!(validate_canonical_path(invalid).is_err(), "{invalid}");
         }
     }

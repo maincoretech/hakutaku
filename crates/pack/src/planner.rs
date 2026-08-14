@@ -1,9 +1,8 @@
 use crate::packer::{PackOptions, validate_options};
 use crate::source::{SourceFile, classify, collect_files};
-use crate::{Identity, Result};
+use crate::{Result, RuntimeKeyMaterial};
 use hakutaku_core::{AccessClass, AssetInfo, Availability, Package, ResourceBudget};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{BufReader, Read};
 
 const COMPARE_BUFFER_BYTES: usize = 1024 * 1024;
@@ -60,7 +59,7 @@ pub struct ReleasePlan {
 ///
 /// Returns an error for invalid options, inaccessible source files, an invalid
 /// identity, or a corrupt active release.
-pub fn plan_directory(options: &PackOptions, identity: &Identity) -> Result<ReleasePlan> {
+pub fn plan_directory(options: &PackOptions, keys: &RuntimeKeyMaterial) -> Result<ReleasePlan> {
     validate_options(options)?;
     let sources = collect_files(&options.input_directory)?;
     let source_bytes = sources.iter().try_fold(0_u64, |total, source| {
@@ -70,13 +69,17 @@ pub fn plan_directory(options: &PackOptions, identity: &Identity) -> Result<Rele
     })?;
     let snapshot = options.output_directory.join("game.haku");
     let package = if options.incremental && snapshot.is_file() {
-        Some(Package::open_directory(
+        let package = Package::open_directory(
             snapshot,
             options.output_directory.join("data"),
-            identity.root_key(),
-            identity.public_key(),
+            keys.root_key(),
+            keys.public_key,
             ResourceBudget::memory_constrained(),
-        )?)
+        )?;
+        if package.project_id() != keys.project_id {
+            return Err(hakutaku_core::Error::ProjectMismatch.into());
+        }
+        Some(package)
     } else {
         None
     };
@@ -141,14 +144,87 @@ pub fn plan_directory(options: &PackOptions, identity: &Identity) -> Result<Rele
     })
 }
 
+/// Rebuilds a UI plan after a successful pack without re-reading asset bodies.
+///
+/// This metadata-only fast path is intentionally valid only immediately after
+/// [`crate::pack_directory`] or [`crate::pack_directory_with_progress`] has
+/// returned successfully for the same options. General previews must use
+/// [`plan_directory`] so same-size edits are compared byte-for-byte.
+///
+/// # Errors
+///
+/// Returns an error if the source inventory no longer matches the built release.
+pub fn plan_directory_after_pack(
+    options: &PackOptions,
+    keys: &RuntimeKeyMaterial,
+) -> Result<ReleasePlan> {
+    validate_options(options)?;
+    let sources = collect_files(&options.input_directory)?;
+    let source_bytes = sources.iter().try_fold(0_u64, |total, source| {
+        total
+            .checked_add(source.len)
+            .ok_or_else(|| crate::Error::InvalidInput("input size overflow".into()))
+    })?;
+    let package = Package::open_directory(
+        options.output_directory.join("game.haku"),
+        options.output_directory.join("data"),
+        keys.root_key(),
+        keys.public_key,
+        ResourceBudget::memory_constrained(),
+    )?;
+    if package.project_id() != keys.project_id {
+        return Err(hakutaku_core::Error::ProjectMismatch.into());
+    }
+    let mut released = package
+        .list_assets()?
+        .into_iter()
+        .map(|asset| (asset.path.clone(), asset))
+        .collect::<BTreeMap<_, _>>();
+    let mut assets = Vec::with_capacity(sources.len());
+    for source in &sources {
+        let released = released.remove(&source.logical_path).ok_or_else(|| {
+            crate::Error::InvalidInput(format!(
+                "built release is missing source asset: {}",
+                source.logical_path
+            ))
+        })?;
+        let (_, _, access) = classify(source);
+        if released.len != source.len || released.access != access {
+            return Err(crate::Error::InvalidInput(format!(
+                "source changed after pack: {}",
+                source.logical_path
+            )));
+        }
+        assets.push(PlannedAsset {
+            path: source.logical_path.clone(),
+            source_len: Some(source.len),
+            released_len: Some(released.len),
+            access,
+            availability: options.availability(&source.logical_path),
+            change: AssetChange::Unchanged,
+        });
+    }
+    if let Some(removed) = released.into_values().next() {
+        return Err(crate::Error::InvalidInput(format!(
+            "built release contains stale asset: {}",
+            removed.path
+        )));
+    }
+    Ok(ReleasePlan {
+        previous_release: Some(package.release_sequence()),
+        assets,
+        source_bytes,
+        changed_source_bytes: 0,
+    })
+}
+
 fn asset_matches_source(
     package: &Package,
     source: &SourceFile,
     source_buffer: &mut [u8],
     release_buffer: &mut [u8],
 ) -> Result<bool> {
-    let mut source_file =
-        BufReader::with_capacity(COMPARE_BUFFER_BYTES, File::open(&source.host_path)?);
+    let mut source_file = BufReader::with_capacity(COMPARE_BUFFER_BYTES, source.open_verified()?);
     let mut released = package.asset(&source.logical_path)?.cursor();
     let mut remaining = source.len;
     while remaining > 0 {
@@ -161,6 +237,7 @@ fn asset_matches_source(
         }
         remaining -= chunk as u64;
     }
+    source.validate_open_file(source_file.get_ref())?;
     Ok(true)
 }
 
@@ -178,7 +255,7 @@ fn removed_asset(options: &PackOptions, asset: AssetInfo) -> PlannedAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack_directory;
+    use crate::{Identity, pack_directory};
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -200,10 +277,11 @@ mod tests {
         std::fs::write(input.join("remove.txt"), b"remove").unwrap();
         std::fs::write(input.join("dlc/later.bin"), b"later").unwrap();
         let identity = Identity::generate().unwrap();
+        let keys = identity.runtime_key_material().unwrap();
         let mut options = PackOptions::new(&input, &output);
         options.deferred_prefixes.push("dlc".into());
 
-        let initial = plan_directory(&options, &identity).unwrap();
+        let initial = plan_directory(&options, &keys).unwrap();
         assert_eq!(initial.previous_release, None);
         assert!(
             initial
@@ -223,7 +301,7 @@ mod tests {
         );
 
         pack_directory(&options, &identity).unwrap();
-        let unchanged = plan_directory(&options, &identity).unwrap();
+        let unchanged = plan_directory(&options, &keys).unwrap();
         assert_eq!(unchanged.previous_release, Some(1));
         assert!(
             unchanged
@@ -232,11 +310,15 @@ mod tests {
                 .all(|asset| asset.change == AssetChange::Unchanged)
         );
         assert_eq!(unchanged.changed_source_bytes, 0);
+        assert_eq!(
+            plan_directory_after_pack(&options, &keys).unwrap(),
+            unchanged
+        );
 
         std::fs::write(input.join("edit.txt"), b"new!").unwrap();
         std::fs::remove_file(input.join("remove.txt")).unwrap();
         std::fs::write(input.join("added.txt"), b"added").unwrap();
-        let changed = plan_directory(&options, &identity).unwrap();
+        let changed = plan_directory(&options, &keys).unwrap();
         let states = changed
             .assets
             .iter()
@@ -247,6 +329,43 @@ mod tests {
         assert_eq!(states["remove.txt"], AssetChange::Removed);
         assert_eq!(states["added.txt"], AssetChange::Added);
         assert_eq!(changed.changed_source_bytes, 9);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_only_post_pack_plan_rejects_every_stale_inventory_shape() {
+        let root = scratch("post-pack-stale");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("asset.bin"), b"four").unwrap();
+        let identity = Identity::generate().unwrap();
+        let mut keys = identity.runtime_key_material().unwrap();
+        let options = PackOptions::new(&input, &output);
+        pack_directory(&options, &identity).unwrap();
+
+        let snapshot = output.join("game.haku");
+        let valid_snapshot = std::fs::read(&snapshot).unwrap();
+        let mut damaged_snapshot = valid_snapshot.clone();
+        damaged_snapshot[0] ^= 1;
+        std::fs::write(&snapshot, damaged_snapshot).unwrap();
+        assert!(plan_directory(&options, &keys).is_err());
+        assert!(plan_directory_after_pack(&options, &keys).is_err());
+        std::fs::write(&snapshot, valid_snapshot).unwrap();
+
+        keys.project_id.0[0] ^= 1;
+        assert!(plan_directory(&options, &keys).is_err());
+        assert!(plan_directory_after_pack(&options, &keys).is_err());
+        keys.project_id = identity.project_id();
+
+        std::fs::write(input.join("added.bin"), b"added").unwrap();
+        assert!(plan_directory_after_pack(&options, &keys).is_err());
+        std::fs::remove_file(input.join("added.bin")).unwrap();
+
+        std::fs::write(input.join("asset.bin"), b"different length").unwrap();
+        assert!(plan_directory_after_pack(&options, &keys).is_err());
+        std::fs::remove_file(input.join("asset.bin")).unwrap();
+        assert!(plan_directory_after_pack(&options, &keys).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

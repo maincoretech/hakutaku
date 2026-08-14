@@ -159,11 +159,18 @@ behavior are deliberately outside the wire format.
 | 28 | 4 | zero |
 
 Paths are non-empty UTF-8 separated by `/`. Absolute paths, empty components,
-`.`/`..`, backslashes, NUL, leading slash, and trailing slash are forbidden.
+`.`/`..`, backslashes, NUL, ASCII control characters, leading/trailing spaces,
+trailing dots, Windows-reserved punctuation, drive prefixes such as `C:`, and
+reserved device names such as `CON`, `NUL`, `COM1`, and `LPT1` are forbidden.
+These are logical package paths on every platform; `/` remains the only logical
+separator. Extraction additionally canonicalizes each created parent and
+requires it to remain beneath the caller's output root.
 
-The reference packer classifies files up to 32 KiB as Hot, known audio/video as
-Streaming, and remaining files as Normal. These are cache hints, not security
-or compatibility semantics; readers must accept every declared access class.
+The reference packer classifies known audio/video before applying the 32 KiB
+Hot rule. Short voice/SFX audio up to 1 MiB is Transient; BGM/music path
+components, longer audio, and video are Streaming. Small scripts/UI/config are
+Hot and remaining files are Normal. These are cache hints, not security or
+compatibility semantics; readers must accept every declared access class.
 The reference packer also writes each availability/access combination through
 an independent bounded segment stream. This placement policy improves
 incremental reclamation but is not a wire-format invariant.

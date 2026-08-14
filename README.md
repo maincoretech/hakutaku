@@ -34,6 +34,10 @@ own repository without inheriting Kēne's dependency graph.
 # Create once and keep this publisher file private.
 cargo run -p hakutaku-cli -- identity create publisher.hakutaku-key
 
+# Export the non-signing material used by runtime/read-only tools.
+cargo run -p hakutaku-cli -- identity export-runtime \
+  publisher.hakutaku-key game.hakutaku-runtime-key
+
 # Build or incrementally update a complete release directory.
 cargo run -p hakutaku-cli -- pack \
   --input path/to/assets \
@@ -43,11 +47,11 @@ cargo run -p hakutaku-cli -- pack \
 
 # Verify every immutable segment, or inspect the file table.
 cargo run -p hakutaku-cli -- verify \
-  --package path/to/release --identity publisher.hakutaku-key
+  --package path/to/release --keys game.hakutaku-runtime-key
 cargo run -p hakutaku-cli -- list \
-  --package path/to/release --identity publisher.hakutaku-key
+  --package path/to/release --keys game.hakutaku-runtime-key
 cargo run -p hakutaku-cli -- segments \
-  --package path/to/release --identity publisher.hakutaku-key
+  --package path/to/release --keys game.hakutaku-runtime-key
 
 # Inspect source changes, build and verify releases, and manage identities.
 cargo run -p hakutaku-gui
@@ -62,16 +66,22 @@ inspects, and backs up publisher identities without exposing private key
 material. Runtime benchmarks remain in the repository's Criterion bench rather
 than the application.
 
-Only `game.haku` and `data/*.taku` belong in the shipped game. The
-`*.hakutaku-key` identity contains both the content root key and publisher
-signing key; never ship or commit it.
+Only `game.haku`, `data/*.taku`, and the runtime's equivalent embedded key
+material belong in the shipped game. The `*.hakutaku-key` publisher identity
+contains both the content root key and Ed25519 signing private key; never ship
+or commit it. `*.hakutaku-runtime-key` contains the content decryption secret
+and public verification key but cannot sign a release. It is suitable for
+read-only tooling, not for public distribution as a loose file. The packer and
+GUI reject either key format as an asset by file magic, regardless of filename.
 
 Incremental packing reuses chunks from the active release. Identical chunks in
 the same placement class are also deduplicated during the first release, so
 copied assets with the same access policy are encrypted and stored only once.
-Files up to 32 KiB are marked `Hot`, media uses fixed
-`Streaming` blocks, and other assets enter the bounded second-hit `Normal`
-cache. The reference packer keeps each availability/access class in its own
+Scripts, UI files, and small configuration up to 32 KiB are marked `Hot`.
+Short voice/SFX audio up to 1 MiB is `Transient`, while BGM/music, longer
+audio, and video are `Streaming`; media classification takes precedence over
+size. Other assets enter the bounded second-hit `Normal` cache. The reference
+packer keeps each availability/access class in its own
 bounded segment stream: 64 MiB for Hot, 256 MiB for Normal, 128 MiB for
 Transient, and up to the configured limit (512 MiB by default) for Streaming.
 These are upper bounds rather than padded target sizes. Deferred content is
@@ -95,6 +105,17 @@ schedule `Asset::prefetch_range` on their existing task pool; its dedicated
 cache is bounded by `ResourceBudget::prefetch_cache_bytes` and creates no
 Hakutaku-owned threads.
 
+`Asset::read_at` remains the convenient one-shot random-access API. Code that
+performs repeated reads should retain an `AssetCursor` for sequential/seekable
+decoders or an `AssetReadSession` for offset-based engine APIs; both preserve
+the active segment handle and decode buffers across calls.
+
+The signed `release_sequence` prevents undetectable edits but cannot by itself
+remember a previously accepted version. A launcher should persist its highest
+accepted sequence and pass `OpenPolicy::requiring(sequence)` to
+`Package::open_with_policy` or `Package::open_directory_with_policy`. Hakutaku
+then rejects a correctly signed older snapshot without owning platform state.
+
 This boundary works with desktop files, Android/iOS asset storage, memory maps,
 or a platform download manager without adding an HTTP client or async runtime
 to `hakutaku-core`. Snapshot and segment reads are positional and safe to share
@@ -105,6 +126,16 @@ snapshot replacement, Unix directory synchronization, and post-commit garbage
 collection. Interrupted `.part` files are removed only after the exclusive
 build lock is acquired. If a process is killed while packing, confirm no packer
 is still running before removing a reported stale `.hakutaku.lock`.
+
+For local 20–40 GiB VN iteration, incremental builds may opt into
+`--dev-cache`. The release-local cache records source size, modification time,
+available file identity, and authenticated chunk metadata so unchanged voices
+do not need to be reread merely to rediscover their chunks. It is bound to the
+project and active release sequence; corrupt or stale caches are ignored.
+`--full` cannot be combined with it, and normal/final builds retain complete
+source rereads and byte-for-byte staged verification. After a successful GUI
+incremental build, the post-build plan validates the complete path/size/access
+inventory without immediately rereading every source body.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the normative v1 byte layout, parser limits,
 nonce/AAD rules, and verification chain.
@@ -125,11 +156,23 @@ cargo llvm-cov -p hakutaku-cli --fail-under-lines 45
 cargo bench --workspace
 ```
 
+The larger VN benchmark is opt-in because it creates 10k/50k/100k-entry
+fixtures. A 10k smoke run and the complete matrix are:
+
+```sh
+HAKUTAKU_VN_BENCH=1 HAKUTAKU_VN_BENCH_COUNTS=10000 \
+  cargo bench -p hakutaku-pack --bench vn_runtime
+HAKUTAKU_VN_BENCH=1 cargo bench -p hakutaku-pack --bench vn_runtime
+```
+
 Every successful push to `main` creates the next patch tag and publishes the
 CLI and GUI builds, together with `SHA256SUMS`, on GitHub Releases. The first
 automated tag follows `workspace.package.version`; later releases increment its
 patch component. Raise the workspace version explicitly to start a new minor or
 major line.
+
+Publisher-key storage, CI trust, and platform signing boundaries are documented
+in [docs/SECURITY.md](docs/SECURITY.md).
 
 Both library crates deny missing public API documentation. CI therefore keeps
 public rustdoc coverage at 100%. The canonical wire-format parser is held at

@@ -1,8 +1,8 @@
 use egui::{Align, Color32, RichText};
 use hakutaku_core::{Availability, Package, ResourceBudget, SegmentInfo};
 use hakutaku_pack::{
-    AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan,
-    pack_directory_with_progress, plan_directory,
+    AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan, RuntimeKeyMaterial,
+    is_hakutaku_key_file, pack_directory_with_progress, plan_directory, plan_directory_after_pack,
 };
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -118,6 +118,7 @@ impl Workspace {
     fn pack_options(&self) -> Result<PackOptions, String> {
         let mut options = PackOptions::new(&self.assets, &self.release);
         options.incremental = self.incremental;
+        options.development_cache = self.incremental;
         options.compression_level = self.compression_level;
         options.segment_target_bytes = self
             .segment_mib
@@ -338,7 +339,10 @@ impl App {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
                 .and_then(|identity| {
-                    plan_directory(&options, &identity).map_err(|error| error.to_string())
+                    let keys = identity
+                        .runtime_key_material()
+                        .map_err(|error| error.to_string())?;
+                    plan_directory(&options, &keys).map_err(|error| error.to_string())
                 });
             let _ = sender.send(Message::Planned(result));
         });
@@ -362,9 +366,12 @@ impl App {
                     let _ = sender.send(Message::Progress(progress));
                 })
                 .map_err(|error| error.to_string())?;
-                let plan =
-                    plan_directory(&options, &identity).map_err(|error| error.to_string())?;
-                let summary = inspect_release(&options.output_directory, &identity, false)?;
+                let keys = identity
+                    .runtime_key_material()
+                    .map_err(|error| error.to_string())?;
+                let plan = plan_directory_after_pack(&options, &keys)
+                    .map_err(|error| error.to_string())?;
+                let summary = inspect_release(&options.output_directory, &keys, false)?;
                 Ok((report, plan, summary))
             })();
             let _ = sender.send(Message::Packed(result));
@@ -379,7 +386,12 @@ impl App {
         std::thread::spawn(move || {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
-                .and_then(|identity| inspect_release(&release, &identity, true));
+                .and_then(|identity| {
+                    let keys = identity
+                        .runtime_key_material()
+                        .map_err(|error| error.to_string())?;
+                    inspect_release(&release, &keys, true)
+                });
             let _ = sender.send(Message::Verified(result));
         });
     }
@@ -1045,17 +1057,20 @@ fn pack_status(report: &PackReport) -> String {
 
 fn inspect_release(
     release: &Path,
-    identity: &Identity,
+    keys: &RuntimeKeyMaterial,
     verify: bool,
 ) -> Result<ReleaseSummary, String> {
     let package = Package::open_directory(
         release.join("game.haku"),
         release.join("data"),
-        identity.root_key(),
-        identity.public_key(),
+        keys.root_key(),
+        keys.public_key,
         ResourceBudget::memory_constrained(),
     )
     .map_err(|error| error.to_string())?;
+    if package.project_id() != keys.project_id {
+        return Err(hakutaku_core::Error::ProjectMismatch.to_string());
+    }
     if verify {
         package
             .verify_segments()
@@ -1102,6 +1117,12 @@ fn import_resources(sources: &[PathBuf], directory: &Path) -> Result<usize, Stri
     for source in sources {
         if !source.is_file() {
             return Err(format!("not a regular file: {}", source.display()));
+        }
+        if is_hakutaku_key_file(source).map_err(|error| error.to_string())? {
+            return Err(format!(
+                "Hakutaku key material cannot be imported as a resource: {}",
+                source.display()
+            ));
         }
         let name = source
             .file_name()
@@ -1151,6 +1172,12 @@ fn copy_new_file(source: &Path, target: &Path, private: bool) -> Result<(), Stri
 }
 
 fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
+    if is_hakutaku_key_file(source).map_err(|error| error.to_string())? {
+        return Err(format!(
+            "Hakutaku key material cannot replace a resource: {}",
+            source.display()
+        ));
+    }
     let parent = target
         .parent()
         .ok_or_else(|| format!("resource has no parent: {}", target.display()))?;
@@ -1272,6 +1299,10 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"first");
         replace_file(&replacement, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        let identity_path = source.join("renamed-resource.bin");
+        Identity::generate().unwrap().save(&identity_path).unwrap();
+        assert!(import_resources(std::slice::from_ref(&identity_path), &assets).is_err());
+        assert!(replace_file(&identity_path, &target).is_err());
         assert_eq!(std::fs::read_dir(&assets).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }

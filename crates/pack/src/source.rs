@@ -1,9 +1,14 @@
+use crate::identity::{is_hakutaku_key_file, is_hakutaku_key_magic};
 use crate::{Error, Result};
 use hakutaku_core::AccessClass;
 use hakutaku_core::format::{LayoutKind, validate_canonical_path};
+use std::fs::{File, Metadata};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const STREAM_BLOCK: usize = 256 * 1024;
+const SHORT_AUDIO_LIMIT: u64 = 1024 * 1024;
 pub(crate) const BULK_BLOCK: usize = 1024 * 1024;
 pub(crate) const HOT_FILE_LIMIT: u64 = 32 * 1024;
 pub(crate) const CONTENT_DEFINED_LIMIT: u64 = 64 * 1024 * 1024;
@@ -12,6 +17,89 @@ pub(crate) struct SourceFile {
     pub(crate) host_path: PathBuf,
     pub(crate) logical_path: String,
     pub(crate) len: u64,
+    stamp: SourceStamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    pub(crate) len: u64,
+    pub(crate) modified: Option<(u64, u32)>,
+    #[cfg(unix)]
+    pub(crate) device: u64,
+    #[cfg(unix)]
+    pub(crate) inode: u64,
+}
+
+impl SourceStamp {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos())),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+
+    fn matches(&self, metadata: &Metadata) -> bool {
+        metadata.is_file() && Self::from_metadata(metadata) == *self
+    }
+}
+
+impl SourceFile {
+    pub(crate) fn open_verified(&self) -> Result<File> {
+        let file = File::open(&self.host_path)?;
+        self.validate_open_file(&file)?;
+        let mut magic = [0_u8; 8];
+        let mut reader = &file;
+        let read = reader.read(&mut magic)?;
+        reader.seek(SeekFrom::Start(0))?;
+        if read == magic.len() && is_hakutaku_key_magic(&magic) {
+            return Err(Error::InvalidInput(format!(
+                "Hakutaku key material cannot be packaged as a resource: {}",
+                self.host_path.display()
+            )));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn validate_open_file(&self, file: &File) -> Result<()> {
+        if !self.stamp.matches(&file.metadata()?) {
+            return Err(Error::InvalidInput(format!(
+                "source changed while packing: {}",
+                self.host_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn stamp(&self) -> SourceStamp {
+        self.stamp
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(logical_path: impl Into<String>, len: u64) -> Self {
+        Self {
+            host_path: PathBuf::new(),
+            logical_path: logical_path.into(),
+            len,
+            stamp: SourceStamp {
+                len,
+                modified: None,
+                #[cfg(unix)]
+                device: 0,
+                #[cfg(unix)]
+                inode: 0,
+            },
+        }
+    }
 }
 
 pub(crate) fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
@@ -20,20 +108,22 @@ pub(crate) fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
         .rsplit_once('.')
         .map_or("", |(_, extension)| extension)
         .to_ascii_lowercase();
-    let streaming = matches!(
-        extension.as_str(),
-        "mp4" | "webm" | "mkv" | "mov" | "m4v" | "mp3" | "ogg" | "opus" | "flac" | "wav"
-    );
+    let audio = matches!(extension.as_str(), "mp3" | "ogg" | "opus" | "flac" | "wav");
+    let video = matches!(extension.as_str(), "mp4" | "webm" | "mkv" | "mov" | "m4v");
+    if video || audio {
+        let long_lived_audio = source.logical_path.split('/').any(|component| {
+            component.eq_ignore_ascii_case("bgm") || component.eq_ignore_ascii_case("music")
+        });
+        let access = if video || long_lived_audio || source.len > SHORT_AUDIO_LIMIT {
+            AccessClass::Streaming
+        } else {
+            AccessClass::Transient
+        };
+        return (LayoutKind::Fixed, STREAM_BLOCK as u32, access);
+    }
     if source.len <= HOT_FILE_LIMIT {
         let fixed = u32::try_from(source.len.max(1)).unwrap_or(1);
         return (LayoutKind::Fixed, fixed, AccessClass::Hot);
-    }
-    if streaming {
-        return (
-            LayoutKind::Fixed,
-            STREAM_BLOCK as u32,
-            AccessClass::Streaming,
-        );
     }
     if source.len <= CONTENT_DEFINED_LIMIT {
         return (LayoutKind::ContentDefined, 0, AccessClass::Normal);
@@ -62,6 +152,12 @@ fn collect_directory(root: &Path, directory: &Path, files: &mut Vec<SourceFile>)
         if metadata.is_dir() {
             collect_directory(root, &entry.path(), files)?;
         } else if metadata.is_file() {
+            if is_hakutaku_key_file(entry.path())? {
+                return Err(Error::InvalidInput(format!(
+                    "Hakutaku key material cannot be packaged as a resource: {}",
+                    entry.path().display()
+                )));
+            }
             let relative = entry
                 .path()
                 .strip_prefix(root)
@@ -77,12 +173,63 @@ fn collect_directory(root: &Path, directory: &Path, files: &mut Vec<SourceFile>)
                 .collect::<Result<Vec<_>>>()?
                 .join("/");
             validate_canonical_path(&logical_path)?;
+            let metadata = entry.metadata()?;
             files.push(SourceFile {
                 host_path: entry.path(),
                 logical_path,
-                len: entry.metadata()?.len(),
+                len: metadata.len(),
+                stamp: SourceStamp::from_metadata(&metadata),
             });
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hakutaku-source-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn verified_open_rechecks_key_magic_on_the_open_handle() {
+        let root = scratch("magic");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("renamed.bin");
+        std::fs::write(&path, b"HAKID001not-a-valid-identity").unwrap();
+        let metadata = path.metadata().unwrap();
+        let source = SourceFile {
+            host_path: path,
+            logical_path: "renamed.bin".into(),
+            len: metadata.len(),
+            stamp: SourceStamp::from_metadata(&metadata),
+        };
+        assert!(source.open_verified().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_scan_rejects_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = scratch("non-utf8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        if std::fs::write(
+            root.join(std::ffi::OsString::from_vec(vec![0xff])),
+            b"asset",
+        )
+        .is_err()
+        {
+            // Some macOS volumes reject non-UTF-8 names before Hakutaku sees them.
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        assert!(collect_files(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -24,3 +24,7 @@ all = "warn"
 [[bench]]
 name = "runtime"
 harness = false
+
+[[bench]]
+name = "vn_runtime"
+harness = false
