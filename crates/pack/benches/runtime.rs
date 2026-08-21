@@ -1,4 +1,4 @@
-use hakutaku_core::{Asset, Package, ResourceBudget};
+use hakutaku_core::{Asset, OpenPolicy, Package, ResourceBudget};
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::default(),
+        OpenPolicy::TrustFirstRelease,
     )?;
     let open_elapsed = open_started.elapsed();
     let asset = package.asset("opening.mp4")?;

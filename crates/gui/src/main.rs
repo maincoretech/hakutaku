@@ -1,5 +1,5 @@
 use egui::{Align, Color32, RichText};
-use hakutaku_core::{Availability, Package, ResourceBudget, SegmentInfo};
+use hakutaku_core::{Availability, OpenPolicy, Package, ResourceBudget, SegmentInfo};
 use hakutaku_pack::{
     AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan, RuntimeKeyMaterial,
     is_hakutaku_key_file, pack_directory_with_progress, plan_directory, plan_directory_after_pack,
@@ -1066,6 +1066,7 @@ fn inspect_release(
         keys.root_key(),
         keys.public_key,
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )
     .map_err(|error| error.to_string())?;
     if package.project_id() != keys.project_id {

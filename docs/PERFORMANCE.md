@@ -31,6 +31,10 @@ Targets are upper bounds; tail segments are never padded.
 | Streaming | fixed 256 KiB | configured limit, default 512 MiB |
 | Transient | short voice/SFX, fixed 256 KiB | 128 MiB |
 
+Known pre-compressed media is encrypted as `Codec::Raw` without first invoking
+zstd. This covers WebP/PNG/JPEG/AVIF, Opus/MP3/Ogg/FLAC, and supported video
+containers. WAV and general data retain the normal compress-if-useful policy.
+
 The publisher reports retained segment bytes, unique referenced encrypted block
 bytes, and stranded payload after every build. A full rebuild is the single
 compaction mechanism; the runtime never performs garbage collection.
@@ -157,3 +161,21 @@ The cached unchanged build was 50.8% faster than strict incremental on this
 metadata-heavy fixture. This is a smoke marker, not a claim about 20–40 GiB
 projects; the full count matrix and target storage should be measured before a
 release decision.
+
+### Pre-compressed media bypass
+
+Apple Silicon macOS, 2026-08-21, single same-session runs with a warm filesystem
+cache. The before build is `557ea18`; the after build skips zstd entirely for
+known pre-compressed media. Runtime read amplification is unchanged because the
+wire codec was already commonly RAW; the gain is publisher-side work avoided.
+
+| Fixture / metric | Before | Raw media policy | Change |
+|---|---:|---:|---:|
+| 10k initial strict pack | 547.471 ms | 500.604 ms | -8.6% |
+| 10k unchanged strict incremental | 307.560 ms | 286.086 ms | -7.0% |
+| 10k development-cache seed | 308.603 ms | 290.955 ms | -5.7% |
+| 10k development-cache hit | 152.763 ms | 141.342 ms | -7.5% |
+| 100k initial strict pack | 6,006.161 ms | 5,730.845 ms | -4.6% |
+| 100k unchanged strict incremental | 3,893.427 ms | 3,730.331 ms | -4.2% |
+| 100k development-cache seed | 3,915.249 ms | 3,751.604 ms | -4.2% |
+| 100k development-cache hit | 1,946.918 ms | 1,880.343 ms | -3.4% |

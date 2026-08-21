@@ -95,6 +95,7 @@ fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::cache_disabled(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
@@ -121,6 +122,7 @@ fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
             prefetch_cache_bytes: 256 * 1024,
             ..ResourceBudget::cache_disabled()
         },
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
 
@@ -189,7 +191,7 @@ fn caller_policy_rejects_a_validly_signed_rollback() {
     let identity = Identity::generate().unwrap();
     pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
 
-    let rejected = Package::open_directory_with_policy(
+    let rejected = Package::open_directory(
         output.join("game.haku"),
         output.join("data"),
         identity.root_key(),
@@ -289,6 +291,7 @@ fn first_release_deduplicates_identical_chunks() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     assert_eq!(package.asset("a.bin").unwrap().read().unwrap(), repeated);
@@ -318,6 +321,7 @@ fn deferred_segments_are_isolated_and_can_arrive_after_snapshot_open() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     let assets = local.list_assets().unwrap();
@@ -353,6 +357,7 @@ fn deferred_segments_are_isolated_and_can_arrive_after_snapshot_open() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     assert_eq!(
@@ -385,6 +390,7 @@ fn snapshot_signature_rejects_tampering() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::cache_disabled(),
+        OpenPolicy::TrustFirstRelease,
     );
     assert!(result.is_err());
 }
@@ -500,6 +506,7 @@ fn extracted_content_key_cannot_forge_the_signed_block_commitment() {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::cache_disabled(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     assert!(package.verify_segments().is_err());
@@ -513,6 +520,7 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::default(),
+        OpenPolicy::TrustFirstRelease,
     )
     .unwrap();
     assert_eq!(package.project_id(), identity.project_id());

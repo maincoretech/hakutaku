@@ -113,8 +113,10 @@ the active segment handle and decode buffers across calls.
 The signed `release_sequence` prevents undetectable edits but cannot by itself
 remember a previously accepted version. A launcher should persist its highest
 accepted sequence and pass `OpenPolicy::requiring(sequence)` to
-`Package::open_with_policy` or `Package::open_directory_with_policy`. Hakutaku
+`Package::open` or `Package::open_directory`. Hakutaku
 then rejects a correctly signed older snapshot without owning platform state.
+The first trusted install must deliberately pass `OpenPolicy::TrustFirstRelease`;
+there is no implicit rollback-permitting open path.
 
 This boundary works with desktop files, Android/iOS asset storage, memory maps,
 or a platform download manager without adding an HTTP client or async runtime

@@ -10,10 +10,16 @@ Hakutaku v1 has exactly one cryptographic suite:
 - AES-256-GCM with a 96-bit nonce and 128-bit tag;
 - Ed25519 snapshot signatures;
 - BLAKE3 key derivation, page/block commitments, fingerprints, and SegmentId;
-- zstd independent frames, or RAW when compression is not useful.
+- zstd independent frames, or RAW when compression is not useful or the source
+  is already compressed media.
 
 There is no cipher identifier, algorithm negotiation, password KDF, or
 compatibility branch in the wire format.
+
+The publisher writes WebP/PNG/JPEG/AVIF, Opus/MP3/Ogg/FLAC, and supported video
+containers as RAW encrypted blocks. Recompressing these formats with zstd adds
+publisher CPU time without a reliable storage benefit. Other inputs use zstd
+only when the independent frame saves at least the canonical threshold.
 
 ## Release layout
 

@@ -1,5 +1,5 @@
 use hakutaku_core::{
-    LocalFile, Package, PositionedFile, ResourceBudget, Result as CoreResult,
+    LocalFile, OpenPolicy, Package, PositionedFile, ResourceBudget, Result as CoreResult,
     SEGMENT_FILE_EXTENSION, SegmentId, SegmentSource, segment_file_name,
 };
 use hakutaku_pack::{Identity, PackOptions, pack_directory};
@@ -171,6 +171,7 @@ fn open_counted(
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::default(),
+        OpenPolicy::TrustFirstRelease,
     )?)
 }
 

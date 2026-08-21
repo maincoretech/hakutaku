@@ -1,12 +1,13 @@
-use crate::source::SourceStamp;
+use crate::source::{CompressionPolicy, SourceStamp};
 use crate::{Error, Result};
 use hakutaku_core::format::LayoutKind;
 use hakutaku_core::{AccessClass, Availability, ProjectId};
 use std::collections::HashMap;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"HAKBC001";
+const MAGIC: &[u8; 8] = b"HAKBC002";
 const HEADER_SIZE: usize = 48;
+const ENTRY_HEADER_SIZE: usize = 51;
 const CHECKSUM_SIZE: usize = 32;
 const CHUNK_SIZE: usize = 44;
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -24,6 +25,7 @@ pub(crate) struct CachedEntry {
     pub(crate) fixed_block_len: u32,
     pub(crate) access: AccessClass,
     pub(crate) availability: Availability,
+    pub(crate) compression: CompressionPolicy,
     pub(crate) chunks: Vec<CachedChunk>,
 }
 
@@ -59,7 +61,7 @@ impl BuildCache {
     fn parse(bytes: &[u8], project_id: ProjectId, release_sequence: u64) -> Option<Self> {
         if bytes.len() < HEADER_SIZE + CHECKSUM_SIZE
             || bytes.get(..8)? != MAGIC
-            || read_u16(bytes, 8)? != 1
+            || read_u16(bytes, 8)? != 2
             || read_u16(bytes, 10)? as usize != HEADER_SIZE
             || bytes.get(12..28)? != project_id.0
             || read_u64(bytes, 28)? != release_sequence
@@ -83,22 +85,23 @@ impl BuildCache {
             let layout = parse_layout(*bytes.get(offset + 2)?)?;
             let access = parse_access(*bytes.get(offset + 3)?)?;
             let availability = parse_availability(*bytes.get(offset + 4)?)?;
-            let modified_known = *bytes.get(offset + 5)?;
+            let compression = parse_compression(*bytes.get(offset + 5)?)?;
+            let modified_known = *bytes.get(offset + 6)?;
             if modified_known > 1 {
                 return None;
             }
-            let fixed_block_len = read_u32(bytes, offset + 6)?;
-            let len = read_u64(bytes, offset + 10)?;
-            let modified_secs = read_u64(bytes, offset + 18)?;
-            let modified_nanos = read_u32(bytes, offset + 26)?;
-            let device = read_u64(bytes, offset + 30)?;
-            let inode = read_u64(bytes, offset + 38)?;
-            let chunk_count = read_u32(bytes, offset + 46)? as usize;
+            let fixed_block_len = read_u32(bytes, offset + 7)?;
+            let len = read_u64(bytes, offset + 11)?;
+            let modified_secs = read_u64(bytes, offset + 19)?;
+            let modified_nanos = read_u32(bytes, offset + 27)?;
+            let device = read_u64(bytes, offset + 31)?;
+            let inode = read_u64(bytes, offset + 39)?;
+            let chunk_count = read_u32(bytes, offset + 47)? as usize;
             total_chunks = total_chunks.checked_add(chunk_count)?;
             if total_chunks > MAX_CHUNKS || modified_nanos >= 1_000_000_000 {
                 return None;
             }
-            offset = offset.checked_add(50)?;
+            offset = offset.checked_add(ENTRY_HEADER_SIZE)?;
             let path_end = offset.checked_add(path_len)?;
             let path = std::str::from_utf8(bytes.get(offset..path_end)?).ok()?;
             hakutaku_core::format::validate_canonical_path(path).ok()?;
@@ -132,6 +135,7 @@ impl BuildCache {
                         fixed_block_len,
                         access,
                         availability,
+                        compression,
                         chunks,
                     },
                 )
@@ -154,7 +158,7 @@ pub(crate) fn save(
         .map_err(|_| Error::InvalidInput("too many build-cache entries".into()))?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
     bytes.extend_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
     bytes.extend_from_slice(&project_id.0);
     bytes.extend_from_slice(&release_sequence.to_le_bytes());
@@ -169,6 +173,7 @@ pub(crate) fn save(
         bytes.push(entry.layout as u8);
         bytes.push(entry.access as u8);
         bytes.push(entry.availability as u8);
+        bytes.push(entry.compression as u8);
         bytes.push(u8::from(entry.stamp.modified.is_some()));
         bytes.extend_from_slice(&entry.fixed_block_len.to_le_bytes());
         bytes.extend_from_slice(&entry.stamp.len.to_le_bytes());
@@ -226,6 +231,14 @@ fn parse_availability(value: u8) -> Option<Availability> {
     }
 }
 
+fn parse_compression(value: u8) -> Option<CompressionPolicy> {
+    match value {
+        0 => Some(CompressionPolicy::Auto),
+        1 => Some(CompressionPolicy::Raw),
+        _ => None,
+    }
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -278,6 +291,7 @@ mod tests {
             fixed_block_len: u32::from(layout == LayoutKind::Fixed) * 4,
             access,
             availability,
+            compression: CompressionPolicy::Auto,
             chunks: vec![CachedChunk {
                 logical_offset: 0,
                 plain_len: 4,
@@ -299,7 +313,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("cache");
         let project = ProjectId([9; 16]);
-        let entries = vec![
+        let mut entries = vec![
             (
                 "a".into(),
                 entry(
@@ -337,9 +351,11 @@ mod tests {
                 ),
             ),
         ];
+        entries[2].1.compression = CompressionPolicy::Raw;
         save(&path, project, 7, &entries).unwrap();
         let loaded = BuildCache::load(&path, project, 7).unwrap().unwrap();
         assert_eq!(loaded.get("b").unwrap().chunks.len(), 1);
+        assert_eq!(loaded.get("c").unwrap().compression, CompressionPolicy::Raw);
         assert!(
             BuildCache::load(&root.join("missing"), project, 7)
                 .unwrap()
@@ -365,7 +381,11 @@ mod tests {
         rewrite_checksum(&mut damaged);
         assert!(BuildCache::parse(&damaged, project, 7).is_none());
         let mut damaged = valid.clone();
-        damaged[48 + 26..48 + 30].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
+        damaged[48 + 6] = 2;
+        rewrite_checksum(&mut damaged);
+        assert!(BuildCache::parse(&damaged, project, 7).is_none());
+        let mut damaged = valid.clone();
+        damaged[48 + 27..48 + 31].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
         rewrite_checksum(&mut damaged);
         assert!(BuildCache::parse(&damaged, project, 7).is_none());
         let mut damaged = valid;

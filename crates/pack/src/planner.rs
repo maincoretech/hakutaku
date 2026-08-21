@@ -1,7 +1,7 @@
 use crate::packer::{PackOptions, validate_options};
 use crate::source::{SourceFile, classify, collect_files};
 use crate::{Result, RuntimeKeyMaterial};
-use hakutaku_core::{AccessClass, AssetInfo, Availability, Package, ResourceBudget};
+use hakutaku_core::{AccessClass, AssetInfo, Availability, OpenPolicy, Package, ResourceBudget};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read};
 
@@ -75,6 +75,7 @@ pub fn plan_directory(options: &PackOptions, keys: &RuntimeKeyMaterial) -> Resul
             keys.root_key(),
             keys.public_key,
             ResourceBudget::memory_constrained(),
+            OpenPolicy::TrustFirstRelease,
         )?;
         if package.project_id() != keys.project_id {
             return Err(hakutaku_core::Error::ProjectMismatch.into());
@@ -99,7 +100,7 @@ pub fn plan_directory(options: &PackOptions, keys: &RuntimeKeyMaterial) -> Resul
 
     for source in &sources {
         let previous = released.remove(&source.logical_path);
-        let (_, _, current_access) = classify(source);
+        let current_access = classify(source).access;
         let change = match (&package, &previous) {
             (Some(package), Some(previous))
                 if previous.len == source.len
@@ -171,6 +172,7 @@ pub fn plan_directory_after_pack(
         keys.root_key(),
         keys.public_key,
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )?;
     if package.project_id() != keys.project_id {
         return Err(hakutaku_core::Error::ProjectMismatch.into());
@@ -188,7 +190,7 @@ pub fn plan_directory_after_pack(
                 source.logical_path
             ))
         })?;
-        let (_, _, access) = classify(source);
+        let access = classify(source).access;
         if released.len != source.len || released.access != access {
             return Err(crate::Error::InvalidInput(format!(
                 "source changed after pack: {}",

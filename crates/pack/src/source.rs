@@ -1,7 +1,7 @@
 use crate::identity::{is_hakutaku_key_file, is_hakutaku_key_magic};
 use crate::{Error, Result};
 use hakutaku_core::AccessClass;
-use hakutaku_core::format::{LayoutKind, validate_canonical_path};
+use hakutaku_core::format::{Codec, LayoutKind, validate_canonical_path};
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,27 @@ const SHORT_AUDIO_LIMIT: u64 = 1024 * 1024;
 pub(crate) const BULK_BLOCK: usize = 1024 * 1024;
 pub(crate) const HOT_FILE_LIMIT: u64 = 32 * 1024;
 pub(crate) const CONTENT_DEFINED_LIMIT: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CompressionPolicy {
+    Auto = 0,
+    Raw = 1,
+}
+
+impl CompressionPolicy {
+    pub(crate) const fn accepts(self, codec: Codec) -> bool {
+        matches!(self, Self::Auto) || matches!(codec, Codec::Raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceClass {
+    pub(crate) layout: LayoutKind,
+    pub(crate) fixed_block_len: u32,
+    pub(crate) access: AccessClass,
+    pub(crate) compression: CompressionPolicy,
+}
 
 pub(crate) struct SourceFile {
     pub(crate) host_path: PathBuf,
@@ -102,7 +123,7 @@ impl SourceFile {
     }
 }
 
-pub(crate) fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
+pub(crate) fn classify(source: &SourceFile) -> SourceClass {
     let extension = source
         .logical_path
         .rsplit_once('.')
@@ -110,6 +131,28 @@ pub(crate) fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
         .to_ascii_lowercase();
     let audio = matches!(extension.as_str(), "mp3" | "ogg" | "opus" | "flac" | "wav");
     let video = matches!(extension.as_str(), "mp4" | "webm" | "mkv" | "mov" | "m4v");
+    let already_compressed = matches!(
+        extension.as_str(),
+        "webp"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "avif"
+            | "opus"
+            | "mp3"
+            | "ogg"
+            | "flac"
+            | "mp4"
+            | "webm"
+            | "mkv"
+            | "mov"
+            | "m4v"
+    );
+    let compression = if already_compressed {
+        CompressionPolicy::Raw
+    } else {
+        CompressionPolicy::Auto
+    };
     if video || audio {
         let long_lived_audio = source.logical_path.split('/').any(|component| {
             component.eq_ignore_ascii_case("bgm") || component.eq_ignore_ascii_case("music")
@@ -119,16 +162,36 @@ pub(crate) fn classify(source: &SourceFile) -> (LayoutKind, u32, AccessClass) {
         } else {
             AccessClass::Transient
         };
-        return (LayoutKind::Fixed, STREAM_BLOCK as u32, access);
+        return SourceClass {
+            layout: LayoutKind::Fixed,
+            fixed_block_len: STREAM_BLOCK as u32,
+            access,
+            compression,
+        };
     }
     if source.len <= HOT_FILE_LIMIT {
         let fixed = u32::try_from(source.len.max(1)).unwrap_or(1);
-        return (LayoutKind::Fixed, fixed, AccessClass::Hot);
+        return SourceClass {
+            layout: LayoutKind::Fixed,
+            fixed_block_len: fixed,
+            access: AccessClass::Hot,
+            compression,
+        };
     }
     if source.len <= CONTENT_DEFINED_LIMIT {
-        return (LayoutKind::ContentDefined, 0, AccessClass::Normal);
+        return SourceClass {
+            layout: LayoutKind::ContentDefined,
+            fixed_block_len: 0,
+            access: AccessClass::Normal,
+            compression,
+        };
     }
-    (LayoutKind::Fixed, BULK_BLOCK as u32, AccessClass::Normal)
+    SourceClass {
+        layout: LayoutKind::Fixed,
+        fixed_block_len: BULK_BLOCK as u32,
+        access: AccessClass::Normal,
+        compression,
+    }
 }
 
 pub(crate) fn collect_files(root: &Path) -> Result<Vec<SourceFile>> {

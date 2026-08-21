@@ -38,19 +38,19 @@ pub struct ResourceBudget {
 /// Hakutaku authenticates the signed sequence but deliberately does not own
 /// persistent rollback state. Launchers should persist the highest accepted
 /// sequence and provide it here on subsequent opens.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OpenPolicy {
-    /// Lowest signed release sequence accepted by the caller.
-    pub minimum_release_sequence: Option<u64>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenPolicy {
+    /// Accept the first authenticated release for a locally trusted install.
+    TrustFirstRelease,
+    /// Reject authenticated releases below the caller's persisted floor.
+    RequireAtLeast(u64),
 }
 
 impl OpenPolicy {
     #[must_use]
     /// Requires an authenticated snapshot at or above `minimum`.
     pub const fn requiring(minimum: u64) -> Self {
-        Self {
-            minimum_release_sequence: Some(minimum),
-        }
+        Self::RequireAtLeast(minimum)
     }
 }
 
@@ -341,30 +341,6 @@ impl Package {
         root_key: [u8; 32],
         verifying_key: [u8; 32],
         budget: ResourceBudget,
-    ) -> Result<Self> {
-        Self::open_with_policy(
-            snapshot,
-            source,
-            root_key,
-            verifying_key,
-            budget,
-            OpenPolicy::default(),
-        )
-    }
-
-    /// Opens and authenticates a package while enforcing caller-owned rollback policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ReleaseRollback`] after signature verification when the
-    /// signed sequence is below the caller's accepted floor, in addition to the
-    /// errors returned by [`Package::open`].
-    pub fn open_with_policy(
-        snapshot: Arc<dyn PositionedFile>,
-        source: Arc<dyn SegmentSource>,
-        root_key: [u8; 32],
-        verifying_key: [u8; 32],
-        budget: ResourceBudget,
         policy: OpenPolicy,
     ) -> Result<Self> {
         let mut header_bytes = vec![0_u8; crate::format::SNAPSHOT_HEADER_SIZE];
@@ -378,7 +354,7 @@ impl Package {
             &mut catalog_ciphertext,
         )?;
         crypto::verify_snapshot_signature(&header, &catalog_ciphertext, &verifying_key)?;
-        if let Some(minimum) = policy.minimum_release_sequence
+        if let OpenPolicy::RequireAtLeast(minimum) = policy
             && header.release_sequence < minimum
         {
             return Err(Error::ReleaseRollback {
@@ -448,31 +424,9 @@ impl Package {
         root_key: [u8; 32],
         verifying_key: [u8; 32],
         budget: ResourceBudget,
-    ) -> Result<Self> {
-        Self::open_directory_with_policy(
-            snapshot_path,
-            segment_directory,
-            root_key,
-            verifying_key,
-            budget,
-            OpenPolicy::default(),
-        )
-    }
-
-    /// Opens a local package while enforcing caller-owned rollback policy.
-    ///
-    /// # Errors
-    ///
-    /// Propagates filesystem, authentication, canonical-format, and rollback failures.
-    pub fn open_directory_with_policy(
-        snapshot_path: impl AsRef<Path>,
-        segment_directory: impl AsRef<Path>,
-        root_key: [u8; 32],
-        verifying_key: [u8; 32],
-        budget: ResourceBudget,
         policy: OpenPolicy,
     ) -> Result<Self> {
-        Self::open_with_policy(
+        Self::open(
             Arc::new(LocalFile::open(snapshot_path)?),
             Arc::new(DirectorySegmentSource::new(
                 segment_directory.as_ref().to_path_buf(),

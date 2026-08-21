@@ -252,15 +252,16 @@ fn package_arguments(
 
 fn open_package(arguments: &PackageArguments) -> Result<Package, Box<dyn std::error::Error>> {
     let keys = RuntimeKeyMaterial::load(&arguments.keys)?;
-    let package = Package::open_directory_with_policy(
+    let policy = arguments
+        .minimum_release
+        .map_or(OpenPolicy::TrustFirstRelease, OpenPolicy::requiring);
+    let package = Package::open_directory(
         arguments.release.join("game.haku"),
         arguments.release.join("data"),
         keys.root_key(),
         keys.public_key,
         ResourceBudget::default(),
-        OpenPolicy {
-            minimum_release_sequence: arguments.minimum_release,
-        },
+        policy,
     )?;
     if package.project_id() != keys.project_id {
         return Err(hakutaku_core::Error::ProjectMismatch.into());

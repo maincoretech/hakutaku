@@ -1,5 +1,5 @@
 use crate::build_cache::{self, BuildCache, CachedChunk, CachedEntry};
-use crate::source::{SourceFile, classify, collect_files};
+use crate::source::{CompressionPolicy, SourceClass, SourceFile, classify, collect_files};
 use crate::{Error, Identity, Result};
 use hakutaku_core::crypto::{self, Aes256Key, ProjectKeys};
 use hakutaku_core::format::{
@@ -8,7 +8,9 @@ use hakutaku_core::format::{
     SEGMENT_HEADER_SIZE, SegmentHeader, SegmentId, SegmentRecord, SnapshotHeader, encode_map_page,
     encode_reuse_page, validate_canonical_path,
 };
-use hakutaku_core::{Package, ResourceBudget, SEGMENT_FILE_EXTENSION, segment_file_name};
+use hakutaku_core::{
+    OpenPolicy, Package, ResourceBudget, SEGMENT_FILE_EXTENSION, segment_file_name,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -169,6 +171,7 @@ where
             identity.root_key(),
             identity.public_key(),
             ResourceBudget::memory_constrained(),
+            OpenPolicy::TrustFirstRelease,
         )?)
     } else {
         None
@@ -224,7 +227,7 @@ where
     };
     context
         .fingerprint
-        .update(b"Hakutaku source fingerprint v1");
+        .update(b"Hakutaku source fingerprint v2");
     context
         .fingerprint
         .update(&(files.len() as u64).to_le_bytes());
@@ -419,7 +422,10 @@ impl BuildContext<'_> {
     }
 
     fn add_file(&mut self, source: &SourceFile, cached: Option<&CachedEntry>) -> Result<()> {
-        let (layout, fixed_block_len, access) = classify(source);
+        let class = classify(source);
+        let layout = class.layout;
+        let fixed_block_len = class.fixed_block_len;
+        let access = class.access;
         let availability = self.options.availability(&source.logical_path);
         let first_block = u32::try_from(self.pending_blocks.len())
             .map_err(|_| Error::InvalidInput("too many blocks".into()))?;
@@ -434,22 +440,19 @@ impl BuildContext<'_> {
             .update(&(source.logical_path.len() as u64).to_le_bytes());
         self.fingerprint.update(source.logical_path.as_bytes());
         self.fingerprint.update(&source.len.to_le_bytes());
-        self.fingerprint
-            .update(&[layout as u8, access as u8, availability as u8]);
+        self.fingerprint.update(&[
+            layout as u8,
+            access as u8,
+            availability as u8,
+            class.compression as u8,
+        ]);
         self.fingerprint.update(&fixed_block_len.to_le_bytes());
 
         let before = self.pending_blocks.len();
         if source.len > 0 {
-            if let Some(cached) = cached.filter(|cached| {
-                self.cached_entry_usable(
-                    source,
-                    cached,
-                    layout,
-                    fixed_block_len,
-                    availability,
-                    access,
-                )
-            }) {
+            if let Some(cached) = cached
+                .filter(|cached| self.cached_entry_usable(source, cached, class, availability))
+            {
                 for chunk in &cached.chunks {
                     self.record_chunk(chunk.chunk_id);
                     if !self.try_reuse_chunk(
@@ -458,6 +461,7 @@ impl BuildContext<'_> {
                         chunk.chunk_id,
                         availability,
                         access,
+                        class.compression,
                     )? {
                         return Err(Error::InvalidInput(
                             "development cache lost a reusable block".into(),
@@ -466,12 +470,19 @@ impl BuildContext<'_> {
                 }
             } else {
                 match layout {
-                    LayoutKind::Fixed => {
-                        self.add_fixed_file(source, fixed_block_len as usize, availability, access)?
-                    }
-                    LayoutKind::ContentDefined => {
-                        self.add_content_defined_file(source, availability, access)?
-                    }
+                    LayoutKind::Fixed => self.add_fixed_file(
+                        source,
+                        fixed_block_len as usize,
+                        availability,
+                        access,
+                        class.compression,
+                    )?,
+                    LayoutKind::ContentDefined => self.add_content_defined_file(
+                        source,
+                        availability,
+                        access,
+                        class.compression,
+                    )?,
                 }
             }
         }
@@ -499,16 +510,15 @@ impl BuildContext<'_> {
         &self,
         source: &SourceFile,
         cached: &CachedEntry,
-        layout: LayoutKind,
-        fixed_block_len: u32,
+        class: SourceClass,
         availability: Availability,
-        access: AccessClass,
     ) -> bool {
         if cached.stamp != source.stamp()
-            || cached.layout != layout
-            || cached.fixed_block_len != fixed_block_len
+            || cached.layout != class.layout
+            || cached.fixed_block_len != class.fixed_block_len
             || cached.availability != availability
-            || cached.access != access
+            || cached.access != class.access
+            || cached.compression != class.compression
         {
             return false;
         }
@@ -521,16 +531,20 @@ impl BuildContext<'_> {
                 Some(offset) => offset,
                 None => return false,
             };
-            let class = SegmentClass::new(availability, access);
+            let segment_class = SegmentClass::new(availability, class.access);
             let current = self
                 .current_reuse
-                .get(&(chunk.chunk_id, class))
-                .is_some_and(|pending| pending.reference.plain_len == chunk.plain_len);
+                .get(&(chunk.chunk_id, segment_class))
+                .is_some_and(|pending| {
+                    pending.reference.plain_len == chunk.plain_len
+                        && class.compression.accepts(pending.reference.codec)
+                });
             let existing = self
                 .reuse_index
                 .get(&(chunk.chunk_id, availability))
                 .is_some_and(|reused| {
                     reused.block.plain_len == chunk.plain_len
+                        && class.compression.accepts(reused.block.codec)
                         && self
                             .reuse_segments
                             .get(reused.segment_ordinal as usize)
@@ -549,6 +563,7 @@ impl BuildContext<'_> {
         block_size: usize,
         availability: Availability,
         access: AccessClass,
+        compression: CompressionPolicy,
     ) -> Result<()> {
         let mut reader =
             BufReader::with_capacity(block_size.min(1024 * 1024), source.open_verified()?);
@@ -559,7 +574,13 @@ impl BuildContext<'_> {
             if read == 0 {
                 break;
             }
-            self.add_chunk(logical_offset, &buffer[..read], availability, access)?;
+            self.add_chunk(
+                logical_offset,
+                &buffer[..read],
+                availability,
+                access,
+                compression,
+            )?;
             logical_offset = logical_offset
                 .checked_add(read as u64)
                 .ok_or_else(|| Error::InvalidInput("file offset overflow".into()))?;
@@ -574,6 +595,7 @@ impl BuildContext<'_> {
         source: &SourceFile,
         availability: Availability,
         access: AccessClass,
+        compression: CompressionPolicy,
     ) -> Result<()> {
         let mut file = source.open_verified()?;
         let mut bytes = Vec::with_capacity(
@@ -593,6 +615,7 @@ impl BuildContext<'_> {
                 &bytes[chunk.offset..end],
                 availability,
                 access,
+                compression,
             )?;
         }
         Ok(())
@@ -604,6 +627,7 @@ impl BuildContext<'_> {
         plaintext: &[u8],
         availability: Availability,
         access: AccessClass,
+        compression: CompressionPolicy,
     ) -> Result<()> {
         let chunk_id = *blake3::hash(plaintext).as_bytes();
         self.record_chunk(chunk_id);
@@ -614,13 +638,14 @@ impl BuildContext<'_> {
             chunk_id,
             availability,
             access,
+            compression,
         )? {
             return Ok(());
         }
         let class = SegmentClass::new(availability, access);
         let reuse_key = (chunk_id, class);
 
-        let (codec, encoded) = compress_block(&mut self.compressor, plaintext)?;
+        let (codec, encoded) = compress_block(&mut self.compressor, plaintext, compression)?;
         let estimated_stored = encoded
             .len()
             .checked_add(16)
@@ -669,11 +694,13 @@ impl BuildContext<'_> {
         chunk_id: [u8; 32],
         availability: Availability,
         access: AccessClass,
+        compression: CompressionPolicy,
     ) -> Result<bool> {
         let class = SegmentClass::new(availability, access);
         let reuse_key = (chunk_id, class);
         if let Some(reused) = self.current_reuse.get(&reuse_key).copied()
             && reused.reference.plain_len == plain_len
+            && compression.accepts(reused.reference.codec)
         {
             let mut reused = reused;
             reused.reference.logical_offset = logical_offset;
@@ -685,6 +712,7 @@ impl BuildContext<'_> {
         // build is the explicit operation that rewrites them into new classes.
         if let Some(reused) = self.reuse_index.get(&(chunk_id, availability))
             && reused.block.plain_len == plain_len
+            && compression.accepts(reused.block.codec)
         {
             let segment = self
                 .reuse_segments
@@ -1375,8 +1403,12 @@ fn build_path_slots(
 fn compress_block(
     compressor: &mut zstd::bulk::Compressor<'_>,
     plaintext: &[u8],
+    policy: CompressionPolicy,
 ) -> Result<(Codec, Vec<u8>)> {
-    compress_bytes(compressor, plaintext)
+    match policy {
+        CompressionPolicy::Auto => compress_bytes(compressor, plaintext),
+        CompressionPolicy::Raw => Ok((Codec::Raw, plaintext.to_vec())),
+    }
 }
 
 fn compress_bytes(
@@ -1468,6 +1500,7 @@ fn verify_staged_release(
         identity.root_key(),
         identity.public_key(),
         ResourceBudget::memory_constrained(),
+        OpenPolicy::TrustFirstRelease,
     )?;
     package.verify_segments()?;
     if !verify_sources {
@@ -1536,6 +1569,7 @@ fn save_build_cache(
                 fixed_block_len: record.fixed_block_len,
                 access: record.access,
                 availability: options.availability(&source.logical_path),
+                compression: classify(source).compression,
                 chunks,
             },
         ));
@@ -1804,6 +1838,12 @@ mod tests {
         let randomish: Vec<u8> = (0..4096).map(|index| (index * 73) as u8).collect();
         let (_, encoded) = compress_bytes(&mut compressor, &randomish).unwrap();
         assert!(encoded.len() <= randomish.len());
+
+        let media = vec![0; 4096];
+        let (codec, encoded) =
+            compress_block(&mut compressor, &media, CompressionPolicy::Raw).unwrap();
+        assert_eq!(codec, Codec::Raw);
+        assert_eq!(encoded, media);
     }
 
     #[test]
@@ -1867,23 +1907,42 @@ mod tests {
         validate_options(&options).unwrap();
 
         let source = |path: &str, len| SourceFile::test(path, len);
-        assert_eq!(classify(&source("tiny", 0)).2, AccessClass::Hot);
-        assert_eq!(classify(&source("MOVIE.MP4", 1)).2, AccessClass::Streaming);
+        assert_eq!(classify(&source("tiny", 0)).access, AccessClass::Hot);
         assert_eq!(
-            classify(&source("voice/line.opus", 12 * 1024)).2,
-            AccessClass::Transient
-        );
-        assert_eq!(
-            classify(&source("bgm/theme.opus", 12 * 1024)).2,
+            classify(&source("MOVIE.MP4", 1)).access,
             AccessClass::Streaming
         );
         assert_eq!(
-            classify(&source("asset.bin", HOT_FILE_LIMIT + 1)).0,
+            classify(&source("voice/line.opus", 12 * 1024)).access,
+            AccessClass::Transient
+        );
+        assert_eq!(
+            classify(&source("bgm/theme.opus", 12 * 1024)).access,
+            AccessClass::Streaming
+        );
+        assert_eq!(
+            classify(&source("asset.bin", HOT_FILE_LIMIT + 1)).layout,
             LayoutKind::ContentDefined
         );
         assert_eq!(
-            classify(&source("asset.bin", CONTENT_DEFINED_LIMIT + 1)).1,
+            classify(&source("asset.bin", CONTENT_DEFINED_LIMIT + 1)).fixed_block_len,
             BULK_BLOCK as u32
+        );
+        for path in [
+            "background.webp",
+            "voice.opus",
+            "compatibility.png",
+            "compatibility.mp3",
+            "opening.webm",
+        ] {
+            assert_eq!(
+                classify(&source(path, 1)).compression,
+                CompressionPolicy::Raw
+            );
+        }
+        assert_eq!(
+            classify(&source("audio.wav", 1)).compression,
+            CompressionPolicy::Auto
         );
 
         let mut invalid = options.clone();
@@ -2406,6 +2465,7 @@ mod tests {
             identity.root_key(),
             identity.public_key(),
             ResourceBudget::cache_disabled(),
+            OpenPolicy::TrustFirstRelease,
         )
         .unwrap();
         assert!(package.list_assets().unwrap().is_empty());
@@ -2421,6 +2481,7 @@ mod tests {
                 identity.root_key(),
                 identity.public_key(),
                 ResourceBudget::cache_disabled(),
+                OpenPolicy::TrustFirstRelease,
             )
             .is_err()
         );
