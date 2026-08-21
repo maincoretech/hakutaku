@@ -58,6 +58,9 @@ compaction mechanism; the runtime never performs garbage collection.
   dedicated clock cache. The engine schedules that call on its existing task
   pool, so Core owns neither threads nor an async runtime. Default and
   memory-constrained prefetch budgets are 2 MiB and 512 KiB respectively.
+- Until explicit prefetch first populates that cache, ordinary reads bypass its
+  mutex through an atomic population flag. `Package::trim` clears the cache and
+  returns to the same fast path; enabling prefetch restores normal lookups.
 - Hot and admitted Normal content retain their separate cache policy; streaming
   prefetch cannot evict those entries.
 - Repeated offset-based reads can retain an `AssetReadSession`; the one-shot
@@ -120,6 +123,28 @@ An attempted cursor-local block-map page window was rejected: its same-session
 A/B changed sequential throughput by only +0.1%/+0.9% and random reads by
 -0.4%, while increasing retained state. This prevents an unproven optimization
 from becoming part of the runtime architecture.
+
+### Inactive-prefetch fast path
+
+Kēne currently relies on AssetServer timeline prediction rather than calling
+`Asset::prefetch_range`, so the dedicated prefetch cache is normally empty.
+Every uncached Streaming/Transient block formerly locked that empty cache
+anyway. A population flag now removes the lock from this common path without
+changing format, authentication, decoded-buffer ownership, or cache budgets.
+
+The before values are the immediately preceding `01a6434` run; after values are
+the median of three runs in the same session. Filesystem cache remains warm.
+
+| Metric | Before | After | Change |
+|---|---:|---:|---:|
+| Sequential 128 KiB | 1,688.8 MiB/s | 1,761.3 MiB/s | +4.3% |
+| Sequential 256 KiB | 1,681.1 MiB/s | 1,771.6 MiB/s | +5.4% |
+| Uniform random 4 KiB | 7,077 IOPS | 7,392 IOPS | +4.5% |
+| Two-block short seek 4 KiB | 24,564,955 IOPS | 24,615,385 IOPS | noise |
+
+The short-seek fixture remains memory-copy dominated and is included only as a
+no-regression marker. Explicit prefetch and trim transitions are covered by a
+state test so the atomic hint cannot make populated entries invisible.
 
 ## Visual-novel workload matrix
 

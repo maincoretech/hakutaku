@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 thread_local! {
@@ -109,6 +110,7 @@ struct PackageInner {
     page_cache: Mutex<ClockCache<u32>>,
     block_cache: Mutex<ClockCache<BlockKey>>,
     prefetch_cache: Mutex<ClockCache<BlockKey>>,
+    prefetch_populated: AtomicBool,
     probation: Mutex<VecDeque<BlockKey>>,
     handles: Mutex<HandleCache>,
     budget: ResourceBudget,
@@ -403,6 +405,7 @@ impl Package {
                 page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
                 block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
                 prefetch_cache: Mutex::new(ClockCache::new(budget.prefetch_cache_bytes)),
+                prefetch_populated: AtomicBool::new(false),
                 // Probation is sparse in normal play; grow only when a Normal
                 // block is actually touched instead of reserving caller budget
                 // eagerly on package open (important for mobile launchers).
@@ -528,7 +531,12 @@ impl Package {
     pub fn trim(&self) {
         lock(&self.inner.page_cache).clear();
         lock(&self.inner.block_cache).clear();
-        lock(&self.inner.prefetch_cache).clear();
+        let mut prefetch = lock(&self.inner.prefetch_cache);
+        prefetch.clear();
+        self.inner
+            .prefetch_populated
+            .store(false, Ordering::Release);
+        drop(prefetch);
         lock(&self.inner.probation).clear();
         lock(&self.inner.handles).clear();
     }
@@ -658,7 +666,9 @@ impl PackageInner {
             }
             return Ok(BlockData::Shared(value));
         }
-        if let Some(value) = lock(&self.prefetch_cache).get(&key) {
+        if self.prefetch_populated.load(Ordering::Acquire)
+            && let Some(value) = lock(&self.prefetch_cache).get(&key)
+        {
             if value.len() != reference.plain_len as usize {
                 return Err(Error::InvalidFormat("prefetched block length mismatch"));
             }
@@ -730,13 +740,16 @@ impl PackageInner {
             block_ordinal: reference.segment_block_ordinal,
         };
         if lock(&self.block_cache).get(&key).is_some()
-            || lock(&self.prefetch_cache).get(&key).is_some()
+            || (self.prefetch_populated.load(Ordering::Acquire)
+                && lock(&self.prefetch_cache).get(&key).is_some())
         {
             return Ok(());
         }
         let plaintext = self.load_block_buffered(reference, access, reader)?;
         if lock(&self.block_cache).get(&key).is_none() {
-            lock(&self.prefetch_cache).insert(key, plaintext.into_shared());
+            let mut prefetch = lock(&self.prefetch_cache);
+            prefetch.insert(key, plaintext.into_shared());
+            self.prefetch_populated.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1487,6 +1500,7 @@ mod tests {
                 page_cache: Mutex::new(ClockCache::new(budget.map_page_cache_bytes)),
                 block_cache: Mutex::new(ClockCache::new(budget.plaintext_cache_bytes)),
                 prefetch_cache: Mutex::new(ClockCache::new(budget.prefetch_cache_bytes)),
+                prefetch_populated: AtomicBool::new(false),
                 probation: Mutex::new(VecDeque::new()),
                 handles: Mutex::new(HandleCache::new(budget.idle_segment_handles)),
                 budget,
@@ -1541,6 +1555,20 @@ mod tests {
         let retained = reader.segment_handle(&package.inner, 0, &record).unwrap();
 
         assert!(Arc::ptr_eq(&first, &retained));
+    }
+
+    #[test]
+    fn prefetch_fast_path_tracks_population_and_trim() {
+        let (package, _) = package_with_budget(ResourceBudget::default());
+        let asset = package.asset("a").unwrap();
+
+        assert!(!package.inner.prefetch_populated.load(Ordering::Acquire));
+        asset.prefetch_range(0, 1).unwrap();
+        assert!(package.inner.prefetch_populated.load(Ordering::Acquire));
+        assert_eq!(asset.read().unwrap(), b"data");
+
+        package.trim();
+        assert!(!package.inner.prefetch_populated.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1601,6 +1629,10 @@ mod tests {
             },
             Arc::new(b"bad".to_vec()),
         );
+        package
+            .inner
+            .prefetch_populated
+            .store(true, Ordering::Release);
         assert!(
             package
                 .inner
@@ -1608,6 +1640,10 @@ mod tests {
                 .is_err()
         );
         lock(&package.inner.prefetch_cache).clear();
+        package
+            .inner
+            .prefetch_populated
+            .store(false, Ordering::Release);
 
         let mut invalid = reference;
         invalid.segment_block_ordinal = 1;
