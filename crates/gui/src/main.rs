@@ -1,9 +1,12 @@
-use egui::{Align, Color32, RichText};
+mod icons;
+
+use eframe::egui::{self, Align, Color32, RichText};
 use hakutaku_core::{Availability, OpenPolicy, Package, ResourceBudget, SegmentInfo};
 use hakutaku_pack::{
     AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan, RuntimeKeyMaterial,
     is_hakutaku_key_file, pack_directory_with_progress, plan_directory, plan_directory_after_pack,
 };
+use icons::Icon;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -79,18 +82,13 @@ fn load_cjk_font() -> Option<Vec<u8>> {
     .find_map(|path| std::fs::read(path).ok().filter(|bytes| !bytes.is_empty()))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tab {
-    Resources,
-    Release,
-    Identity,
-}
-
 struct Workspace {
     assets: String,
     release: String,
     identity: String,
     incremental: bool,
+    development_cache: bool,
+    release_sequence_floor: u64,
     compression_level: i32,
     segment_mib: u64,
     deferred_prefixes: String,
@@ -103,6 +101,8 @@ impl Default for Workspace {
             release: String::new(),
             identity: String::new(),
             incremental: true,
+            development_cache: false,
+            release_sequence_floor: 1,
             compression_level: 3,
             segment_mib: 512,
             deferred_prefixes: String::new(),
@@ -118,7 +118,10 @@ impl Workspace {
     fn pack_options(&self) -> Result<PackOptions, String> {
         let mut options = PackOptions::new(&self.assets, &self.release);
         options.incremental = self.incremental;
-        options.development_cache = self.incremental;
+        options.release_sequence_floor = self.release_sequence_floor;
+        // Full builds always reread sources, even if a previous incremental build
+        // opted into the development cache.
+        options.development_cache = self.incremental && self.development_cache;
         options.compression_level = self.compression_level;
         options.segment_target_bytes = self
             .segment_mib
@@ -139,9 +142,57 @@ impl Workspace {
 struct Resources {
     search: String,
     show_unchanged: bool,
+    change_counts: [u64; 4],
     plan: Option<ReleasePlan>,
     selected: Option<usize>,
     pending_replace: Option<Replacement>,
+    visible: Vec<usize>,
+    filter: Option<(String, bool)>,
+}
+
+impl Resources {
+    fn clear_plan(&mut self) {
+        self.plan = None;
+        self.change_counts = [0; 4];
+        self.selected = None;
+        self.pending_replace = None;
+        self.visible.clear();
+        self.filter = None;
+    }
+
+    fn set_plan(&mut self, plan: ReleasePlan) {
+        self.change_counts = [0; 4];
+        for asset in &plan.assets {
+            let index = match asset.change {
+                AssetChange::Added => 0,
+                AssetChange::Modified => 1,
+                AssetChange::Removed => 2,
+                AssetChange::Unchanged => 3,
+            };
+            self.change_counts[index] += 1;
+        }
+        self.plan = Some(plan);
+        self.selected = None;
+        self.filter = None;
+    }
+
+    fn update_filter(&mut self) {
+        let filter = (self.search.to_ascii_lowercase(), self.show_unchanged);
+        if self.filter.as_ref() == Some(&filter) {
+            return;
+        }
+        self.visible.clear();
+        if let Some(plan) = &self.plan {
+            self.visible
+                .extend(plan.assets.iter().enumerate().filter_map(|(index, asset)| {
+                    ((filter.1 || asset.change != AssetChange::Unchanged)
+                        && (filter.0.is_empty()
+                            || asset.path.to_ascii_lowercase().contains(&filter.0)))
+                    .then_some(index)
+                }));
+        }
+        self.filter = Some(filter);
+    }
 }
 
 #[derive(Clone)]
@@ -184,9 +235,6 @@ enum Message {
 }
 
 struct App {
-    tab: Tab,
-    active_tab: Tab,
-    tab_fade: f32,
     workspace: Workspace,
     resources: Resources,
     release: Release,
@@ -204,9 +252,6 @@ impl App {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
-            tab: Tab::Resources,
-            active_tab: Tab::Resources,
-            tab_fade: 0.0,
             workspace: Workspace::default(),
             resources: Resources {
                 show_unchanged: true,
@@ -240,10 +285,9 @@ impl App {
                     match result {
                         Ok(plan) => {
                             self.status = plan_status(&plan);
-                            self.resources.plan = Some(plan);
-                            self.resources.selected = None;
+                            self.resources.set_plan(plan);
                         }
-                        Err(error) => self.status = format!("Scan failed: {error}"),
+                        Err(error) => self.status = format!("Change check failed: {error}"),
                     }
                 }
                 Message::Packed(result) => {
@@ -253,8 +297,7 @@ impl App {
                             self.status = pack_status(&report);
                             self.release.last_report = Some(report);
                             self.release.summary = Some(summary);
-                            self.resources.plan = Some(plan);
-                            self.resources.selected = None;
+                            self.resources.set_plan(plan);
                         }
                         Err(error) => self.status = format!("Build failed: {error}"),
                     }
@@ -263,7 +306,7 @@ impl App {
                     self.finish_work();
                     match result {
                         Ok(summary) => {
-                            self.status = format!("Release {} is valid", summary.sequence);
+                            self.status = format!("#{} verified", summary.sequence);
                             self.release.summary = Some(summary);
                         }
                         Err(error) => self.status = format!("Verification failed: {error}"),
@@ -284,6 +327,7 @@ impl App {
                     match result {
                         Ok(info) => {
                             self.workspace.identity.clone_from(&info.path);
+                            self.clear_workspace_results();
                             self.status = "Publisher identity created; back it up now".into();
                             self.identity_info = Some(info);
                         }
@@ -334,8 +378,9 @@ impl App {
         };
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
-        self.begin_work("Scanning resources…");
-        std::thread::spawn(move || {
+        self.resources.clear_plan();
+        self.begin_work("Checking source changes…");
+        self.spawn_worker(move || {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
                 .and_then(|identity| {
@@ -346,6 +391,13 @@ impl App {
                 });
             let _ = sender.send(Message::Planned(result));
         });
+    }
+
+    fn clear_workspace_results(&mut self) {
+        self.resources.clear_plan();
+        self.release = Release::default();
+        self.identity_info = None;
+        self.status = "Ready to scan".into();
     }
 
     fn start_pack(&mut self) {
@@ -359,11 +411,19 @@ impl App {
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
         self.begin_work("Starting release build…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = (|| {
                 let identity = Identity::load(&identity_path).map_err(|error| error.to_string())?;
+                let mut last_update = Instant::now();
+                let mut last_phase = "";
                 let report = pack_directory_with_progress(&options, &identity, |progress| {
-                    let _ = sender.send(Message::Progress(progress));
+                    if progress.phase != last_phase
+                        || last_update.elapsed() >= Duration::from_millis(100)
+                    {
+                        last_phase = progress.phase;
+                        last_update = Instant::now();
+                        let _ = sender.send(Message::Progress(progress));
+                    }
                 })
                 .map_err(|error| error.to_string())?;
                 let keys = identity
@@ -383,7 +443,7 @@ impl App {
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
         self.begin_work("Verifying release…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
                 .and_then(|identity| {
@@ -400,7 +460,7 @@ impl App {
         let path = PathBuf::from(&self.workspace.identity);
         let sender = self.sender.clone();
         self.begin_work("Loading publisher identity…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = identity_info(&path);
             let _ = sender.send(Message::IdentityLoaded(result));
         });
@@ -409,7 +469,7 @@ impl App {
     fn start_identity_create(&mut self, path: PathBuf) {
         let sender = self.sender.clone();
         self.begin_work("Creating publisher identity…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = Identity::generate()
                 .and_then(|identity| identity.save(&path))
                 .map_err(|error| error.to_string())
@@ -422,7 +482,7 @@ impl App {
         let source = PathBuf::from(&self.workspace.identity);
         let sender = self.sender.clone();
         self.begin_work("Backing up publisher identity…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let display = target.display().to_string();
             let result = copy_new_file(&source, &target, true).map(|()| display);
             let _ = sender.send(Message::IdentityBackedUp(result));
@@ -433,7 +493,7 @@ impl App {
         let directory = PathBuf::from(&self.workspace.assets);
         let sender = self.sender.clone();
         self.begin_work("Importing resources…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = import_resources(&sources, &directory);
             let _ = sender.send(Message::Imported(result));
         });
@@ -442,11 +502,21 @@ impl App {
     fn start_replace(&mut self, replacement: Replacement) {
         let sender = self.sender.clone();
         self.begin_work("Replacing resource…");
-        std::thread::spawn(move || {
+        self.spawn_worker(move || {
             let result = replace_file(&replacement.source, &replacement.target)
                 .map(|()| replacement.logical_path);
             let _ = sender.send(Message::Replaced(result));
         });
+    }
+
+    fn spawn_worker(&mut self, work: impl FnOnce() + Send + 'static) {
+        if let Err(error) = std::thread::Builder::new()
+            .name("hakutaku-publisher".into())
+            .spawn(work)
+        {
+            self.finish_work();
+            self.status = format!("Could not start background work: {error}");
+        }
     }
 
     fn begin_work(&mut self, status: &str) {
@@ -462,71 +532,86 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
         if self.busy {
             context.request_repaint_after(Duration::from_millis(100));
         }
+    }
 
-        egui::TopBottomPanel::top("tabs")
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = ui.ctx().clone();
+        egui::Panel::top("header")
             .frame(
-                egui::Frame::side_top_panel(&context.style()).inner_margin(egui::Margin {
-                    left: 8,
-                    right: 8,
-                    top: 6,
-                    bottom: 4,
-                }),
+                egui::Frame::side_top_panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
-            .min_height(28.0)
-            .show(context, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Resources, " Resources ");
-                    ui.selectable_value(&mut self.tab, Tab::Release, " Release ");
-                    ui.selectable_value(&mut self.tab, Tab::Identity, " Identity ");
+                    ui.heading("Hakutaku");
+                    ui.weak(env!("CARGO_PKG_VERSION"));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("About").clicked() {
                             self.show_about = true;
                         }
                     });
                 });
+                ui.add_space(8.0);
+                ui.add_enabled_ui(!self.busy, |ui| self.release_actions(ui));
             });
-
-        if self.active_tab != self.tab {
-            self.active_tab = self.tab;
-            self.tab_fade = 0.0;
-        }
-        if self.tab_fade < 1.0 {
-            let delta = context.input(|input| input.stable_dt).min(0.05);
-            self.tab_fade = (self.tab_fade + delta * 8.0).min(1.0);
-            context.request_repaint();
-        }
-
-        egui::CentralPanel::default().show(context, |ui| {
-            ui.multiply_opacity(self.tab_fade);
-            ui.add_enabled_ui(!self.busy, |ui| match self.tab {
-                Tab::Resources => self.resources_page(ui),
-                Tab::Release => self.release_page(ui),
-                Tab::Identity => self.identity_page(ui),
-            });
+        self.status_bar(ui);
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("workspace")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        self.workspace_paths(ui);
+                        egui::CollapsingHeader::new("Key tools")
+                            .show(ui, |ui| self.identity_tools(ui));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut self.workspace.incremental, "Reuse blocks")
+                                .on_hover_text("Reuse blocks from the last build. Off: rebuild everything.")
+                                .changed()
+                            {
+                                self.resources.clear_plan();
+                            }
+                            ui.separator();
+                            let cached = self.workspace.incremental && self.workspace.development_cache;
+                            let (icon, label, color, hint) = if cached {
+                                (Icon::Clock, "Dev cache", Color32::from_rgb(218, 178, 110),
+                                 "Local builds only. Uses cached file metadata; skips full source checks.")
+                            } else {
+                                (Icon::Shield, "Strict", Color32::from_rgb(144, 192, 161),
+                                 "Reads every source file and compares staged bytes before publishing.")
+                            };
+                            ui.horizontal(|ui| {
+                                icons::show(ui, icon, 18.0, color);
+                                ui.colored_label(color, label);
+                            }).response.on_hover_text(hint);
+                        });
+                        egui::CollapsingHeader::new("Options")
+                            .show(ui, |ui| self.advanced_options(ui));
+                        self.release_details(ui);
+                        ui.separator();
+                        self.resources_page(ui);
+                    });
+                });
         });
-        self.status_bar(context);
-        self.replace_confirmation(context);
-        self.about_window(context);
+        self.replace_confirmation(&context);
+        self.about_window(&context);
     }
 }
 
 impl App {
     fn resources_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.heading("Game Resources");
-        self.workspace_paths(ui, true);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.workspace.ready(), egui::Button::new("Scan"))
-                .clicked()
-            {
-                self.start_plan();
-            }
+        ui.strong("Files");
+        if self.resources.plan.is_some() {
+            resource_summary(ui, self.resources.change_counts);
+        }
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !self.workspace.assets.is_empty(),
@@ -561,166 +646,246 @@ impl App {
             ui.separator();
             ui.add_sized(
                 [220.0, 22.0],
-                egui::TextEdit::singleline(&mut self.resources.search)
-                    .hint_text("Filter resources…"),
+                egui::TextEdit::singleline(&mut self.resources.search).hint_text("Find a file…"),
             );
-            ui.checkbox(&mut self.resources.show_unchanged, "Show unchanged");
+            ui.checkbox(&mut self.resources.show_unchanged, "Unchanged");
         });
         ui.separator();
+        self.resources.update_filter();
         let has_plan = self.resources.plan.is_some();
         fade_visible(ui, "resource-plan", has_plan, |ui| {
             let Some(plan) = &self.resources.plan else {
                 return;
             };
-            resource_summary(ui, plan);
-            ui.add_space(4.0);
-            let query = self.resources.search.to_ascii_lowercase();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("resource-list")
-                    .striped(true)
-                    .num_columns(5)
-                    .show(ui, |ui| {
-                        ui.strong("Path");
-                        ui.strong("Size");
-                        ui.strong("Access");
-                        ui.strong("Install");
-                        ui.strong("State");
-                        ui.end_row();
-                        for (index, asset) in plan.assets.iter().enumerate() {
-                            if (!self.resources.show_unchanged
-                                && asset.change == AssetChange::Unchanged)
-                                || (!query.is_empty()
-                                    && !asset.path.to_ascii_lowercase().contains(&query))
-                            {
-                                continue;
-                            }
-                            let selected = self.resources.selected == Some(index);
-                            if ui.selectable_label(selected, &asset.path).clicked() {
-                                self.resources.selected = Some(index);
-                            }
-                            ui.label(format_size(
-                                asset.source_len.or(asset.released_len).unwrap_or(0),
-                            ));
-                            ui.label(format!("{:?}", asset.access));
-                            ui.label(format!("{:?}", asset.availability));
-                            ui.label(change_label(asset.change));
-                            ui.end_row();
-                        }
-                    });
-            });
+            let row_height = ui
+                .text_style_height(&egui::TextStyle::Body)
+                .max(ui.spacing().interact_size.y);
+            egui::ScrollArea::vertical()
+                .id_salt("resource-rows")
+                .max_height(320.0)
+                .show_rows(
+                    ui,
+                    row_height,
+                    self.resources.visible.len() + 1,
+                    |ui, rows| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        let path_width = (ui.available_width()
+                            - 2.0 * (90.0 + ui.spacing().item_spacing.x))
+                            .max(140.0);
+                        egui::Grid::new("resource-list")
+                            .striped(true)
+                            .num_columns(3)
+                            .min_col_width(90.0)
+                            .min_row_height(row_height)
+                            .start_row(rows.start)
+                            .show(ui, |ui| {
+                                for row in rows {
+                                    if row == 0 {
+                                        for label in ["File", "Size", "Change"] {
+                                            ui.strong(label);
+                                        }
+                                    } else {
+                                        let index = self.resources.visible[row - 1];
+                                        let asset = &plan.assets[index];
+                                        let selected = self.resources.selected == Some(index);
+                                        if ui
+                                            .add_sized(
+                                                [path_width, row_height],
+                                                egui::Button::selectable(
+                                                    selected,
+                                                    (&asset.path, egui::Atom::grow()),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.resources.selected = Some(index);
+                                        }
+                                        ui.label(format_size(
+                                            asset.source_len.or(asset.released_len).unwrap_or(0),
+                                        ));
+                                        ui.colored_label(
+                                            change_color(asset.change),
+                                            change_label(asset.change),
+                                        )
+                                        .on_hover_text(
+                                            format!(
+                                                "Access: {:?}\nInstall: {:?}",
+                                                asset.access, asset.availability
+                                            ),
+                                        );
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    },
+                );
         });
         if !has_plan {
-            ui.label("Open an asset directory and scan it to review the next release.");
+            ui.horizontal(|ui| {
+                icons::show(ui, Icon::Scan, 24.0, ui.visuals().weak_text_color());
+                ui.weak("Scan to view files");
+            });
         }
     }
 
-    fn release_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.heading("Release Management");
-        self.workspace_paths(ui, true);
-        ui.horizontal(|ui| {
-            ui.label("Options:");
-            ui.checkbox(&mut self.workspace.incremental, "Reuse current release");
-            ui.separator();
-            ui.label("zstd");
-            ui.add(egui::DragValue::new(&mut self.workspace.compression_level).range(-7..=22));
+    fn advanced_options(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.workspace.incremental, |ui| {
+            ui.checkbox(
+                &mut self.workspace.development_cache,
+                "Dev cache",
+            ).on_hover_text("Local builds only. Skips source reads and staged byte comparison for cached files.");
+        });
+        if !self.workspace.incremental {
+            ui.small("Full build · cache off");
+        }
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Compression").on_hover_text("Zstandard level");
+            changed |= ui
+                .add(egui::DragValue::new(&mut self.workspace.compression_level).range(-7..=22))
+                .changed();
             ui.separator();
             ui.label("Segment MiB");
-            ui.add(egui::DragValue::new(&mut self.workspace.segment_mib).range(1..=4096));
+            changed |= ui
+                .add(egui::DragValue::new(&mut self.workspace.segment_mib).range(1..=4096))
+                .changed();
         });
         ui.horizontal(|ui| {
+            ui.label("Start at #").on_hover_text("Lowest release number. For v1 migration, use an empty output folder and a number above the old release.");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.workspace.release_sequence_floor)
+                        .range(1..=u64::MAX),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Optional assets").on_hover_text(
+                "These paths may be installed later. Leave empty to require all files.",
+            );
+            changed |= ui
+                .add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::TextEdit::singleline(&mut self.workspace.deferred_prefixes)
+                        .hint_text("voice/, bonus/"),
+                )
+                .changed();
+        });
+        if changed {
+            self.resources.clear_plan();
+        }
+    }
+
+    fn release_actions(&mut self, ui: &mut egui::Ui) {
+        let width = (ui.available_width() - 28.0 - 4.0 * ui.spacing().item_spacing.x) / 3.0;
+        ui.horizontal(|ui| {
             let ready = self.workspace.ready();
-            if ui
-                .add_enabled(ready, egui::Button::new("Preview"))
-                .clicked()
-            {
+            let scan = ui
+                .add_enabled_ui(ready, |ui| {
+                    icons::button(ui, Icon::Scan, "Scan", width)
+                        .on_hover_text("Compare source files with the current package")
+                })
+                .inner;
+            if scan.clicked() {
                 self.start_plan();
             }
-            if ui
-                .add_enabled(ready, egui::Button::new("Build Release"))
-                .clicked()
-            {
+            icons::show(ui, Icon::Arrow, 14.0, ui.visuals().weak_text_color());
+            let build = ui
+                .add_enabled_ui(ready && !self.busy, |ui| {
+                    icons::button(ui, Icon::Package, "Build", width)
+                        .on_hover_text("Build the package in the output folder")
+                })
+                .inner;
+            if build.clicked() {
                 self.start_pack();
             }
+            icons::show(ui, Icon::Arrow, 14.0, ui.visuals().weak_text_color());
             let can_verify =
                 !self.workspace.release.is_empty() && !self.workspace.identity.is_empty();
-            if ui
-                .add_enabled(can_verify, egui::Button::new("Verify Release"))
-                .clicked()
-            {
+            let verify = ui
+                .add_enabled_ui(can_verify && !self.busy, |ui| {
+                    icons::button(ui, Icon::Shield, "Verify", width)
+                        .on_hover_text("Check the package and all its segments")
+                })
+                .inner;
+            if verify.clicked() {
                 self.start_verify();
             }
         });
-        ui.separator();
-        fade_visible(ui, "release-preview", self.resources.plan.is_some(), |ui| {
-            let Some(plan) = &self.resources.plan else {
-                return;
-            };
-            ui.heading("Build Preview");
-            resource_summary(ui, plan);
-        });
-        fade_visible(
-            ui,
-            "release-report",
-            self.release.last_report.is_some(),
-            |ui| {
-                let Some(report) = &self.release.last_report else {
-                    return;
-                };
-                ui.add_space(8.0);
-                ui.heading("Last Build");
+    }
+
+    fn release_details(&self, ui: &mut egui::Ui) {
+        if let Some(summary) = &self.release.summary {
+            ui.horizontal(|ui| {
+                icons::show(ui, Icon::Package, 18.0, ui.visuals().text_color());
+                ui.label(format!("#{} · {} files", summary.sequence, summary.assets));
+            });
+        }
+        if self.release.last_report.is_none()
+            && self.release.summary.is_none()
+            && self.resources.plan.is_none()
+        {
+            return;
+        }
+        egui::CollapsingHeader::new("Details").show(ui, |ui| {
+            if let Some(plan) = &self.resources.plan {
+                ui.strong("Source");
+                ui.label(format!(
+                    "{} total · {} changed",
+                    format_size(plan.source_bytes),
+                    format_size(plan.changed_source_bytes)
+                ));
+                if let Some(sequence) = plan.previous_release {
+                    ui.small(format!("Against #{sequence}"));
+                }
+            }
+            if let Some(report) = &self.release.last_report {
+                ui.strong(format!("Build #{}", report.release_sequence));
+                proportion_bar(
+                    ui,
+                    &[
+                        (
+                            report.reused_blocks as u64,
+                            Color32::from_rgb(132, 163, 194),
+                        ),
+                        (report.new_blocks as u64, Color32::from_rgb(144, 192, 161)),
+                    ],
+                );
+                ui.label(format!(
+                    "{} reused + {} new blocks",
+                    report.reused_blocks, report.new_blocks
+                ));
                 egui::Grid::new("build-report")
                     .striped(true)
                     .show(ui, |ui| {
-                        metric(ui, "Release", report.release_sequence.to_string());
-                        metric(ui, "Files", report.file_count.to_string());
-                        metric(ui, "Reused blocks", report.reused_blocks.to_string());
-                        metric(ui, "New blocks", report.new_blocks.to_string());
                         metric(ui, "New segments", report.new_segments.to_string());
                         metric(ui, "Written", format_size(report.new_segment_bytes));
                     });
-            },
-        );
-        fade_visible(
-            ui,
-            "release-summary",
-            self.release.summary.is_some(),
-            |ui| {
-                let Some(summary) = &self.release.summary else {
-                    return;
-                };
-                ui.add_space(8.0);
-                ui.heading("Active Release");
+                ui.small("New data only")
+                    .on_hover_text("Written counts new segments, not the total package size.");
+            }
+            if let Some(summary) = &self.release.summary {
+                ui.strong("Package");
                 release_summary(ui, summary);
-            },
-        );
+            }
+        });
     }
 
-    fn identity_page(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.heading("Publisher Identity");
-        path_row(
-            ui,
-            "Identity:",
-            &mut self.workspace.identity,
-            PathPicker::Identity,
-            22.0,
-        );
+    fn identity_tools(&mut self, ui: &mut egui::Ui) {
         ui.small(
-            RichText::new("Contains the signing key and content root key. Never ship it.")
-                .color(Color32::from_rgb(215, 178, 120)),
+            RichText::new("Private key · do not ship").color(Color32::from_rgb(215, 178, 120)),
         );
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.workspace.identity.is_empty(),
-                    egui::Button::new("Inspect"),
+                    egui::Button::new("View"),
                 )
                 .clicked()
             {
                 self.start_identity_load();
             }
-            if ui.button("Create New…").clicked()
+            if ui.button("New…").clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .set_file_name("publisher.hakutaku-key")
                     .save_file()
@@ -740,7 +905,6 @@ impl App {
                 self.start_identity_backup(path);
             }
         });
-        ui.separator();
         fade_visible(ui, "identity-info", self.identity_info.is_some(), |ui| {
             let Some(info) = &self.identity_info else {
                 return;
@@ -748,46 +912,38 @@ impl App {
             egui::Grid::new("identity-info-grid")
                 .striped(true)
                 .show(ui, |ui| {
-                    metric(ui, "File", info.path.clone());
                     metric(ui, "Project ID", info.project_id.clone());
                     metric(ui, "Public key", info.public_key.clone());
                 });
             ui.add_space(8.0);
-            ui.label("Keep at least one offline backup. Losing this file breaks future updates.");
+            ui.small("Keep an offline backup.");
         });
     }
 
-    fn workspace_paths(&mut self, ui: &mut egui::Ui, deferred: bool) {
-        path_row(
+    fn workspace_paths(&mut self, ui: &mut egui::Ui) {
+        let mut changed = path_row(
             ui,
-            "Assets:",
+            "Assets",
             &mut self.workspace.assets,
             PathPicker::Directory,
-            22.0,
+            24.0,
         );
-        path_row(
+        changed |= path_row(
             ui,
-            "Release:",
+            "Output",
             &mut self.workspace.release,
             PathPicker::Directory,
-            22.0,
+            24.0,
         );
-        path_row(
+        changed |= path_row(
             ui,
-            "Identity:",
+            "Key",
             &mut self.workspace.identity,
             PathPicker::Identity,
-            22.0,
+            24.0,
         );
-        if deferred {
-            ui.horizontal(|ui| {
-                ui.label("Deferred:");
-                ui.add_sized(
-                    [ui.available_width(), 22.0],
-                    egui::TextEdit::singleline(&mut self.workspace.deferred_prefixes)
-                        .hint_text("optional directory prefixes, comma-separated"),
-                );
-            });
+        if changed {
+            self.clear_workspace_results();
         }
     }
 
@@ -803,14 +959,13 @@ impl App {
         ))
     }
 
-    fn status_bar(&self, context: &egui::Context) {
-        egui::TopBottomPanel::bottom("status")
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status")
             .frame(
-                egui::Frame::side_top_panel(&context.style())
-                    .inner_margin(egui::Margin::symmetric(8, 6)),
+                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(8, 6)),
             )
-            .min_height(32.0)
-            .show(context, |ui| {
+            .min_size(32.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.busy
                         && let Some(progress) = &self.progress
@@ -874,7 +1029,7 @@ impl App {
                 ui.label("Hakutaku");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.hyperlink("https://github.com/maincoretech/hakutaku");
-                ui.label("Authenticated resource and release manager for offline games");
+                ui.label("Game asset packer");
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                     if ui.button("Close").clicked() {
@@ -901,11 +1056,19 @@ fn path_row(
     value: &mut String,
     picker: PathPicker,
     row_height: f32,
-) {
+) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(label);
+        let icon = match picker {
+            PathPicker::Directory => Icon::Folder,
+            PathPicker::Identity => Icon::Key,
+        };
+        icons::show(ui, icon, 20.0, ui.visuals().text_color());
+        ui.add_sized([52.0, row_height], egui::Label::new(label));
         let width = (ui.available_width() - 34.0).max(60.0);
-        ui.add_sized([width, row_height], egui::TextEdit::singleline(value));
+        changed |= ui
+            .add_sized([width, row_height], egui::TextEdit::singleline(value))
+            .changed();
         if ui
             .add(egui::Button::new("…").min_size(egui::vec2(0.0, row_height)))
             .clicked()
@@ -917,10 +1080,13 @@ fn path_row(
                     .pick_file(),
             };
             if let Some(path) = path {
-                *value = path.display().to_string();
+                let selected = path.display().to_string();
+                changed |= *value != selected;
+                *value = selected;
             }
         }
     });
+    changed
 }
 
 fn fade_visible(
@@ -941,36 +1107,61 @@ fn fade_visible(
     }
 }
 
-fn resource_summary(ui: &mut egui::Ui, plan: &ReleasePlan) {
-    let count = |state| {
-        plan.assets
-            .iter()
-            .filter(|asset| asset.change == state)
-            .count()
-    };
+fn change_color(change: AssetChange) -> Color32 {
+    match change {
+        AssetChange::Added => Color32::from_rgb(144, 192, 161),
+        AssetChange::Modified => Color32::from_rgb(218, 178, 110),
+        AssetChange::Removed => Color32::from_rgb(207, 136, 136),
+        AssetChange::Unchanged => Color32::from_gray(135),
+    }
+}
+
+fn proportion_bar(ui: &mut egui::Ui, parts: &[(u64, Color32)]) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 5.0), egui::Sense::hover());
+    let total: u64 = parts.iter().map(|(n, _)| n).sum();
+    ui.painter()
+        .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+    let mut x = rect.left();
+    for &(count, color) in parts {
+        let width = rect.width() * (count as f64 / total.max(1) as f64) as f32;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width, rect.height())),
+            0.0,
+            color,
+        );
+        x += width;
+    }
+}
+
+fn resource_summary(ui: &mut egui::Ui, counts: [u64; 4]) {
+    let states = [
+        AssetChange::Added,
+        AssetChange::Modified,
+        AssetChange::Removed,
+        AssetChange::Unchanged,
+    ];
+    let parts = std::array::from_fn::<_, 4, _>(|i| (counts[i], change_color(states[i])));
+    proportion_bar(ui, &parts);
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!(
-            "{} source files",
-            plan.assets.len() - count(AssetChange::Removed)
-        ));
-        ui.separator();
-        ui.label(format_size(plan.source_bytes));
-        ui.separator();
-        ui.label(format!(
-            "{} added · {} modified · {} removed · {} unchanged",
-            count(AssetChange::Added),
-            count(AssetChange::Modified),
-            count(AssetChange::Removed),
-            count(AssetChange::Unchanged)
-        ));
-        ui.separator();
-        ui.label(format!(
-            "{} changed source",
-            format_size(plan.changed_source_bytes)
-        ));
-        if let Some(sequence) = plan.previous_release {
-            ui.separator();
-            ui.label(format!("compared with release {sequence}"));
+        for (i, (symbol, label)) in [
+            ("+", "Added"),
+            ("~", "Changed"),
+            ("−", "Removed"),
+            ("=", "Same"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let color = if counts[i] == 0 {
+                ui.visuals().weak_text_color()
+            } else {
+                parts[i].1
+            };
+            ui.colored_label(color, format!("{symbol} {} {label}", counts[i]));
+            if i < 3 {
+                ui.separator();
+            }
         }
     });
 }
@@ -1020,10 +1211,10 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String) {
 
 fn change_label(change: AssetChange) -> &'static str {
     match change {
-        AssetChange::Added => "Added",
-        AssetChange::Modified => "Modified",
-        AssetChange::Unchanged => "Unchanged",
-        AssetChange::Removed => "Removed",
+        AssetChange::Added => "+ Added",
+        AssetChange::Modified => "~ Changed",
+        AssetChange::Unchanged => "= Same",
+        AssetChange::Removed => "− Removed",
     }
 }
 
@@ -1038,20 +1229,14 @@ fn plan_status(plan: &ReleasePlan) -> String {
         .iter()
         .filter(|asset| asset.change != AssetChange::Unchanged)
         .count();
-    format!("Scanned {source_files} source files; {changed} change(s)")
+    format!("{source_files} files · {changed} changes")
 }
 
 fn pack_status(report: &PackReport) -> String {
     if report.changed {
-        format!(
-            "Release {} built: {} reused, {} new blocks, {} new segment(s)",
-            report.release_sequence, report.reused_blocks, report.new_blocks, report.new_segments
-        )
+        format!("Built #{}", report.release_sequence)
     } else {
-        format!(
-            "No changes; release {} remains active",
-            report.release_sequence
-        )
+        format!("#{} unchanged", report.release_sequence)
     }
 }
 
@@ -1187,7 +1372,6 @@ fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("resource has no file name: {}", target.display()))?
         .to_string_lossy();
     let temporary = parent.join(format!(".{name}.hakutaku-part-{}", std::process::id()));
-    let backup = parent.join(format!(".{name}.hakutaku-backup-{}", std::process::id()));
     let permissions = target
         .metadata()
         .map_err(|error| error.to_string())?
@@ -1197,22 +1381,10 @@ fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    if let Err(error) = std::fs::rename(target, &backup) {
+    if let Err(error) = std::fs::rename(&temporary, target) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    if let Err(error) = std::fs::rename(&temporary, target) {
-        let restore = std::fs::rename(&backup, target);
-        let _ = std::fs::remove_file(&temporary);
-        return match restore {
-            Ok(()) => Err(error.to_string()),
-            Err(restore_error) => Err(format!(
-                "{error}; restoring {} also failed: {restore_error}",
-                target.display()
-            )),
-        };
-    }
-    std::fs::remove_file(backup).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1261,6 +1433,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incremental_reuse_defaults_to_strict_validation() {
+        let workspace = Workspace::default();
+        let options = workspace.pack_options().unwrap();
+        assert!(options.incremental);
+        assert!(!options.development_cache);
+    }
+
+    #[test]
+    fn development_cache_is_explicit_and_inactive_for_full_builds() {
+        let mut workspace = Workspace {
+            development_cache: true,
+            ..Workspace::default()
+        };
+        assert!(workspace.pack_options().unwrap().development_cache);
+        workspace.incremental = false;
+        let options = workspace.pack_options().unwrap();
+        assert!(!options.incremental);
+        assert!(!options.development_cache);
+        workspace.incremental = true;
+        assert!(workspace.pack_options().unwrap().development_cache);
+        workspace.development_cache = false;
+        let options = workspace.pack_options().unwrap();
+        assert!(options.incremental);
+        assert!(!options.development_cache);
+    }
+
+    #[test]
+    fn changing_workspace_discards_previous_results_and_replace_target() {
+        let mut app = App::new();
+        app.resources.set_plan(ReleasePlan::default());
+        app.resources.selected = Some(0);
+        app.resources.visible.push(0);
+        app.resources.pending_replace = Some(Replacement {
+            source: "old-source".into(),
+            target: "old-target".into(),
+            logical_path: "old-path".into(),
+        });
+        app.release.summary = Some(ReleaseSummary {
+            sequence: 1,
+            assets: 0,
+            segments: vec![],
+        });
+        app.identity_info = Some(IdentityInfo {
+            path: "old".into(),
+            project_id: String::new(),
+            public_key: String::new(),
+        });
+        app.clear_workspace_results();
+        assert!(app.resources.plan.is_none());
+        assert_eq!(app.resources.change_counts, [0; 4]);
+        assert!(app.resources.selected.is_none());
+        assert!(app.resources.visible.is_empty());
+        assert!(app.resources.pending_replace.is_none());
+        assert!(app.release.summary.is_none());
+        assert!(app.identity_info.is_none());
+    }
+
+    #[test]
     fn embedded_application_icon_is_valid_rgba() {
         let icon = application_icon();
         assert_eq!(icon.width, 256);
@@ -1306,6 +1536,66 @@ mod tests {
         assert!(replace_file(&identity_path, &target).is_err());
         assert_eq!(std::fs::read_dir(&assets).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_replace_preserves_destination_and_cleans_temporary_file() {
+        let root = scratch("replace-failure");
+        let target = root.join("directory");
+        std::fs::create_dir_all(&target).unwrap();
+        let original = target.join("original.bin");
+        std::fs::write(&original, b"original").unwrap();
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"replacement").unwrap();
+        assert!(replace_file(&source, &target).is_err());
+        assert_eq!(std::fs::read(original).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resource_filter_preserves_asset_indices_and_refreshes_after_scan() {
+        let mut resources = Resources::default();
+        let plan = ReleasePlan {
+            assets: [
+                ("images/A.webp", AssetChange::Added),
+                ("images/B.webp", AssetChange::Unchanged),
+                ("script/main.txt", AssetChange::Modified),
+            ]
+            .into_iter()
+            .map(|(path, change)| hakutaku_pack::PlannedAsset {
+                path: path.into(),
+                source_len: Some(1),
+                released_len: None,
+                access: hakutaku_core::AccessClass::Hot,
+                availability: Availability::Required,
+                change,
+            })
+            .collect(),
+            ..ReleasePlan::default()
+        };
+        resources.set_plan(plan.clone());
+        assert_eq!(resources.change_counts, [1, 1, 0, 1]);
+        resources.update_filter();
+        assert_eq!(resources.visible, [0, 2]);
+        resources.selected = Some(2);
+        resources.search = "WEBP".into();
+        resources.update_filter();
+        assert_eq!(resources.visible, [0]);
+        assert_eq!(resources.selected, Some(2));
+        resources.show_unchanged = true;
+        resources.update_filter();
+        assert_eq!(resources.visible, [0, 1]);
+        let mut rescanned = plan;
+        rescanned.assets.remove(0);
+        resources.set_plan(rescanned);
+        assert_eq!(resources.change_counts, [0, 1, 0, 1]);
+        resources.update_filter();
+        assert_eq!(resources.visible, [0]);
+        assert_eq!(resources.selected, None);
+        resources.search = "missing".into();
+        resources.update_filter();
+        assert!(resources.visible.is_empty());
     }
 
     #[cfg(unix)]

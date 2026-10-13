@@ -3,6 +3,7 @@ use crate::{Error, Result};
 use hakutaku_core::format::LayoutKind;
 use hakutaku_core::{AccessClass, Availability, ProjectId};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"HAKBC002";
@@ -42,15 +43,19 @@ impl BuildCache {
         project_id: ProjectId,
         release_sequence: u64,
     ) -> Result<Option<Self>> {
-        let metadata = match path.metadata() {
-            Ok(metadata) => metadata,
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if metadata.len() > MAX_CACHE_BYTES {
+        if file.metadata()?.len() > MAX_CACHE_BYTES {
             return Ok(None);
         }
-        let bytes = std::fs::read(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Ok(None);
+        }
         Ok(Self::parse(&bytes, project_id, release_sequence))
     }
 
@@ -74,7 +79,9 @@ impl BuildCache {
             return None;
         }
         let entry_count = read_u32(bytes, 36)? as usize;
-        if entry_count > MAX_ENTRIES {
+        if entry_count > MAX_ENTRIES
+            || entry_count > (payload_len - HEADER_SIZE) / (ENTRY_HEADER_SIZE + 1)
+        {
             return None;
         }
         let mut offset = HEADER_SIZE;
@@ -106,6 +113,10 @@ impl BuildCache {
             let path = std::str::from_utf8(bytes.get(offset..path_end)?).ok()?;
             hakutaku_core::format::validate_canonical_path(path).ok()?;
             offset = path_end;
+            let chunks_end = offset.checked_add(chunk_count.checked_mul(CHUNK_SIZE)?)?;
+            if chunks_end > payload_len {
+                return None;
+            }
             let mut chunks = Vec::with_capacity(chunk_count);
             for _ in 0..chunk_count {
                 let chunk_end = offset.checked_add(CHUNK_SIZE)?;
@@ -198,10 +209,10 @@ pub(crate) fn save(
     bytes.extend_from_slice(checksum.as_bytes());
     let temporary = path.with_extension(format!("cache.part-{}", std::process::id()));
     std::fs::write(&temporary, bytes)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    std::fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -374,6 +385,14 @@ mod tests {
         assert!(BuildCache::parse(&damaged, project, 7).is_none());
         let mut damaged = valid.clone();
         damaged[36..40].copy_from_slice(&((MAX_ENTRIES as u32) + 1).to_le_bytes());
+        rewrite_checksum(&mut damaged);
+        assert!(BuildCache::parse(&damaged, project, 7).is_none());
+        let mut damaged = valid.clone();
+        damaged[36..40].copy_from_slice(&(MAX_ENTRIES as u32).to_le_bytes());
+        rewrite_checksum(&mut damaged);
+        assert!(BuildCache::parse(&damaged, project, 7).is_none());
+        let mut damaged = valid.clone();
+        damaged[48 + 47..48 + 51].copy_from_slice(&(MAX_CHUNKS as u32).to_le_bytes());
         rewrite_checksum(&mut damaged);
         assert!(BuildCache::parse(&damaged, project, 7).is_none());
         let mut damaged = valid.clone();

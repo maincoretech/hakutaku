@@ -14,6 +14,8 @@ const CHECKSUM_SIZE: usize = 32;
 const RUNTIME_MAGIC: &[u8; 8] = b"HAKRT001";
 const RUNTIME_HEADER_SIZE: usize = 124;
 const RUNTIME_FILE_SIZE: usize = RUNTIME_HEADER_SIZE + CHECKSUM_SIZE;
+// Far above ring's Ed25519 PKCS#8 encoding; bound allocation before parsing.
+const IDENTITY_FILE_LIMIT: usize = HEADER_SIZE + 4096 + CHECKSUM_SIZE;
 
 /// Runtime-only key material embedded into a packaged executable.
 pub struct RuntimeKeyMaterial {
@@ -34,7 +36,7 @@ impl RuntimeKeyMaterial {
     ///
     /// Returns an error for I/O failures, corruption, or an unsupported version.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = Zeroizing::new(std::fs::read(path)?);
+        let bytes = read_private_file(path.as_ref(), RUNTIME_FILE_SIZE)?;
         if bytes.len() != RUNTIME_FILE_SIZE || bytes.get(..8) != Some(RUNTIME_MAGIC) {
             return Err(Error::Identity("runtime key magic or length"));
         }
@@ -146,7 +148,7 @@ impl Identity {
     /// Returns an error for I/O failures, corruption, or inconsistent key material.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let source_path = path.as_ref().canonicalize()?;
-        let bytes = Zeroizing::new(std::fs::read(&source_path)?);
+        let bytes = read_private_file(&source_path, IDENTITY_FILE_LIMIT)?;
         if bytes.len() < HEADER_SIZE + CHECKSUM_SIZE || bytes.get(..8) != Some(MAGIC) {
             return Err(Error::Identity("magic or length"));
         }
@@ -164,7 +166,7 @@ impl Identity {
         if blake3::hash(&bytes[..payload_len]).as_bytes() != &bytes[payload_len..] {
             return Err(Error::Identity("checksum"));
         }
-        let signing_pkcs8 = bytes[HEADER_SIZE..payload_len].to_vec();
+        let signing_pkcs8 = Zeroizing::new(bytes[HEADER_SIZE..payload_len].to_vec());
         let pair = Ed25519KeyPair::from_pkcs8(&signing_pkcs8)
             .map_err(|_| Error::Identity("Ed25519 private key"))?;
         let public_key: [u8; 32] = bytes[60..92].try_into().expect("fixed slice");
@@ -175,7 +177,7 @@ impl Identity {
             project_id: ProjectId(bytes[12..28].try_into().expect("fixed slice")),
             root_key: Zeroizing::new(bytes[28..60].try_into().expect("fixed slice")),
             public_key,
-            signing_pkcs8: Zeroizing::new(signing_pkcs8),
+            signing_pkcs8,
             source_path: Some(source_path),
         })
     }
@@ -292,6 +294,17 @@ pub(crate) fn is_hakutaku_key_magic(magic: &[u8; 8]) -> bool {
     magic == MAGIC || magic == RUNTIME_MAGIC
 }
 
+fn read_private_file(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(Error::Identity("file length limit"));
+    }
+    Ok(bytes)
+}
+
 fn save_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         return Err(Error::InvalidInput(format!(
@@ -380,6 +393,26 @@ mod tests {
         let payload_len = bytes.len() - CHECKSUM_SIZE;
         let checksum = blake3::hash(&bytes[..payload_len]);
         bytes[payload_len..].copy_from_slice(checksum.as_bytes());
+    }
+
+    #[test]
+    fn private_file_loads_bound_the_read_before_parsing() {
+        let root = root("bounded");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("oversized");
+        File::create(&path)
+            .unwrap()
+            .set_len(512 * 1024 * 1024)
+            .unwrap();
+        assert!(matches!(
+            Identity::load(&path),
+            Err(Error::Identity("file length limit"))
+        ));
+        assert!(matches!(
+            RuntimeKeyMaterial::load(&path),
+            Err(Error::Identity("file length limit"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

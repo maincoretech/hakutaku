@@ -77,6 +77,58 @@ fn full_incremental_and_unchanged_roundtrip() {
 }
 
 #[test]
+fn failed_cross_block_reads_preserve_cursor_position() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir(&input).unwrap();
+    let video = pseudo_random_bytes(2 * 256 * 1024);
+    std::fs::write(input.join("opening.mp4"), &video).unwrap();
+    let identity = Identity::generate().unwrap();
+    pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+    let original = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::cache_disabled(),
+        OpenPolicy::TrustFirstRelease,
+    )
+    .unwrap();
+    let segments = original
+        .segment_ids()
+        .unwrap()
+        .into_iter()
+        .map(|id| {
+            let mut bytes = std::fs::read(output.join("data").join(format!("{id}.taku"))).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            (id, Arc::<[u8]>::from(bytes))
+        })
+        .collect();
+    let package = Package::open(
+        Arc::new(MemoryFile(Arc::from(
+            std::fs::read(output.join("game.haku")).unwrap(),
+        ))),
+        Arc::new(MemorySegments(segments)),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::cache_disabled(),
+        OpenPolicy::TrustFirstRelease,
+    )
+    .unwrap();
+    let asset = package.asset("opening.mp4").unwrap();
+    let mut cursor = asset.cursor();
+    let mut bytes = vec![0; video.len()];
+    assert!(cursor.read(&mut bytes).is_err());
+    assert_eq!(cursor.position(), 0);
+    cursor.read_exact(&mut bytes[..256 * 1024]).unwrap();
+    assert_eq!(&bytes[..256 * 1024], &video[..256 * 1024]);
+    assert!(cursor.read(&mut bytes).is_err());
+    assert_eq!(cursor.position(), 256 * 1024);
+    assert!(asset.read_session().read_at(0, &mut bytes).is_err());
+}
+
+#[test]
 fn streaming_cursor_keeps_the_previous_block_for_short_backward_seeks() {
     let scratch = Scratch::new();
     let input = scratch.0.join("input");
@@ -206,6 +258,82 @@ fn caller_policy_rejects_a_validly_signed_rollback() {
             actual: 1
         })
     ));
+}
+
+#[test]
+fn full_rebuild_preserves_release_order_and_recovers_missing_segments() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("voice.opus"), pseudo_random_bytes(1024)).unwrap();
+    let identity = Identity::generate().unwrap();
+    let mut options = PackOptions::new(&input, &output);
+    assert_eq!(
+        pack_directory(&options, &identity)
+            .unwrap()
+            .release_sequence,
+        1
+    );
+    std::fs::write(input.join("script.txt"), b"updated").unwrap();
+    assert_eq!(
+        pack_directory(&options, &identity)
+            .unwrap()
+            .release_sequence,
+        2
+    );
+
+    // Full reconstruction needs the authenticated snapshot, not old payloads.
+    let old = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::default(),
+        OpenPolicy::RequireAtLeast(2),
+    )
+    .unwrap();
+    let old_ids = old.segment_ids().unwrap();
+    drop(old);
+    std::fs::remove_file(
+        output
+            .join("data")
+            .join(hakutaku_core::segment_file_name(old_ids[0])),
+    )
+    .unwrap();
+    options.incremental = false;
+    for expected_sequence in [3, 4] {
+        let report = pack_directory(&options, &identity).unwrap();
+        assert!(report.changed);
+        assert_eq!(report.release_sequence, expected_sequence);
+        assert_eq!(report.reused_blocks, 0);
+        assert!(report.new_blocks > 0);
+        let package = Package::open_directory(
+            output.join("game.haku"),
+            output.join("data"),
+            identity.root_key(),
+            identity.public_key(),
+            ResourceBudget::default(),
+            OpenPolicy::RequireAtLeast(expected_sequence),
+        )
+        .unwrap();
+        package.verify_segments().unwrap();
+        assert_eq!(
+            package.asset("script.txt").unwrap().read().unwrap(),
+            b"updated"
+        );
+        assert_eq!(
+            package.asset("voice.opus").unwrap().read().unwrap(),
+            pseudo_random_bytes(1024)
+        );
+        assert!(
+            package
+                .segment_ids()
+                .unwrap()
+                .iter()
+                .all(|id| !old_ids.contains(id))
+        );
+    }
 }
 
 #[test]
@@ -419,12 +547,16 @@ fn extracted_content_key_cannot_forge_the_signed_block_commitment() {
     pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
 
     let snapshot_bytes = std::fs::read(output.join("game.haku")).unwrap();
-    let header = SnapshotHeader::parse(&snapshot_bytes[..4096]).unwrap();
+    let header =
+        SnapshotHeader::parse(&snapshot_bytes[..hakutaku_core::format::SNAPSHOT_HEADER_SIZE])
+            .unwrap();
     let keys = ProjectKeys::new(identity.root_key(), identity.project_id());
     let snapshot_key_bytes = keys.snapshot_key(&header.snapshot_salt);
     let snapshot_key = Aes256Key::new(&snapshot_key_bytes).unwrap();
-    let catalog_end = 4096 + header.catalog_stored_len as usize;
-    let mut catalog_ciphertext = snapshot_bytes[4096..catalog_end].to_vec();
+    let catalog_end =
+        hakutaku_core::format::SNAPSHOT_HEADER_SIZE + header.catalog_stored_len as usize;
+    let mut catalog_ciphertext =
+        snapshot_bytes[hakutaku_core::format::SNAPSHOT_HEADER_SIZE..catalog_end].to_vec();
     snapshot_key
         .open(
             crypto::nonce(header.nonce_prefix, 0),
@@ -466,8 +598,10 @@ fn extracted_content_key_cannot_forge_the_signed_block_commitment() {
     let segment = catalog.segment(u32::from(block.segment_ordinal)).unwrap();
     let segment_path = output.join("data").join(format!("{}.taku", segment.id));
     let mut segment_bytes = std::fs::read(&segment_path).unwrap();
-    let segment_header =
-        hakutaku_core::format::SegmentHeader::parse(&segment_bytes[..4096]).unwrap();
+    let segment_header = hakutaku_core::format::SegmentHeader::parse(
+        &segment_bytes[..hakutaku_core::format::SEGMENT_HEADER_SIZE],
+    )
+    .unwrap();
     let segment_key_bytes = keys.segment_key(&segment_header);
     let segment_key = Aes256Key::new(&segment_key_bytes).unwrap();
     let start = block.physical_offset as usize;
@@ -677,4 +811,87 @@ impl PositionedFile for CountingFile {
         destination.copy_from_slice(self.bytes.get(start..end).ok_or(CoreError::InvalidRange)?);
         Ok(())
     }
+}
+
+#[test]
+fn migration_floor_and_consolidation_preserve_release_order_and_live_content() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir(&input).unwrap();
+    for index in 0..200 {
+        std::fs::write(input.join(format!("{index}.opus")), [index as u8; 64]).unwrap();
+    }
+    let identity = Identity::generate().unwrap();
+    let mut options = PackOptions::new(&input, &output);
+    options.release_sequence_floor = 200;
+    assert_eq!(
+        pack_directory(&options, &identity)
+            .unwrap()
+            .release_sequence,
+        200
+    );
+    let mut peak = 0;
+    let mut consolidated = false;
+    for step in 0..140 {
+        let mut bytes = [step as u8; 64];
+        bytes[0] ^= 0xff;
+        std::fs::write(input.join(format!("{step}.opus")), bytes).unwrap();
+        options.development_cache = step % 2 == 0;
+        let report = pack_directory(&options, &identity).unwrap();
+        assert_eq!(report.release_sequence, 201 + step);
+        let package = Package::open_directory(
+            output.join("game.haku"),
+            output.join("data"),
+            identity.root_key(),
+            identity.public_key(),
+            ResourceBudget::memory_constrained(),
+            OpenPolicy::RequireAtLeast(report.release_sequence),
+        )
+        .unwrap();
+        let count = package.list_segments().unwrap().len();
+        peak = peak.max(count);
+        consolidated |= report.new_blocks > 1;
+        assert_eq!(
+            package
+                .asset(&format!("{step}.opus"))
+                .unwrap()
+                .read()
+                .unwrap(),
+            bytes
+        );
+    }
+    assert!(consolidated);
+    assert!(peak <= 64, "patch fragments accumulated: {peak}");
+    let package = Package::open_directory(
+        output.join("game.haku"),
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::default(),
+        OpenPolicy::RequireAtLeast(340),
+    )
+    .unwrap();
+    package.verify_segments().unwrap();
+    for index in 0..200 {
+        let path = format!("{index}.opus");
+        assert_eq!(
+            package.asset(&path).unwrap().read().unwrap(),
+            std::fs::read(input.join(path)).unwrap()
+        );
+    }
+    drop(package);
+    let mut floor_only = options.clone();
+    floor_only.release_sequence_floor = 900;
+    assert_eq!(
+        pack_directory(&floor_only, &identity)
+            .unwrap()
+            .release_sequence,
+        900
+    );
+    let same = pack_directory(&floor_only, &identity).unwrap();
+    assert!(!same.changed);
+    assert_eq!(same.release_sequence, 900);
+    floor_only.release_sequence_floor = 0;
+    assert!(pack_directory(&floor_only, &identity).is_err());
 }

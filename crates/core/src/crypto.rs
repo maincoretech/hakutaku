@@ -1,4 +1,4 @@
-//! Fixed Hakutaku v1 cryptographic profile.
+//! Fixed Hakutaku v2 cryptographic profile.
 //!
 //! AES-256-GCM is the only content cipher. There is deliberately no runtime
 //! algorithm identifier or negotiation path.
@@ -9,11 +9,11 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::signature::{self, UnparsedPublicKey};
 use zeroize::{Zeroize, Zeroizing};
 
-const MASTER_CONTEXT: &str = "Hakutaku project master v1";
-const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"Hakutaku snapshot signature v1";
-const CATALOG_AAD_DOMAIN: &[u8] = b"Hakutaku catalog aad v1";
-const PAGE_AAD_DOMAIN: &[u8] = b"Hakutaku page aad v1";
-const BLOCK_AAD_DOMAIN: &[u8] = b"Hakutaku block aad v1";
+const MASTER_CONTEXT: &str = "Hakutaku project master v2";
+const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"Hakutaku snapshot signature v2";
+const CATALOG_AAD_DOMAIN: &[u8] = b"Hakutaku catalog aad v2";
+const PAGE_AAD_DOMAIN: &[u8] = b"Hakutaku page aad v2";
+const BLOCK_AAD_DOMAIN: &[u8] = b"Hakutaku block aad v2";
 const CATALOG_AAD_LEN: usize = CATALOG_AAD_DOMAIN.len() + 16 + 8 + 8 + 8 + 4;
 const PAGE_AAD_LEN: usize = PAGE_AAD_DOMAIN.len() + 16 + 8 + 1 + 1 + 4 + 4 + 4;
 const BLOCK_AAD_LEN: usize = BLOCK_AAD_DOMAIN.len() + 16 + 16 + 4 + 1 + 4 + 4;

@@ -1,11 +1,11 @@
-# Hakutaku v1 wire format
+# Hakutaku v2 wire format
 
-This document is normative for format major `1`, minor `0`. Integers are
+This document is normative for format major `2`, minor `0`. Integers are
 little-endian. Every reserved byte must be zero. Readers must validate all
 counts, lengths, offsets, additions, and multiplications before allocation or
 I/O. Unknown versions and non-canonical layouts are errors.
 
-Hakutaku v1 has exactly one cryptographic suite:
+Hakutaku v2 has exactly one cryptographic suite:
 
 - AES-256-GCM with a 96-bit nonce and 128-bit tag;
 - Ed25519 snapshot signatures;
@@ -21,6 +21,23 @@ containers as RAW encrypted blocks. Recompressing these formats with zstd adds
 publisher CPU time without a reliable storage benefit. Other inputs use zstd
 only when the independent frame saves at least the canonical threshold.
 
+## Compatibility and upgrade
+
+Only format major 2 is accepted. There is no v1 reader, writer, incremental
+reuse or automatic package migration. Rebuild original assets into a **fresh
+output directory** with the same publisher identity and deploy the v2 runtime
+and package together. Identity/key-file serialization has its own version and
+is unchanged; keep the existing private identity.
+
+Use `PackOptions::release_sequence_floor` / `--release-sequence-floor N` with
+`N` above the previous published sequence when moving to a new output directory.
+The packer does not parse an old v1 snapshot to recover that state. Existing v2
+output continues its authenticated sequence; a lower supplied floor cannot
+decrease it. Full builds require an authentic current snapshot when present.
+
+Measured layout choices and rejected alternatives are documented in
+[performance evidence](PERFORMANCE.md#next-format-design-evidence).
+
 ## Release layout
 
 ```text
@@ -33,22 +50,22 @@ release/
 `SegmentId = BLAKE3(complete .taku file)`. Segment files are immutable. A new
 snapshot may reuse blocks from old segments and add new segments.
 
-## SnapshotHeaderV1
+## SnapshotHeaderV2
 
-`game.haku` begins with one 4096-byte header.
+`game.haku` begins with one 256-byte header.
 
 | offset | size | field |
 |---:|---:|---|
-| 0 | 8 | `HAKU0001` |
-| 8 | 2 | major = 1 |
+| 0 | 8 | `HAKU0002` |
+| 8 | 2 | major = 2 |
 | 10 | 2 | minor = 0 |
-| 12 | 4 | header size = 4096 |
+| 12 | 4 | header size = 256 |
 | 16 | 16 | project ID |
 | 32 | 8 | monotonically increasing release sequence |
-| 40 | 8 | catalog offset = 4096 |
+| 40 | 8 | catalog offset = 256 |
 | 48 | 8 | catalog ciphertext + tag length |
 | 56 | 8 | catalog decompressed length |
-| 64 | 8 | page region offset = 4096 + catalog stored length |
+| 64 | 8 | page region offset = 256 + catalog stored length |
 | 72 | 4 | total page count |
 | 76 | 4 | zero |
 | 80 | 16 | snapshot KDF salt |
@@ -56,7 +73,7 @@ snapshot may reuse blocks from old segments and add new segments.
 | 104 | 16 | `BLAKE3(Ed25519 public key)[0..16]` |
 | 120 | 32 | source fingerprint |
 | 152 | 64 | Ed25519 signature |
-| 216 | 3880 | zero |
+| 216 | 40 | zero |
 
 The catalog immediately follows the header. It is always one zstd frame,
 encrypted in place with AES-256-GCM; the 16-byte tag is appended. Pages follow
@@ -65,8 +82,8 @@ the catalog in directory order with no gaps.
 The signature slot is zeroed when constructing the signed message:
 
 ```text
-"Hakutaku snapshot signature v1" ||
-BLAKE3(zero-signature SnapshotHeaderV1 || catalog ciphertext || catalog tag)
+"Hakutaku snapshot signature v2" ||
+BLAKE3(zero-signature SnapshotHeaderV2 || catalog ciphertext || catalog tag)
 ```
 
 The signature is verified before catalog decryption.
@@ -78,7 +95,7 @@ a human password.
 
 ```text
 project_master = BLAKE3 derive_key(
-  "Hakutaku project master v1",
+  "Hakutaku project master v2",
   content_root_key || project_id
 )
 
@@ -103,14 +120,14 @@ nonce = nonce_prefix[8] || u32_le(ordinal)
 The format forbids ordinal reuse with one key. Page and block counts are
 bounded below `u32::MAX`.
 
-## CatalogV1
+## CatalogV2
 
 After decryption and zstd decoding, the catalog begins with 64 bytes:
 
 | offset | size | field |
 |---:|---:|---|
-| 0 | 8 | `HAKCAT01` |
-| 8 | 2 | major = 1 |
+| 0 | 8 | `HAKCAT02` |
+| 8 | 2 | major = 2 |
 | 10 | 2 | header size = 64 |
 | 12 | 4 | segment count |
 | 16 | 4 | file count |
@@ -130,7 +147,7 @@ The only canonical order is header, segment records, file records, path slots,
 path bytes, and page records. There is no padding between tables and no trailing
 data.
 
-### SegmentRecordV1 — 96 bytes
+### SegmentRecordV2 — 96 bytes
 
 | offset | size | field |
 |---:|---:|---|
@@ -150,7 +167,7 @@ absent until an asset that references them is requested. The signed catalog is
 therefore also the authoritative update/install manifest. Transport and retry
 behavior are deliberately outside the wire format.
 
-### FileRecordV1 — 32 bytes
+### FileRecordV2 — 32 bytes
 
 | offset | size | field |
 |---:|---:|---|
@@ -181,18 +198,17 @@ The reference packer also writes each availability/access combination through
 an independent bounded segment stream. This placement policy improves
 incremental reclamation but is not a wire-format invariant.
 
-### PathSlotV1 — 16 bytes
+### PathSlotV2 — 8 bytes
 
 | offset | size | field |
 |---:|---:|---|
-| 0 | 8 | first 64 bits of `BLAKE3 keyed_hash(path_key, path)` |
-| 8 | 4 | file index; `0xffffffff` means empty |
-| 12 | 4 | zero |
+| 0 | 4 | first 32 bits of `BLAKE3 keyed_hash(path_key, path)` |
+| 4 | 4 | file index; `0xffffffff` means empty |
 
 The table uses linear probing. A hash match must still compare the complete
 path bytes.
 
-### PageRecordV1 — 64 bytes
+### PageRecordV2 — 64 bytes
 
 | offset | size | field |
 |---:|---:|---|
@@ -216,16 +232,16 @@ Every decoded page starts with 16 bytes:
 
 | offset | size | field |
 |---:|---:|---|
-| 0 | 8 | `HAKMAP01` or `HAKREU01` |
-| 8 | 2 | major = 1 |
-| 10 | 2 | record size: 48 or 80 |
+| 0 | 8 | `HAKMAP02` or `HAKREU02` |
+| 8 | 2 | major = 2 |
+| 10 | 2 | record size: 48 or 32 |
 | 12 | 4 | first global record index |
 
 A 16 KiB BlockMapPage contains at most 341 BlockRef records. A ReusePage
-contains at most 204 ReuseRecord records. The final page is the only short
+contains at most 511 chunk IDs. The final page is the only short
 page. Empty packages have no pages.
 
-### BlockRefV1 — 48 bytes
+### BlockRefV2 — 48 bytes
 
 | offset | size | field |
 |---:|---:|---|
@@ -244,27 +260,30 @@ It is checked before AEAD opening. A party that extracts the embedded content
 key can decrypt data and recompute a GCM tag, but cannot replace this signed
 digest without the publisher signing key.
 
-### ReuseRecordV1 — 80 bytes
+### ReusePage entry — 32 bytes
 
 | offset | size | field |
 |---:|---:|---|
 | 0 | 32 | `BLAKE3(plaintext chunk)` |
-| 32 | 48 | complete BlockRefV1 |
+
+The record at global index `i` is the chunk ID for BlockRef `i` in the block
+map. Both tables must contain exactly `total_blocks` records. The publisher
+resolves the shared BlockRef on demand; no duplicate BlockRef is encoded.
 
 Reuse pages are packer-only cold data. Runtime lookup and asset reads never
 load them.
 
-## SegmentHeaderV1
+## SegmentHeaderV2
 
-Every `.taku` begins with one 4096-byte header followed by tightly packed
+Every `.taku` begins with one 128-byte header followed by tightly packed
 ciphertext blocks.
 
 | offset | size | field |
 |---:|---:|---|
-| 0 | 8 | `HAKSEG01` |
-| 8 | 2 | major = 1 |
+| 0 | 8 | `HAKSEG02` |
+| 8 | 2 | major = 2 |
 | 10 | 2 | minor = 0 |
-| 12 | 4 | header size = 4096 |
+| 12 | 4 | header size = 128 |
 | 16 | 16 | project ID |
 | 32 | 16 | segment UID |
 | 48 | 16 | segment KDF salt |
@@ -272,8 +291,8 @@ ciphertext blocks.
 | 72 | 4 | block count |
 | 76 | 4 | zero |
 | 80 | 8 | payload length |
-| 88 | 8 | complete file length = 4096 + payload length |
-| 96 | 4000 | zero |
+| 88 | 8 | complete file length = 128 + payload length |
+| 96 | 32 | zero |
 
 The catalog's SegmentRecord and the segment header must match exactly before
 reading payload bytes.
@@ -284,23 +303,23 @@ Length prefixes below are literal fixed fields, not a generic serialization.
 
 ```text
 catalog AAD =
-  "Hakutaku catalog aad v1" || project_id || release_sequence:u64 ||
+  "Hakutaku catalog aad v2" || project_id || release_sequence:u64 ||
   catalog_stored_len:u64 || catalog_plain_len:u64 || page_count:u32
 
 page AAD =
-  "Hakutaku page aad v1" || project_id || release_sequence:u64 ||
+  "Hakutaku page aad v2" || project_id || release_sequence:u64 ||
   kind:u8 || codec:u8 || nonce_ordinal:u32 || stored_len:u32 || plain_len:u32
 
 block AAD =
-  "Hakutaku block aad v1" || project_id || segment_uid || block_ordinal:u32 ||
+  "Hakutaku block aad v2" || project_id || segment_uid || block_ordinal:u32 ||
   codec:u8 || stored_len:u32 || plain_len:u32
 ```
 
 ## Parser limits
 
-The v1 core currently rejects values above:
+The v2 core currently rejects values above:
 
-- 128 referenced segments;
+- 65,535 referenced segments;
 - 1,000,000 files;
 - 10,000,000 blocks;
 - 100,000 pages;
@@ -313,7 +332,7 @@ The v1 core currently rejects values above:
 For RAW records, `stored_len = plain_len + 16`. For zstd records,
 `16 <= stored_len < plain_len + 16`; a non-beneficial compressed form is not
 canonical. These relations bound ciphertext allocation before AEAD and keep a
-single v1 block within the fixed reader budget.
+single v2 block within the fixed reader budget.
 
 These are reader safety limits, not recommended package targets.
 
@@ -348,3 +367,18 @@ availability matches. Within one build, identical new blocks are shared only
 when both availability and access class match. Historical immutable placement
 is preserved by incremental builds; a full build rewrites all blocks into the
 current placement classes.
+
+Full rebuilds authenticate the existing snapshot and increment its release
+sequence, while disabling block reuse and the unchanged-source shortcut. They
+can reconstruct missing old segments from source. A corrupt or untrusted
+existing snapshot is an error rather than permission to reset release ordering.
+
+The reference publisher consolidates when at least 64 retained segments are
+at most 64 KiB each, or a segment has at least 1 MiB dead payload and no more
+than half its payload live. Candidates are selected by unique live plaintext
+size, within a 64 MiB rewrite budget per build. Duplicate references count once;
+compressed bytes cannot bypass the plaintext budget. Selected blocks are
+recreated from verified source under the existing availability/access partition.
+Unchanged content still publishes a new sequence if consolidation or an
+increased sequence floor requires a new snapshot. Existing segments remain
+available until the staged replacement has passed verification and committed.

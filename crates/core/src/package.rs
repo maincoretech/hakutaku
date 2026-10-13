@@ -579,7 +579,18 @@ impl Package {
                 .inner
                 .load_page(first_page + reuse_index, PageKind::Reuse)?;
             let expected_first = checked_record_index(reuse_index, REUSE_PER_PAGE as u32)?;
-            records.extend(parse_reuse_page(&bytes, expected_first)?);
+            for (local, chunk_id) in parse_reuse_page(&bytes, expected_first)?
+                .into_iter()
+                .enumerate()
+            {
+                let global = expected_first
+                    .checked_add(local as u32)
+                    .ok_or(Error::InvalidFormat("reuse block index overflow"))?;
+                records.push(ReuseRecord {
+                    chunk_id,
+                    block: self.inner.block_ref(global)?,
+                });
+            }
         }
         validate_record_total(records.len(), self.inner.catalog.total_blocks())?;
         Ok(records)
@@ -1043,62 +1054,20 @@ impl Read for AssetCursor {
                 "cursor is beyond the end of the asset",
             ));
         }
-        let requested =
-            usize::try_from((self.asset.len() - self.position).min(buffer.len() as u64))
-                .map_err(std::io::Error::other)?;
-        let mut written = 0;
-        while written < requested {
-            let covered = self
-                .current_block
-                .as_ref()
-                .is_some_and(|block| block.covers(self.position));
-            if !covered {
-                if self
-                    .previous_streaming_block
-                    .as_ref()
-                    .is_some_and(|block| block.covers(self.position))
-                {
-                    std::mem::swap(&mut self.current_block, &mut self.previous_streaming_block);
-                    continue;
-                }
-                let reference = self
-                    .asset
-                    .reference_for_offset(self.position)
-                    .map_err(std::io::Error::other)?;
-                if self.asset.record.access == AccessClass::Streaming {
-                    if let Some(previous) = self.previous_streaming_block.take() {
-                        self.reader.recycle(previous.data);
-                    }
-                    self.previous_streaming_block = self.current_block.take();
-                } else {
-                    if let Some(current) = self.current_block.take() {
-                        self.reader.recycle(current.data);
-                    }
-                }
-                let block = self
-                    .asset
-                    .package
-                    .inner
-                    .load_block_buffered(&reference, self.asset.record.access, &mut self.reader)
-                    .map_err(std::io::Error::other)?;
-                self.current_block = Some(CursorBlock {
-                    reference,
-                    data: block,
-                });
-            }
-            let block = self
-                .current_block
-                .as_ref()
-                .expect("cursor block loaded above");
-            let bytes = block.data.as_ref();
-            let within = usize::try_from(self.position - block.reference.logical_offset)
-                .map_err(std::io::Error::other)?;
-            let amount = (bytes.len() - within).min(requested - written);
-            buffer[written..written + amount].copy_from_slice(&bytes[within..within + amount]);
-            written += amount;
-            self.position += amount as u64;
-        }
-        Ok(written)
+        // Share authenticated block loading, coverage checks and buffer reuse
+        // with offset reads. A failed read must not advance the cursor.
+        let read = self
+            .asset
+            .read_at_buffered(
+                self.position,
+                buffer,
+                &mut self.current_block,
+                &mut self.previous_streaming_block,
+                &mut self.reader,
+            )
+            .map_err(std::io::Error::other)?;
+        self.position += read as u64;
+        Ok(read)
     }
 }
 
@@ -1385,7 +1354,10 @@ mod tests {
                 PageKind::BlockMap,
                 encode_map_page(0, &[reference]).unwrap(),
             ),
-            (PageKind::Reuse, encode_reuse_page(0, &[reuse]).unwrap()),
+            (
+                PageKind::Reuse,
+                encode_reuse_page(0, &[reuse.chunk_id]).unwrap(),
+            ),
         ];
         let mut page_region = Vec::new();
         let mut pages = Vec::new();
@@ -1432,8 +1404,8 @@ mod tests {
             availability: Availability::Required,
         };
         let path_key = keys.path_key();
-        let hash = u64::from_le_bytes(
-            blake3::keyed_hash(&path_key, b"a").as_bytes()[..8]
+        let hash = u32::from_le_bytes(
+            blake3::keyed_hash(&path_key, b"a").as_bytes()[..4]
                 .try_into()
                 .unwrap(),
         );

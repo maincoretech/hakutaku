@@ -87,6 +87,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
     let mut output = None;
     let mut identity = None;
     let mut incremental = true;
+    let mut release_sequence_floor = 1;
     let mut development_cache = false;
     let mut level = 3;
     let mut segment_mib = 512_u64;
@@ -97,6 +98,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             Long("output") | Short('o') => output = Some(PathBuf::from(parser.value()?)),
             Long("identity") | Short('k') => identity = Some(PathBuf::from(parser.value()?)),
             Long("full") => incremental = false,
+            Long("release-sequence-floor") => release_sequence_floor = parser.value()?.parse()?,
             Long("dev-cache") => development_cache = true,
             Long("zstd-level") => level = parser.value()?.parse()?,
             Long("segment-mib") => segment_mib = parser.value()?.parse()?,
@@ -105,7 +107,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
             }
             Long("help") | Short('h') => {
                 println!(
-                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--dev-cache] [--zstd-level 3] [--segment-mib 512] [--deferred-prefix PATH]"
+                    "usage: hakutaku pack -i <assets> -o <release> -k <identity> [--full] [--release-sequence-floor N] [--dev-cache] [--zstd-level 3] [--segment-mib 512] [--deferred-prefix PATH]"
                 );
                 return Ok(());
             }
@@ -118,6 +120,7 @@ fn pack_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error::E
         required_path(output, "--output")?,
     );
     options.incremental = incremental;
+    options.release_sequence_floor = release_sequence_floor;
     if development_cache && !incremental {
         return Err(
             "--dev-cache cannot be combined with --full; full builds always reread sources".into(),

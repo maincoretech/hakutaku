@@ -20,7 +20,7 @@ The repository is intentionally split by responsibility:
 - `hakutaku`: command-line pack/list/extract/verify tool;
 - `hakutaku-gui`: optional resource, release, and publisher-identity manager.
 
-The v1 wire format has one cryptographic suite: AES-256-GCM for encrypted
+The v2 wire format has one cryptographic suite: AES-256-GCM for encrypted
 catalogs, pages, and blocks, Ed25519 for publisher identity, and BLAKE3 for
 content addresses and signed commitments. It does not contain an algorithm
 identifier or compatibility branch.
@@ -57,14 +57,16 @@ cargo run -p hakutaku-cli -- segments \
 cargo run -p hakutaku-gui
 ```
 
-The GUI treats the source directory as the single source of truth. Its
-**Resources** view compares every source asset with the authenticated active
-release, including same-size edits, and supports safe import, atomic replace,
-search, and reveal operations. **Release** previews and builds incremental or
-full releases and verifies all immutable segments. **Identity** creates,
-inspects, and backs up publisher identities without exposing private key
-material. Runtime benchmarks remain in the repository's Criterion bench rather
-than the application.
+Set **Assets**, **Output**, and **Key** once. Use **Scan → Build → Verify**.
+The icons show the workflow; change bars show added, changed, removed, and
+unchanged files. File access/install details and longer explanations appear on
+hover. Import, replace, search, and reveal remain in the file list.
+
+**Reuse blocks** is independent of **Dev cache**. The **Strict** badge means full
+source reads and staged byte comparison; this is the default. Opt into Dev
+cache under **Options** for local iteration only. Full builds disable it.
+**Details** contains build/package statistics; **Key tools** manages the shared
+publisher identity. Changing paths clears old results and selections.
 
 Only `game.haku`, `data/*.taku`, and the runtime's equivalent embedded key
 material belong in the shipped game. The `*.hakutaku-key` publisher identity
@@ -139,23 +141,36 @@ source rereads and byte-for-byte staged verification. After a successful GUI
 incremental build, the post-build plan validates the complete path/size/access
 inventory without immediately rereading every source body.
 
-See [docs/FORMAT.md](docs/FORMAT.md) for the normative v1 byte layout, parser limits,
-nonce/AAD rules, and verification chain.
+Full builds preserve and advance the authenticated release sequence even when
+rebuilding unchanged source or recovering missing old segments. An existing
+snapshot must authenticate; `--full` does not reset the launcher's rollback floor.
+
+Hakutaku 0.2.0 reads and writes **v2 only**. Existing v1 packages require a full
+source repack into a fresh directory using the same identity; pass
+`--release-sequence-floor N` above the last published sequence. Deploy the new
+runtime with its matching package. There is no legacy format fallback.
+
+See [docs/FORMAT.md](docs/FORMAT.md) for the implemented byte layout and
+[performance evidence](docs/PERFORMANCE.md#next-format-design-evidence) for the
+measured design choices. The compact catalog uses 8-byte path slots and 32-byte
+positional chunk IDs; headers are 256/128 bytes. Audio uses 64 KiB blocks,
+video retains 256 KiB, and image CDC remains unchanged. Bounded publisher
+consolidation prevents small patch segments accumulating indefinitely.
 
 ## Validation
 
-Hakutaku requires Rust 1.97.1. The same version is pinned for local development
+Hakutaku requires Rust 1.99.0. The same version is pinned for local development
 and CI in `rust-toolchain.toml`. Local acceptance uses:
 
 ```sh
 cargo fmt --all --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc -p hakutaku-core -p hakutaku-pack --no-deps
-cargo llvm-cov -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
-cargo llvm-cov -p hakutaku-cli --fail-under-lines 45
-cargo bench --workspace
+cargo check --workspace --locked --all-targets --all-features
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo test --workspace --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked -p hakutaku-core -p hakutaku-pack --no-deps
+cargo llvm-cov --locked -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
+cargo llvm-cov --locked -p hakutaku-cli --fail-under-lines 45
+cargo bench --locked --workspace
 ```
 
 The larger VN benchmark is opt-in because it creates 10k/50k/100k-entry
@@ -183,6 +198,80 @@ higher, and CLI argument handling has a 45% regression floor. The remaining
 lines are operating-system and cryptographic-provider failure returns that
 cannot be triggered deterministically without replacing the production
 backends.
+
+## v2 acceptance
+
+The complete 0.2.0 workspace passes Rust 1.99.0 fmt, all-target/all-feature
+check and Clippy, 83 tests, and public documentation with warnings denied.
+Fresh coverage targets report Core/Pack 97.63%, wire parser 100%, CLI 53.42%;
+the existing thresholds remain unchanged. The initial mixed-version coverage
+target is excluded from acceptance. Actionlint passes.
+
+The 500k-resource, 1,024-update and eight-reader stress cases pass. Real v1/v2
+binaries reject each other's wire format; identity reuse and release floors
+are checked. See [integrated results](docs/PERFORMANCE.md#integrated-v2-results)
+for paired measurements, tradeoffs and raw evidence. Kēne's local integration
+passes its workspace gates, all 196 Loader tests and 29 publisher tests, both
+native/FFmpeg media acceptance commands, and the existing dependency policy.
+The local macOS debug GUI passes direct native checks of the single-workspace
+flow: shared paths, collapsed identity/advanced/statistics sections, same-size
+source change detection with preserved mtime, strict incremental build, release
+verification, and independent cache/reuse controls. The demo build advances
+release 42 to 43 with 199 reused blocks and one new block; verification succeeds.
+Full mode disables the development cache and keeps strict validation. Its ad-hoc
+signature verifies. This covers the local debug app; release artifacts and
+Windows/Linux GUI acceptance remain separate.
+Publishing a portable Git dependency and remote release/CI remain separate.
+
+## Quality-review baseline (before v2)
+
+The workspace review covers every crate, with runtime and publisher paths as
+the priority. Scope coverage is not a claim of exhaustive proof.
+
+| Module | Reviewed paths and resulting changes |
+|---|---|
+| Core | Authenticated format/crypto, positional I/O, pages, segments, budgets, prefetch and cursors; remove quadratic cache insertion and path-validation allocation; share cursor/session block loading and preserve cursor position on read errors |
+| Pack | Source inventory/classification, identities, planning, chunking, dedup, cache parsing, staging, recovery and commit; bound reads and allocations before parsing, handle short reads correctly, use standard file replacement, preserve monotonic release ordering during full reconstruction |
+| CLI | Argument/error paths, identity/runtime-key separation, package open, verification and confined extraction; retain the existing public command contract |
+| GUI | Worker lifecycle, progress, resource filtering/selection, import/replace, release and identity flows; use egui visible-row rendering, cache filtering, throttle progress, handle worker creation failures, and scroll long release/identity pages |
+| Dependencies/CI | Rust/MSRV, direct dependencies, feature graph, coverage, native/mobile build jobs and release gates; pin Rust 1.99.0 and lock resolution, add native platform tests |
+
+Direct dependencies now use eframe 0.36.2, rfd 0.17.2, zstd 0.14.2 and
+FastCDC 5.0.0; the lockfile also advances BLAKE3 to 1.8.7 and zeroize to 1.9.1.
+The redundant direct egui dependency is removed in favor of eframe's re-export.
+No new direct crate or runtime framework is introduced. FastCDC keeps the same
+32/128/512 KiB parameters; its updated API uses `usize`. The native zstd version
+remains 1.5.7. See the [FastCDC changelog](https://docs.rs/crate/fastcdc/5.0.0/source/CHANGELOG.md)
+and [eframe release](https://github.com/emilk/egui/releases/tag/0.36.2).
+
+On Apple Silicon macOS with Rust 1.99.0, fmt, all-target/all-feature check and
+Clippy, documentation, and 76 workspace tests pass, including the later
+full-rebuild sequence regression. Before that follow-up, measured line coverage
+was 97.59% for Core/Pack, 53.29% for CLI, and 100% for the wire-format parser;
+coverage was not remeasured after the sequence fix. Existing coverage thresholds
+are unchanged. Actionlint passes with its optional
+shellcheck/pyflakes integrations disabled.
+
+The dependency review, before the sequence follow-up, verified that old and
+new dependency builds read each other's v1 packages byte-for-byte;
+new strict and development-cache incremental builds preserve an unchanged old
+snapshot and its segments. The fixture covers compressed text, raw video,
+empty files and deterministic random data with an odd tail. New full and
+incremental packages also pass the old dependency build's verifier/extractor.
+These two CLI builds both contain this review's reader fixes; the comparison
+isolates dependency compatibility. A separate archive of Kēne `6635d1f`, patched
+only to consume this local Core/Pack, passes all 196 Loader tests. Kēne's live
+checkout and dependency pins were unchanged during that baseline review.
+
+Native macOS acceptance directly exercised scanning 305 temporary assets,
+scrolling and filtering the resource list, incremental build, unchanged rebuild,
+verification and scrolling the complete release report. The local debug app's
+ad-hoc signature also verifies. This is not acceptance of a release artifact:
+remote CI, Windows/Linux GUI operation and mobile targets still need their
+own builds/runs. Dependency-policy boundaries are recorded in
+[SECURITY.md](docs/SECURITY.md#dependency-review-boundary), and measured results
+in [PERFORMANCE.md](docs/PERFORMANCE.md#bounded-cache-population).
+Raw local evidence is under the ignored `target/quality-review/` directory.
 
 ## License
 

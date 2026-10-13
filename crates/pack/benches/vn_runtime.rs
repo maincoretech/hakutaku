@@ -1,3 +1,6 @@
+#[path = "vn_runtime/design.rs"]
+mod design;
+
 use hakutaku_core::{
     LocalFile, OpenPolicy, Package, PositionedFile, ResourceBudget, Result as CoreResult,
     SEGMENT_FILE_EXTENSION, SegmentId, SegmentSource, segment_file_name,
@@ -21,6 +24,9 @@ const VOICE_ENTRY_BYTES: usize = 64;
 const FIXED_ASSETS: usize = 6;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(mode) = std::env::var("HAKUTAKU_DESIGN_BENCH") {
+        return design::run(&mode);
+    }
     if std::env::var_os("HAKUTAKU_VN_BENCH").as_deref() != Some("1".as_ref()) {
         println!("Hakutaku VN benchmark skipped");
         println!("run HAKUTAKU_VN_BENCH=1 cargo bench -p hakutaku-pack --bench vn_runtime");
@@ -48,8 +54,8 @@ fn benchmark_counts() -> Result<Vec<usize>, Box<dyn std::error::Error>> {
         .filter(|value| !value.is_empty())
         .map(str::parse)
         .collect::<Result<Vec<usize>, _>>()?;
-    if counts.is_empty() || counts.iter().any(|count| *count < FIXED_ASSETS) {
-        return Err("benchmark counts must be at least 6".into());
+    if counts.is_empty() || counts.iter().any(|count| *count <= FIXED_ASSETS) {
+        return Err("benchmark counts must be at least 7".into());
     }
     Ok(counts)
 }
@@ -151,6 +157,9 @@ fn run_scale(
     print_measurement("bgm_sequential_short_seek", bgm);
     print_measurement("video_sequential_short_seek", video);
     print_measurement("interleaved_cursors", concurrent);
+    if std::env::var("HAKUTAKU_DESIGN_BENCH").as_deref() == Ok("metadata") {
+        design::metadata_metrics(&release, identity, &package, asset_count)?;
+    }
     Ok(())
 }
 
@@ -163,10 +172,12 @@ fn open_counted(
         Arc::new(CountingFile {
             inner: LocalFile::open(release.join("game.haku"))?,
             bytes: Arc::clone(&counters.snapshot),
+            calls: Arc::clone(&counters.calls),
         }),
         Arc::new(CountingSegments {
             root: release.join("data"),
             bytes: Arc::clone(&counters.segments),
+            calls: Arc::clone(&counters.calls),
         }),
         identity.root_key(),
         identity.public_key(),
@@ -329,12 +340,14 @@ fn xorshift(mut value: u64) -> u64 {
 struct Counters {
     snapshot: Arc<AtomicU64>,
     segments: Arc<AtomicU64>,
+    calls: Arc<AtomicU64>,
 }
 
 impl Counters {
     fn reset(&self) {
         self.snapshot.store(0, Ordering::Relaxed);
         self.segments.store(0, Ordering::Relaxed);
+        self.calls.store(0, Ordering::Relaxed);
     }
 
     fn total(&self) -> u64 {
@@ -345,6 +358,7 @@ impl Counters {
 struct CountingFile {
     inner: LocalFile,
     bytes: Arc<AtomicU64>,
+    calls: Arc<AtomicU64>,
 }
 
 impl PositionedFile for CountingFile {
@@ -356,6 +370,7 @@ impl PositionedFile for CountingFile {
         self.inner.read_exact_at(offset, destination)?;
         self.bytes
             .fetch_add(destination.len() as u64, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -363,6 +378,7 @@ impl PositionedFile for CountingFile {
 struct CountingSegments {
     root: PathBuf,
     bytes: Arc<AtomicU64>,
+    calls: Arc<AtomicU64>,
 }
 
 impl SegmentSource for CountingSegments {
@@ -374,6 +390,7 @@ impl SegmentSource for CountingSegments {
         Ok(Arc::new(CountingFile {
             inner: LocalFile::open(path)?,
             bytes: Arc::clone(&self.bytes),
+            calls: Arc::clone(&self.calls),
         }))
     }
 }

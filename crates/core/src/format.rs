@@ -1,4 +1,4 @@
-//! Normative Hakutaku v1 wire records.
+//! Normative Hakutaku v2 wire records.
 //!
 //! Every record is encoded explicitly. Rust struct layout and serde are never
 //! part of the format contract.
@@ -8,9 +8,9 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Encoded byte length of the fixed snapshot header.
-pub const SNAPSHOT_HEADER_SIZE: usize = 4096;
+pub const SNAPSHOT_HEADER_SIZE: usize = 256;
 /// Encoded byte length of the fixed segment header.
-pub const SEGMENT_HEADER_SIZE: usize = 4096;
+pub const SEGMENT_HEADER_SIZE: usize = 128;
 /// Encoded byte length of the catalog header.
 pub const CATALOG_HEADER_SIZE: usize = 64;
 /// Encoded byte length of one segment record.
@@ -18,7 +18,7 @@ pub const SEGMENT_RECORD_SIZE: usize = 96;
 /// Encoded byte length of one file record.
 pub const FILE_RECORD_SIZE: usize = 32;
 /// Encoded byte length of one path-index slot.
-pub const PATH_SLOT_SIZE: usize = 16;
+pub const PATH_SLOT_SIZE: usize = 8;
 /// Encoded byte length of one snapshot page descriptor.
 pub const PAGE_RECORD_SIZE: usize = 64;
 /// Encoded byte length of a map or reuse page header.
@@ -26,7 +26,7 @@ pub const PAGE_HEADER_SIZE: usize = 16;
 /// Encoded byte length of one block reference.
 pub const BLOCK_REF_SIZE: usize = 48;
 /// Encoded byte length of one reusable-chunk record.
-pub const REUSE_RECORD_SIZE: usize = 80;
+pub const REUSE_RECORD_SIZE: usize = 32;
 /// Maximum block references stored in one 16-KiB map page.
 pub const BLOCKS_PER_MAP_PAGE: usize = (16 * 1024 - PAGE_HEADER_SIZE) / BLOCK_REF_SIZE;
 /// Maximum reusable-chunk records stored in one 16-KiB page.
@@ -41,7 +41,7 @@ pub const MAX_PAGE_PLAIN_LEN: usize = 1024 * 1024;
 /// Maximum plaintext block size.
 pub const MAX_BLOCK_PLAIN_LEN: usize = 1024 * 1024;
 /// Maximum segments referenced by one snapshot.
-pub const MAX_SEGMENTS: usize = 128;
+pub const MAX_SEGMENTS: usize = u16::MAX as usize;
 /// Maximum files indexed by one snapshot.
 pub const MAX_FILES: usize = 1_000_000;
 /// Maximum content blocks indexed by one snapshot.
@@ -53,14 +53,14 @@ pub const MAX_PATH_POOL_LEN: usize = 32 * 1024 * 1024;
 /// Sentinel used by an unoccupied path-index slot.
 pub const EMPTY_PATH_SLOT: u32 = u32::MAX;
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"HAKU0001";
-const CATALOG_MAGIC: &[u8; 8] = b"HAKCAT01";
-const SEGMENT_MAGIC: &[u8; 8] = b"HAKSEG01";
-const MAP_PAGE_MAGIC: &[u8; 8] = b"HAKMAP01";
-const REUSE_PAGE_MAGIC: &[u8; 8] = b"HAKREU01";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"HAKU0002";
+const CATALOG_MAGIC: &[u8; 8] = b"HAKCAT02";
+const SEGMENT_MAGIC: &[u8; 8] = b"HAKSEG02";
+const MAP_PAGE_MAGIC: &[u8; 8] = b"HAKMAP02";
+const REUSE_PAGE_MAGIC: &[u8; 8] = b"HAKREU02";
 
 /// Current incompatible format generation.
-pub const FORMAT_MAJOR: u16 = 1;
+pub const FORMAT_MAJOR: u16 = 2;
 /// Current backwards-compatible format revision.
 pub const FORMAT_MINOR: u16 = 0;
 /// Byte offset of the snapshot's Ed25519 signature.
@@ -509,8 +509,8 @@ impl FileRecord {
 /// One open-addressed lookup slot in the keyed path index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathSlot {
-    /// Keyed 64-bit digest of a canonical path.
-    pub hash: u64,
+    /// Keyed 32-bit fingerprint of a canonical path; matches still compare full paths.
+    pub hash: u32,
     /// Catalog file index, or [`EMPTY_PATH_SLOT`].
     pub file_index: u32,
 }
@@ -518,10 +518,9 @@ pub struct PathSlot {
 impl PathSlot {
     fn parse(bytes: &[u8], offset: usize) -> Result<Self> {
         let record = checked_slice(bytes, offset, PATH_SLOT_SIZE)?;
-        require_zero(record, 12..16, "path slot reserved fields")?;
         Ok(Self {
-            hash: read_u64(record, 0)?,
-            file_index: read_u32(record, 8)?,
+            hash: read_u32(record, 0)?,
+            file_index: read_u32(record, 4)?,
         })
     }
 
@@ -529,8 +528,8 @@ impl PathSlot {
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let start = out.len();
         out.resize(start + PATH_SLOT_SIZE, 0);
-        put_u64(&mut out[start..], 0, self.hash);
-        put_u32(&mut out[start..], 8, self.file_index);
+        put_u32(&mut out[start..], 0, self.hash);
+        put_u32(&mut out[start..], 4, self.file_index);
     }
 }
 
@@ -668,27 +667,6 @@ pub struct ReuseRecord {
     pub chunk_id: [u8; 32],
     /// Existing encrypted block containing that chunk.
     pub block: BlockRef,
-}
-
-impl ReuseRecord {
-    /// Parses one reuse record at `offset`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for truncated or non-canonical input.
-    pub fn parse(bytes: &[u8], offset: usize) -> Result<Self> {
-        let record = checked_slice(bytes, offset, REUSE_RECORD_SIZE)?;
-        Ok(Self {
-            chunk_id: read_array(record, 0)?,
-            block: BlockRef::parse(record, 32)?,
-        })
-    }
-
-    /// Appends this record's canonical wire representation to `out`.
-    pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.chunk_id);
-        self.block.encode_into(out);
-    }
 }
 
 /// Publisher-side, owned representation of a complete catalog.
@@ -1097,12 +1075,12 @@ impl Catalog {
     pub fn find_file(&self, path: &str, path_key: &[u8; 32]) -> Result<Option<u32>> {
         validate_canonical_path(path)?;
         let digest = blake3::keyed_hash(path_key, path.as_bytes());
-        let mut hash_bytes = [0_u8; 8];
-        hash_bytes.copy_from_slice(&digest.as_bytes()[..8]);
-        let hash = u64::from_le_bytes(hash_bytes);
+        let mut hash_bytes = [0_u8; 4];
+        hash_bytes.copy_from_slice(&digest.as_bytes()[..4]);
+        let hash = u32::from_le_bytes(hash_bytes);
         let mask = self.path_slot_count - 1;
         for probe in 0..self.path_slot_count {
-            let slot = self.path_slot(hash.wrapping_add(u64::from(probe)) as u32 & mask)?;
+            let slot = self.path_slot(hash.wrapping_add(probe) & mask)?;
             if slot.file_index == EMPTY_PATH_SLOT {
                 return Ok(None);
             }
@@ -1183,7 +1161,7 @@ pub fn map_page_record(bytes: &[u8], index: usize) -> Result<BlockRef> {
 /// # Errors
 ///
 /// Returns an error when `records` is empty or exceeds one page.
-pub fn encode_reuse_page(first_record: u32, records: &[ReuseRecord]) -> Result<Vec<u8>> {
+pub fn encode_reuse_page(first_record: u32, records: &[[u8; 32]]) -> Result<Vec<u8>> {
     if records.is_empty() || records.len() > REUSE_PER_PAGE {
         return Err(Error::InvalidFormat("reuse page record count"));
     }
@@ -1193,7 +1171,7 @@ pub fn encode_reuse_page(first_record: u32, records: &[ReuseRecord]) -> Result<V
     put_u16(&mut out, 10, REUSE_RECORD_SIZE as u16);
     put_u32(&mut out, 12, first_record);
     for record in records {
-        record.encode_into(&mut out);
+        out.extend_from_slice(record);
     }
     Ok(out)
 }
@@ -1203,16 +1181,12 @@ pub fn encode_reuse_page(first_record: u32, records: &[ReuseRecord]) -> Result<V
 /// # Errors
 ///
 /// Returns an error for a malformed header, payload, or reuse record.
-pub fn parse_reuse_page(bytes: &[u8], expected_first: u32) -> Result<Vec<ReuseRecord>> {
-    let count = parse_page_header(bytes, REUSE_PAGE_MAGIC, REUSE_RECORD_SIZE, expected_first)?;
-    let mut records = Vec::with_capacity(count);
-    for index in 0..count {
-        records.push(ReuseRecord::parse(
-            bytes,
-            PAGE_HEADER_SIZE + index * REUSE_RECORD_SIZE,
-        )?);
-    }
-    Ok(records)
+pub fn parse_reuse_page(bytes: &[u8], expected_first: u32) -> Result<Vec<[u8; 32]>> {
+    parse_page_header(bytes, REUSE_PAGE_MAGIC, REUSE_RECORD_SIZE, expected_first)?;
+    Ok(bytes[PAGE_HEADER_SIZE..]
+        .as_chunks::<REUSE_RECORD_SIZE>()
+        .0
+        .to_vec())
 }
 
 /// Checks the platform-independent path rules used by package indexes.
@@ -1245,18 +1219,20 @@ pub fn validate_canonical_path(path: &str) -> Result<()> {
 
 fn is_windows_reserved_component(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component);
-    let upper = stem.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+    {
         return true;
     }
-    ["COM", "LPT"].into_iter().any(|prefix| {
-        upper.strip_prefix(prefix).is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
-    })
+    let Some((prefix, suffix)) = stem.split_at_checked(3) else {
+        return false;
+    };
+    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
 }
 
 fn parse_page_header(
@@ -1443,7 +1419,7 @@ mod tests {
         let path = b"a";
         let path_key = [9; 32];
         let digest = blake3::keyed_hash(&path_key, path);
-        let hash = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
+        let hash = u32::from_le_bytes(digest.as_bytes()[..4].try_into().unwrap());
         let mut slots = vec![
             PathSlot {
                 hash: 0,
@@ -1510,6 +1486,40 @@ mod tests {
     }
 
     #[test]
+    fn v1_headers_and_pages_are_rejected_without_compatibility_dispatch() {
+        let mut header = snapshot_header().encode(false);
+        header[..8].copy_from_slice(b"HAKU0001");
+        assert!(SnapshotHeader::parse(&header).is_err());
+        let mut map = encode_map_page(0, &[block()]).unwrap();
+        map[..8].copy_from_slice(b"HAKMAP01");
+        assert!(parse_map_page(&map, 0).is_err());
+        let mut reuse = encode_reuse_page(0, &[[9; 32]]).unwrap();
+        reuse[..8].copy_from_slice(b"HAKREU01");
+        assert!(parse_reuse_page(&reuse, 0).is_err());
+        let (data, _) = catalog_data();
+        let mut catalog = data.encode().unwrap();
+        catalog[..8].copy_from_slice(b"HAKCAT01");
+        assert!(Catalog::parse(catalog.into()).is_err());
+    }
+
+    #[test]
+    fn compact_path_fingerprint_match_still_requires_full_path_equality() {
+        let (mut data, key) = catalog_data();
+        let digest = blake3::keyed_hash(&key, b"missing");
+        let hash = u32::from_le_bytes(digest.as_bytes()[..4].try_into().unwrap());
+        data.path_slots.fill(PathSlot {
+            hash: 0,
+            file_index: EMPTY_PATH_SLOT,
+        });
+        data.path_slots[hash as usize & 1] = PathSlot {
+            hash,
+            file_index: 0,
+        };
+        let catalog = Catalog::parse(data.encode().unwrap().into()).unwrap();
+        assert_eq!(catalog.find_file("missing", &key).unwrap(), None);
+    }
+
+    #[test]
     fn block_ref_wire_size_is_exact() {
         let record = block();
         let mut bytes = Vec::new();
@@ -1520,7 +1530,18 @@ mod tests {
 
     #[test]
     fn paths_are_strictly_canonical() {
-        assert!(validate_canonical_path("video/opening.mp4").is_ok());
+        for valid in [
+            "video/opening.mp4",
+            "a/b",
+            "音声/会話.opus",
+            "éé.txt",
+            "COM0",
+            "LPT10",
+            "COM",
+            "company",
+        ] {
+            assert!(validate_canonical_path(valid).is_ok(), "{valid}");
+        }
         for invalid in [
             "",
             "/a",
@@ -1558,7 +1579,7 @@ mod tests {
         cases.push(vec![0; SNAPSHOT_HEADER_SIZE - 1]);
         for (offset, value) in [
             (0, 0),
-            (8, 2),
+            (8, 1),
             (12, 1),
             (40, 1),
             (48, 0),
@@ -1579,7 +1600,7 @@ mod tests {
         let segment = segment_header();
         assert_eq!(SegmentHeader::parse(&segment.encode()).unwrap(), segment);
         let mut cases = vec![vec![0; SEGMENT_HEADER_SIZE - 1]];
-        for (offset, value) in [(0, 0), (8, 2), (12, 1), (76, 1), (96, 1), (88, 0)] {
+        for (offset, value) in [(0, 0), (8, 1), (12, 1), (76, 1), (96, 1), (88, 0)] {
             let mut bytes = segment.encode().to_vec();
             bytes[offset] = value;
             cases.push(bytes);
@@ -1674,7 +1695,7 @@ mod tests {
         let mut bytes = Vec::new();
         slot.encode_into(&mut bytes);
         assert_eq!(PathSlot::parse(&bytes, 0).unwrap(), slot);
-        bytes[12] = 1;
+        bytes.pop();
         assert!(PathSlot::parse(&bytes, 0).is_err());
     }
 
@@ -1684,10 +1705,7 @@ mod tests {
         let map = encode_map_page(3, &[block]).unwrap();
         assert_eq!(parse_map_page(&map, 3).unwrap(), [block]);
         assert_eq!(map_page_record(&map, 0).unwrap(), block);
-        let reuse = ReuseRecord {
-            chunk_id: [8; 32],
-            block,
-        };
+        let reuse = [8; 32];
         let reuse_page = encode_reuse_page(4, &[reuse]).unwrap();
         assert_eq!(parse_reuse_page(&reuse_page, 4).unwrap(), [reuse]);
         assert!(encode_map_page(0, &[]).is_err());
@@ -1695,7 +1713,7 @@ mod tests {
         assert!(encode_map_page(0, &vec![block; BLOCKS_PER_MAP_PAGE + 1]).is_err());
         assert!(encode_reuse_page(0, &vec![reuse; REUSE_PER_PAGE + 1]).is_err());
         assert!(map_page_record(&map, usize::MAX).is_err());
-        let mutations = [(0, 0), (8, 2), (10, 0), (12, 0)];
+        let mutations = [(0, 0), (8, 1), (10, 0), (12, 0)];
         for (offset, value) in mutations {
             let mut bytes = map.clone();
             bytes[offset] = value;
@@ -1707,7 +1725,7 @@ mod tests {
         damaged_map[PAGE_HEADER_SIZE + 31] = 1;
         assert!(parse_map_page(&damaged_map, 3).is_err());
         let mut damaged_reuse = reuse_page.clone();
-        damaged_reuse[PAGE_HEADER_SIZE + 32 + 31] = 1;
+        damaged_reuse.pop();
         assert!(parse_reuse_page(&damaged_reuse, 4).is_err());
 
         let mut page_bytes = Vec::new();
@@ -1760,7 +1778,7 @@ mod tests {
 
         for (offset, value) in [
             (0, 0),
-            (8, 2),
+            (8, 1),
             (10, 0),
             (12, 0xff),
             (28, 0),
@@ -1773,6 +1791,10 @@ mod tests {
         }
         assert!(Catalog::parse(bytes[..CATALOG_HEADER_SIZE - 1].into()).is_err());
 
+        let mut uncovered_blocks = bytes.clone();
+        put_u32(&mut uncovered_blocks, 20, BLOCKS_PER_MAP_PAGE as u32 + 1);
+        assert!(Catalog::parse(uncovered_blocks.into()).is_err());
+
         let mut oversized_slots = bytes.clone();
         oversized_slots[28..32].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         assert!(Catalog::parse(oversized_slots.into()).is_err());
@@ -1783,14 +1805,14 @@ mod tests {
         let page_offset = slot_offset + 2 * PATH_SLOT_SIZE + 1;
         let occupied_slot = [slot_offset, slot_offset + PATH_SLOT_SIZE]
             .into_iter()
-            .find(|offset| bytes[offset + 8..offset + 12] != EMPTY_PATH_SLOT.to_le_bytes())
+            .find(|offset| bytes[offset + 4..offset + 8] != EMPTY_PATH_SLOT.to_le_bytes())
             .unwrap();
         for (offset, value) in [
             (20, 0xff),
             (segment_offset + 72, 0),
             (file_offset + 4, 0),
             (file_offset + 20, 2),
-            (occupied_slot + 8, 1),
+            (occupied_slot + 4, 1),
             (page_offset, PageKind::Reuse as u8),
             (page_offset + 20, 1),
             (page_offset + 8, 1),
@@ -1805,7 +1827,7 @@ mod tests {
             .find(|offset| *offset != occupied_slot)
             .unwrap();
         let mut full_index = bytes.clone();
-        full_index[empty_slot + 8..empty_slot + 12].copy_from_slice(&0_u32.to_le_bytes());
+        full_index[empty_slot + 4..empty_slot + 8].copy_from_slice(&0_u32.to_le_bytes());
         let full_index = Catalog::parse(full_index.into()).unwrap();
         assert!(full_index.find_file("missing", &path_key).is_err());
 

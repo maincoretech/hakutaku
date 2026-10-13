@@ -14,6 +14,7 @@ pub(crate) struct ClockCache<K> {
     hand: usize,
     entries: Vec<Option<Entry<K>>>,
     index: HashMap<K, usize>,
+    vacant: Vec<usize>,
 }
 
 impl<K: Clone + Eq + Hash> ClockCache<K> {
@@ -24,6 +25,7 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
             hand: 0,
             entries: Vec::new(),
             index: HashMap::new(),
+            vacant: Vec::new(),
         }
     }
 
@@ -38,21 +40,17 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         if self.budget == 0 || value.len() > self.budget || self.index.contains_key(&key) {
             return;
         }
-        let mut vacant = None;
         while self.used.saturating_add(value.len()) > self.budget {
             let Some(slot) = self.evict_one() else {
                 return;
             };
-            vacant = Some(slot);
+            self.vacant.push(slot);
         }
-        let slot = vacant.unwrap_or_else(|| {
-            self.entries
-                .iter()
-                .position(Option::is_none)
-                .unwrap_or_else(|| {
-                    self.entries.push(None);
-                    self.entries.len() - 1
-                })
+        // Keep every evicted slot: scanning occupied entries makes initial
+        // population quadratic for projects with many small Hot assets.
+        let slot = self.vacant.pop().unwrap_or_else(|| {
+            self.entries.push(None);
+            self.entries.len() - 1
         });
         self.used += value.len();
         self.index.insert(key.clone(), slot);
@@ -68,6 +66,7 @@ impl<K: Clone + Eq + Hash> ClockCache<K> {
         self.hand = 0;
         self.entries.clear();
         self.index.clear();
+        self.vacant.clear();
     }
 
     /// Evicts one live entry and returns its vacant slot. The bounded scan also
@@ -104,6 +103,25 @@ mod tests {
 
     fn bytes(len: usize, value: u8) -> Arc<Vec<u8>> {
         Arc::new(vec![value; len])
+    }
+
+    #[test]
+    fn mixed_block_sizes_reuse_all_evicted_slots() {
+        let mut cache = ClockCache::new(12);
+        for key in 0..3 {
+            cache.insert(key, bytes(4, key));
+        }
+        cache.insert(3, bytes(9, 3));
+        cache.insert(4, bytes(1, 4));
+        cache.insert(5, bytes(2, 5));
+        assert_eq!(cache.used, 12);
+        assert_eq!(cache.entries.len(), 3);
+        for (key, len) in [(3, 9), (4, 1), (5, 2)] {
+            assert_eq!(cache.get(&key).unwrap().as_slice(), vec![key; len]);
+        }
+        cache.clear();
+        cache.insert(6, bytes(12, 6));
+        assert_eq!(cache.get(&6).unwrap().len(), 12);
     }
 
     #[test]

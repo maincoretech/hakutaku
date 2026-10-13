@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const STREAM_BLOCK: usize = 256 * 1024;
+const AUDIO_BLOCK: usize = 64 * 1024;
 const SHORT_AUDIO_LIMIT: u64 = 1024 * 1024;
 pub(crate) const BULK_BLOCK: usize = 1024 * 1024;
 pub(crate) const HOT_FILE_LIMIT: u64 = 32 * 1024;
@@ -80,9 +81,13 @@ impl SourceFile {
         self.validate_open_file(&file)?;
         let mut magic = [0_u8; 8];
         let mut reader = &file;
-        let read = reader.read(&mut magic)?;
+        let is_key = match reader.read_exact(&mut magic) {
+            Ok(()) => is_hakutaku_key_magic(&magic),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => false,
+            Err(error) => return Err(error.into()),
+        };
         reader.seek(SeekFrom::Start(0))?;
-        if read == magic.len() && is_hakutaku_key_magic(&magic) {
+        if is_key {
             return Err(Error::InvalidInput(format!(
                 "Hakutaku key material cannot be packaged as a resource: {}",
                 self.host_path.display()
@@ -164,7 +169,7 @@ pub(crate) fn classify(source: &SourceFile) -> SourceClass {
         };
         return SourceClass {
             layout: LayoutKind::Fixed,
-            fixed_block_len: STREAM_BLOCK as u32,
+            fixed_block_len: if audio { AUDIO_BLOCK } else { STREAM_BLOCK } as u32,
             access,
             compression,
         };

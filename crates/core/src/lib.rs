@@ -6,7 +6,7 @@ mod cache;
 /// Cryptographic key derivation, authentication, and wire-domain helpers.
 pub mod crypto;
 mod error;
-/// Normative Hakutaku v1 wire-format records and codecs.
+/// Normative Hakutaku v2 wire-format records and codecs.
 pub mod format;
 /// Random-access file and immutable segment-source abstractions.
 pub mod io;

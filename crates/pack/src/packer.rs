@@ -18,9 +18,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const FASTCDC_MIN: u32 = 32 * 1024;
-const FASTCDC_AVG: u32 = 128 * 1024;
-const FASTCDC_MAX: u32 = 512 * 1024;
+const FASTCDC_MIN: usize = 32 * 1024;
+const FASTCDC_AVG: usize = 128 * 1024;
+const FASTCDC_MAX: usize = 512 * 1024;
 const COMPRESSION_SAVINGS: usize = 64;
 const DEFAULT_SEGMENT_TARGET: u64 = 512 * 1024 * 1024;
 const HOT_SEGMENT_TARGET: u64 = 64 * 1024 * 1024;
@@ -37,6 +37,9 @@ pub struct PackOptions {
     pub output_directory: PathBuf,
     /// Whether unchanged encrypted blocks may be reused from the previous release.
     pub incremental: bool,
+    /// Lowest sequence to publish. Use the prior release plus one when
+    /// rebuilding an incompatible package into a fresh output directory.
+    pub release_sequence_floor: u64,
     /// Trusts a local size/mtime/file-identity cache to skip unchanged source
     /// bodies. Intended only for development builds; final builds should leave
     /// this disabled to retain byte-for-byte source verification.
@@ -59,6 +62,7 @@ impl PackOptions {
             input_directory: input_directory.into(),
             output_directory: output_directory.into(),
             incremental: true,
+            release_sequence_floor: 1,
             development_cache: false,
             compression_level: 3,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET,
@@ -164,7 +168,9 @@ where
     });
 
     let snapshot_path = options.output_directory.join("game.haku");
-    let old_package = if options.incremental && snapshot_path.is_file() {
+    // Release ordering belongs to the authenticated snapshot, independently
+    // of whether a full rebuild reuses any of its encrypted blocks.
+    let old_package = if snapshot_path.is_file() {
         Some(Package::open_directory(
             &snapshot_path,
             &data_directory,
@@ -191,13 +197,17 @@ where
     } else {
         None
     };
-    let reuse = load_reuse_index(old_package.as_ref())?;
-    let release_sequence = old_package.as_ref().map_or(Ok(1), |package| {
-        package
-            .release_sequence()
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput("release sequence is exhausted".into()))
-    })?;
+    let reuse = load_reuse_index(old_package.as_ref().filter(|_| options.incremental))?;
+    let compacting = reuse.compacting;
+    let release_sequence = old_package
+        .as_ref()
+        .map_or(Ok(1), |package| {
+            package
+                .release_sequence()
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidInput("release sequence is exhausted".into()))
+        })?
+        .max(options.release_sequence_floor);
 
     let keys = ProjectKeys::new(identity.root_key(), identity.project_id());
     let mut compressor = zstd::bulk::Compressor::new(options.compression_level)?;
@@ -252,9 +262,12 @@ where
     }
     let source_fingerprint = *context.fingerprint.finalize().as_bytes();
 
-    if old_package
-        .as_ref()
-        .is_some_and(|old| old.source_fingerprint() == source_fingerprint)
+    if options.incremental
+        && !compacting
+        && old_package.as_ref().is_some_and(|old| {
+            old.source_fingerprint() == source_fingerprint
+                && old.release_sequence() >= options.release_sequence_floor
+        })
     {
         let old = old_package.as_ref().expect("checked above");
         let active_segments = old.segment_ids()?;
@@ -333,6 +346,7 @@ struct ReusableBlock {
 }
 
 struct ReuseIndex {
+    compacting: bool,
     blocks: HashMap<([u8; 32], Availability), ReusableBlock>,
     segments: Vec<SegmentRecord>,
 }
@@ -602,7 +616,9 @@ impl BuildContext<'_> {
             usize::try_from(source.len)
                 .map_err(|_| Error::InvalidInput("source file is too large".into()))?,
         );
-        file.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut file)
+            .take(source.len + 1)
+            .read_to_end(&mut bytes)?;
         validate_source_len(bytes.len() as u64, source)?;
         source.validate_open_file(&file)?;
         for chunk in fastcdc::v2020::FastCDC::new(&bytes, FASTCDC_MIN, FASTCDC_AVG, FASTCDC_MAX) {
@@ -1192,6 +1208,7 @@ impl Drop for NewSegment {
 fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
     let Some(old) = old else {
         return Ok(ReuseIndex {
+            compacting: false,
             blocks: HashMap::new(),
             segments: Vec::new(),
         });
@@ -1206,8 +1223,13 @@ fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
             old.segment_record(ordinal).map_err(Error::from)
         })
         .collect::<Result<Vec<_>>>()?;
+    let records = old.reuse_records()?;
+    let compact = compaction_segments(&segments, &records)?;
     let mut blocks = HashMap::new();
-    for reuse in old.reuse_records()? {
+    for reuse in records {
+        if compact.contains(&reuse.block.segment_ordinal) {
+            continue;
+        }
         let segment = segments
             .get(reuse.block.segment_ordinal as usize)
             .ok_or_else(|| Error::InvalidInput("reuse segment ordinal".into()))?;
@@ -1218,7 +1240,68 @@ fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
                 segment_ordinal: reuse.block.segment_ordinal,
             });
     }
-    Ok(ReuseIndex { blocks, segments })
+    Ok(ReuseIndex {
+        compacting: !compact.is_empty(),
+        blocks,
+        segments,
+    })
+}
+
+// Consolidate tiny patch fragments or mostly dead segments. The budget counts
+// unique live plaintext, so compressed segments cannot trigger an unbounded
+// automatic rewrite. Strict builds already read source; development-cache
+// entries referencing excluded chunks fall back to verified source reads.
+fn compaction_segments(
+    segments: &[SegmentRecord],
+    records: &[ReuseRecord],
+) -> Result<HashSet<u16>> {
+    const SMALL: u64 = 64 * 1024;
+    const MIN_FRAGMENTS: usize = 64;
+    const REWRITE_BUDGET: u64 = 64 * 1024 * 1024;
+    let mut stored = vec![0_u64; segments.len()];
+    let mut plain = vec![0_u64; segments.len()];
+    let mut seen = HashSet::new();
+    for reuse in records {
+        let block = &reuse.block;
+        let index = usize::from(block.segment_ordinal);
+        if index >= segments.len() {
+            return Err(Error::InvalidInput("reuse segment ordinal".into()));
+        }
+        if seen.insert((block.segment_ordinal, block.segment_block_ordinal)) {
+            stored[index] += u64::from(block.stored_len);
+            plain[index] += u64::from(block.plain_len);
+        }
+    }
+    let fragmented = segments
+        .iter()
+        .filter(|segment| segment.file_len <= SMALL)
+        .count()
+        >= MIN_FRAGMENTS;
+    let mut candidates = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let dead = segment
+            .payload_len
+            .checked_sub(stored[index])
+            .ok_or_else(|| Error::InvalidInput("referenced bytes exceed segment payload".into()))?;
+        if (fragmented && segment.file_len <= SMALL)
+            || (dead >= 1024 * 1024 && stored[index] <= segment.payload_len / 2)
+        {
+            candidates.push(index);
+        }
+    }
+    candidates.sort_unstable_by_key(|&index| (plain[index], index));
+    let mut remaining = REWRITE_BUDGET;
+    let mut selected = HashSet::new();
+    for index in candidates {
+        if plain[index] <= remaining {
+            remaining -= plain[index];
+            selected.insert(
+                u16::try_from(index)
+                    .map_err(|_| Error::InvalidInput("compaction segment ordinal".into()))?,
+            );
+        }
+    }
+    Ok(selected)
 }
 
 struct EncryptedPages {
@@ -1268,19 +1351,7 @@ fn build_pages(
     for (page_index, chunk_page) in chunk_ids.chunks(REUSE_PER_PAGE).enumerate() {
         let first = u32::try_from(page_index * REUSE_PER_PAGE)
             .map_err(|_| Error::InvalidInput("reuse page index".into()))?;
-        let block_start = page_index
-            .checked_mul(REUSE_PER_PAGE)
-            .ok_or_else(|| Error::InvalidInput("reuse page index".into()))?;
-        let block_page = block_refs
-            .get(block_start..block_start + chunk_page.len())
-            .ok_or_else(|| Error::InvalidInput("reuse page block range".into()))?;
-        let records = chunk_page
-            .iter()
-            .copied()
-            .zip(block_page.iter().copied())
-            .map(|(chunk_id, block)| ReuseRecord { chunk_id, block })
-            .collect::<Vec<_>>();
-        let plaintext = encode_reuse_page(first, &records)?;
+        let plaintext = encode_reuse_page(first, chunk_page)?;
         encrypt_page(
             project_id,
             release_sequence,
@@ -1379,10 +1450,10 @@ fn build_path_slots(
     let mask = slot_count - 1;
     for (file_index, path) in paths.iter().enumerate() {
         let digest = blake3::keyed_hash(path_key, path.as_bytes());
-        let hash = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("fixed prefix"));
+        let hash = u32::from_le_bytes(digest.as_bytes()[..4].try_into().expect("fixed prefix"));
         let mut inserted = false;
         for probe in 0..slot_count {
-            let slot = hash.wrapping_add(probe as u64) as usize & mask;
+            let slot = hash.wrapping_add(probe as u32) as usize & mask;
             if slots[slot].file_index == EMPTY_PATH_SLOT {
                 slots[slot] = PathSlot {
                     hash,
@@ -1512,8 +1583,8 @@ fn verify_staged_release(
         let mut source_file = source.open_verified()?;
         let mut asset = package.asset(&source.logical_path)?.cursor();
         loop {
-            let expected_len = source_file.read(&mut expected)?;
-            let actual_len = asset.read(&mut actual)?;
+            let expected_len = read_chunk(&mut source_file, &mut expected)?;
+            let actual_len = read_chunk(&mut asset, &mut actual)?;
             if expected_len != actual_len || expected[..expected_len] != actual[..actual_len] {
                 return Err(Error::InvalidInput(format!(
                     "verification mismatch: {}",
@@ -1593,29 +1664,7 @@ fn validate_build_cache_record_count(files: usize, records: usize) -> Result<()>
 
 fn commit_snapshot(target: &Path) -> Result<()> {
     let temporary = target.with_extension(format!("haku.part-{}", std::process::id()));
-    #[cfg(unix)]
-    {
-        std::fs::rename(temporary, target)?;
-    }
-    #[cfg(windows)]
-    {
-        let previous = target.with_extension("haku.previous");
-        if target.exists() {
-            if previous.exists() {
-                std::fs::remove_file(&previous)?;
-            }
-            std::fs::rename(target, &previous)?;
-        }
-        if let Err(error) = std::fs::rename(&temporary, target) {
-            if previous.exists() {
-                let _ = std::fs::rename(&previous, target);
-            }
-            return Err(Error::Io(error));
-        }
-        if previous.exists() {
-            std::fs::remove_file(previous)?;
-        }
-    }
+    std::fs::rename(temporary, target)?;
     if let Some(parent) = target.parent() {
         sync_directory(parent)?;
     }
@@ -1696,7 +1745,7 @@ fn cleanup_unreferenced_segments(data_directory: &Path, active: &[SegmentId]) ->
 /// Persist directory-entry changes on Unix. Each file is synchronized before
 /// it is renamed; synchronizing the containing directory closes the remaining
 /// crash window between a durable file and its durable name. Windows keeps the
-/// same verified rename/recovery protocol without adding a platform crate to
+/// same verified atomic replacement protocol without adding a platform crate to
 /// the publisher-only dependency graph.
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -1707,6 +1756,11 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn validate_options(options: &PackOptions) -> Result<()> {
+    if options.release_sequence_floor == 0 {
+        return Err(Error::InvalidInput(
+            "release sequence floor must be positive".into(),
+        ));
+    }
     if !options.input_directory.is_dir() {
         return Err(Error::InvalidInput(format!(
             "input is not a directory: {}",
@@ -2486,6 +2540,70 @@ mod tests {
             .is_err()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consolidation_budget_counts_unique_plaintext_and_rejects_bad_references() {
+        let segment = |index| SegmentRecord {
+            id: SegmentId([index; 32]),
+            uid: [index; 16],
+            salt: [0; 16],
+            nonce_prefix: [0; 8],
+            file_len: 100 * 1024 * 1024 + SEGMENT_HEADER_SIZE as u64,
+            payload_len: 100 * 1024 * 1024,
+            block_count: 100,
+            availability: Availability::Required,
+        };
+        let segments = vec![segment(0), segment(1)];
+        let mut records = Vec::new();
+        for segment_ordinal in 0..2 {
+            for ordinal in 0..50 {
+                records.push(ReuseRecord {
+                    chunk_id: [ordinal as u8; 32],
+                    block: BlockRef {
+                        logical_offset: u64::from(ordinal) * 1024 * 1024,
+                        segment_ordinal,
+                        segment_block_ordinal: ordinal,
+                        physical_offset: SEGMENT_HEADER_SIZE as u64
+                            + u64::from(ordinal) * 1024 * 1024,
+                        stored_len: 1024 * 1024,
+                        plain_len: 1024 * 1024,
+                        codec: Codec::Raw,
+                        cipher_digest: [0; 16],
+                    },
+                });
+            }
+        }
+        assert_eq!(
+            compaction_segments(&segments, &records).unwrap(),
+            HashSet::from([0])
+        );
+        let original = records.clone();
+        records.extend_from_slice(&original);
+        assert_eq!(
+            compaction_segments(&segments, &records).unwrap(),
+            HashSet::from([0])
+        );
+        // A small compressed payload still costs 80 MiB to reconstruct.
+        let mut compressed = records[..50].to_vec();
+        for ordinal in 50..80 {
+            let mut record = compressed[0];
+            record.block.segment_block_ordinal = ordinal;
+            compressed.push(record);
+        }
+        for record in &mut compressed {
+            record.block.stored_len = 128;
+        }
+        assert!(
+            compaction_segments(&segments[..1], &compressed)
+                .unwrap()
+                .is_empty()
+        );
+        records[0].block.segment_ordinal = 2;
+        assert!(compaction_segments(&segments, &records).is_err());
+        let mut invalid = segments;
+        invalid[0].payload_len = 0;
+        assert!(compaction_segments(&invalid, &original).is_err());
     }
 
     #[test]

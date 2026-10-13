@@ -104,6 +104,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dedup.new_blocks,
         dedup.reused_blocks,
     );
+    if std::env::var_os("HAKUTAKU_HOT_BENCH").as_deref() == Some("1".as_ref()) {
+        hot_cache_population(&fixture.path)?;
+    }
+    Ok(())
+}
+
+fn hot_cache_population(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for count in [10_000_u64, 50_000] {
+        let input = root.join(format!("hot-{count}-input"));
+        let release = root.join(format!("hot-{count}-release"));
+        std::fs::create_dir(&input)?;
+        for index in 0..count {
+            let mut bytes = [0_u8; 128];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            std::fs::write(input.join(format!("{index:05}.bin")), bytes)?;
+        }
+        let identity = Identity::generate()?;
+        pack_directory(&PackOptions::new(&input, &release), &identity)?;
+        let package = Package::open_directory(
+            release.join("game.haku"),
+            release.join("data"),
+            identity.root_key(),
+            identity.public_key(),
+            ResourceBudget::default(),
+            OpenPolicy::TrustFirstRelease,
+        )?;
+        let assets = (0..count)
+            .map(|index| package.asset(&format!("{index:05}.bin")))
+            .collect::<Result<Vec<_>, _>>()?;
+        for pass in 0..3 {
+            package.trim();
+            let started = Instant::now();
+            for (index, asset) in assets.iter().enumerate() {
+                let bytes = asset.read()?;
+                assert_eq!(u64::from_le_bytes(bytes[..8].try_into()?), index as u64);
+                std::hint::black_box(bytes);
+            }
+            println!(
+                "hot_cache_assets={count} pass={pass} populate_ms={:.3}",
+                milliseconds(started.elapsed())
+            );
+        }
+    }
     Ok(())
 }
 
