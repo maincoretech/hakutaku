@@ -155,9 +155,9 @@ mod tests {
     #[test]
     fn local_and_directory_sources_preserve_positioned_io_semantics() {
         let root = std::env::temp_dir().join(format!(
-            "hakutaku-io-{}-{}",
+            "hakutaku-io-{}-{:?}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

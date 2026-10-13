@@ -204,9 +204,9 @@ struct Fixture {
 impl Fixture {
     fn new() -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!(
-            "hakutaku-bench-{}-{}",
+            "hakutaku-bench-{}-{:?}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("runtime")
+            std::thread::current().id()
         ));
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {}
