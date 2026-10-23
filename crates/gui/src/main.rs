@@ -4,7 +4,7 @@ use eframe::egui::{self, Align, Color32, RichText};
 use hakutaku_core::{Availability, OpenPolicy, Package, ResourceBudget, SegmentInfo};
 use hakutaku_pack::{
     AssetChange, Identity, PackOptions, PackProgress, PackReport, ReleasePlan, RuntimeKeyMaterial,
-    is_hakutaku_key_file, pack_directory_with_progress, plan_directory, plan_directory_after_pack,
+    is_hakutaku_key_file, pack_directory_with_plan, plan_directory,
 };
 use icons::Icon;
 use std::collections::HashSet;
@@ -379,7 +379,9 @@ impl App {
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
         self.resources.clear_plan();
-        self.begin_work("Checking source changes…");
+        if !self.begin_work("Checking source changes…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
@@ -410,13 +412,15 @@ impl App {
         };
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
-        self.begin_work("Starting release build…");
+        if !self.begin_work("Starting release build…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = (|| {
                 let identity = Identity::load(&identity_path).map_err(|error| error.to_string())?;
                 let mut last_update = Instant::now();
                 let mut last_phase = "";
-                let report = pack_directory_with_progress(&options, &identity, |progress| {
+                let (report, plan) = pack_directory_with_plan(&options, &identity, |progress| {
                     if progress.phase != last_phase
                         || last_update.elapsed() >= Duration::from_millis(100)
                     {
@@ -429,8 +433,6 @@ impl App {
                 let keys = identity
                     .runtime_key_material()
                     .map_err(|error| error.to_string())?;
-                let plan = plan_directory_after_pack(&options, &keys)
-                    .map_err(|error| error.to_string())?;
                 let summary = inspect_release(&options.output_directory, &keys, false)?;
                 Ok((report, plan, summary))
             })();
@@ -442,7 +444,9 @@ impl App {
         let release = PathBuf::from(&self.workspace.release);
         let identity_path = self.workspace.identity.clone();
         let sender = self.sender.clone();
-        self.begin_work("Verifying release…");
+        if !self.begin_work("Verifying release…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = Identity::load(identity_path)
                 .map_err(|error| error.to_string())
@@ -459,7 +463,9 @@ impl App {
     fn start_identity_load(&mut self) {
         let path = PathBuf::from(&self.workspace.identity);
         let sender = self.sender.clone();
-        self.begin_work("Loading publisher identity…");
+        if !self.begin_work("Loading publisher identity…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = identity_info(&path);
             let _ = sender.send(Message::IdentityLoaded(result));
@@ -468,7 +474,9 @@ impl App {
 
     fn start_identity_create(&mut self, path: PathBuf) {
         let sender = self.sender.clone();
-        self.begin_work("Creating publisher identity…");
+        if !self.begin_work("Creating publisher identity…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = Identity::generate()
                 .and_then(|identity| identity.save(&path))
@@ -481,7 +489,9 @@ impl App {
     fn start_identity_backup(&mut self, target: PathBuf) {
         let source = PathBuf::from(&self.workspace.identity);
         let sender = self.sender.clone();
-        self.begin_work("Backing up publisher identity…");
+        if !self.begin_work("Backing up publisher identity…") {
+            return;
+        }
         self.spawn_worker(move || {
             let display = target.display().to_string();
             let result = copy_new_file(&source, &target, true).map(|()| display);
@@ -492,7 +502,9 @@ impl App {
     fn start_import(&mut self, sources: Vec<PathBuf>) {
         let directory = PathBuf::from(&self.workspace.assets);
         let sender = self.sender.clone();
-        self.begin_work("Importing resources…");
+        if !self.begin_work("Importing resources…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = import_resources(&sources, &directory);
             let _ = sender.send(Message::Imported(result));
@@ -501,7 +513,9 @@ impl App {
 
     fn start_replace(&mut self, replacement: Replacement) {
         let sender = self.sender.clone();
-        self.begin_work("Replacing resource…");
+        if !self.begin_work("Replacing resource…") {
+            return;
+        }
         self.spawn_worker(move || {
             let result = replace_file(&replacement.source, &replacement.target)
                 .map(|()| replacement.logical_path);
@@ -519,10 +533,15 @@ impl App {
         }
     }
 
-    fn begin_work(&mut self, status: &str) {
+    fn begin_work(&mut self, status: &str) -> bool {
+        if self.busy {
+            return false;
+        }
         self.busy = true;
+        self.resources.pending_replace = None;
         self.status = status.into();
         self.started = Some(Instant::now());
+        true
     }
 
     fn finish_work(&mut self) {
@@ -767,7 +786,7 @@ impl App {
                 .add_sized(
                     [ui.available_width(), 22.0],
                     egui::TextEdit::singleline(&mut self.workspace.deferred_prefixes)
-                        .hint_text("voice/, bonus/"),
+                        .hint_text("voice, bonus"),
                 )
                 .changed();
         });
@@ -1006,7 +1025,10 @@ impl App {
                     if ui.button("Cancel").clicked() {
                         self.resources.pending_replace = None;
                     }
-                    if ui.button("Replace").clicked() {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Replace"))
+                        .clicked()
+                    {
                         self.resources.pending_replace = None;
                         self.start_replace(replacement);
                     }
@@ -1258,9 +1280,7 @@ fn inspect_release(
         return Err(hakutaku_core::Error::ProjectMismatch.to_string());
     }
     if verify {
-        package
-            .verify_segments()
-            .map_err(|error| error.to_string())?;
+        package.verify().map_err(|error| error.to_string())?;
     }
     Ok(ReleaseSummary {
         sequence: package.release_sequence(),
@@ -1488,6 +1508,27 @@ mod tests {
         assert!(app.resources.pending_replace.is_none());
         assert!(app.release.summary.is_none());
         assert!(app.identity_info.is_none());
+    }
+
+    #[test]
+    fn background_work_rejects_reentry_and_cancels_stale_confirmation() {
+        let mut app = App::new();
+        let replacement = Replacement {
+            source: "must-not-open".into(),
+            target: "must-not-write".into(),
+            logical_path: "a".into(),
+        };
+        app.resources.pending_replace = Some(replacement.clone());
+        assert!(app.begin_work("Building"));
+        assert!(app.resources.pending_replace.is_none());
+        let started = app.started;
+        app.start_replace(replacement);
+        assert_eq!(app.status, "Building");
+        assert_eq!(app.started, started);
+        assert!(app.receiver.try_recv().is_err());
+        assert!(!app.begin_work("Second worker"));
+        app.finish_work();
+        assert!(app.begin_work("Next task"));
     }
 
     #[test]

@@ -77,6 +77,88 @@ fn full_incremental_and_unchanged_roundtrip() {
 }
 
 #[test]
+fn full_verification_rejects_corrupt_map_and_reuse_pages() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("a.txt"), b"hello").unwrap();
+    let identity = Identity::generate().unwrap();
+    pack_directory(&PackOptions::new(&input, &output), &identity).unwrap();
+    let snapshot = output.join("game.haku");
+    let original = std::fs::read(&snapshot).unwrap();
+    let header = SnapshotHeader::parse(&original).unwrap();
+    for offset in [header.page_region_offset as usize, original.len() - 1] {
+        let mut corrupt = original.clone();
+        corrupt[offset] ^= 1;
+        std::fs::write(&snapshot, corrupt).unwrap();
+        let package = Package::open_directory(
+            &snapshot,
+            output.join("data"),
+            identity.root_key(),
+            identity.public_key(),
+            ResourceBudget::default(),
+            OpenPolicy::TrustFirstRelease,
+        )
+        .unwrap();
+        package.verify_segments().unwrap();
+        assert!(package.verify().is_err());
+    }
+    std::fs::write(&snapshot, original).unwrap();
+    Package::open_directory(
+        &snapshot,
+        output.join("data"),
+        identity.root_key(),
+        identity.public_key(),
+        ResourceBudget::default(),
+        OpenPolicy::TrustFirstRelease,
+    )
+    .unwrap()
+    .verify()
+    .unwrap();
+}
+
+#[test]
+fn unchanged_strict_build_rechecks_payloads_and_sources() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir(&input).unwrap();
+    let path = input.join("a.txt");
+    std::fs::write(&path, b"hello").unwrap();
+    let identity = Identity::generate().unwrap();
+    let options = PackOptions::new(&input, &output);
+    pack_directory(&options, &identity).unwrap();
+    let snapshot = std::fs::read(output.join("game.haku")).unwrap();
+    let segment = std::fs::read_dir(output.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = std::fs::read(&segment).unwrap();
+    std::fs::remove_file(&segment).unwrap();
+    assert!(pack_directory(&options, &identity).is_err());
+    let mut corrupt = original.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&segment, corrupt).unwrap();
+    assert!(pack_directory(&options, &identity).is_err());
+    std::fs::write(&segment, original).unwrap();
+    assert!(!pack_directory(&options, &identity).unwrap().changed);
+    let result = hakutaku_pack::pack_directory_with_progress(&options, &identity, |progress| {
+        if progress.phase == "Verifying" {
+            std::fs::write(&path, b"world").unwrap();
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(output.join("game.haku")).unwrap(), snapshot);
+    let mut invalid = options;
+    invalid.incremental = false;
+    invalid.development_cache = true;
+    assert!(pack_directory(&invalid, &identity).is_err());
+}
+
+#[test]
 fn failed_cross_block_reads_preserve_cursor_position() {
     let scratch = Scratch::new();
     let input = scratch.0.join("input");
@@ -126,6 +208,46 @@ fn failed_cross_block_reads_preserve_cursor_position() {
     assert!(cursor.read(&mut bytes).is_err());
     assert_eq!(cursor.position(), 256 * 1024);
     assert!(asset.read_session().read_at(0, &mut bytes).is_err());
+}
+
+#[test]
+fn returned_build_plan_matches_committed_inventory_in_every_mode() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("input");
+    let output = scratch.0.join("release");
+    std::fs::create_dir_all(input.join("voice")).unwrap();
+    std::fs::write(input.join("voice/a.opus"), b"short voice").unwrap();
+    std::fs::write(input.join("script.json"), b"{}").unwrap();
+    std::fs::write(input.join("empty"), []).unwrap();
+    let identity = Identity::generate().unwrap();
+    let keys = identity.runtime_key_material().unwrap();
+    let mut options = PackOptions::new(&input, &output);
+    options.deferred_prefixes.push("voice".into());
+    for (incremental, cached) in [
+        (true, false),
+        (true, false),
+        (true, true),
+        (true, true),
+        (false, false),
+    ] {
+        options.incremental = incremental;
+        options.development_cache = cached;
+        let (report, plan) =
+            hakutaku_pack::pack_directory_with_plan(&options, &identity, |_| {}).unwrap();
+        assert_eq!(plan.previous_release, Some(report.release_sequence));
+        assert_eq!(
+            plan,
+            hakutaku_pack::plan_directory_after_pack(&options, &keys).unwrap()
+        );
+    }
+    std::fs::remove_file(input.join("empty")).unwrap();
+    std::fs::write(input.join("script.json"), b"changed").unwrap();
+    let (_, plan) = hakutaku_pack::pack_directory_with_plan(&options, &identity, |_| {}).unwrap();
+    assert_eq!(plan.assets.len(), 2);
+    assert_eq!(
+        plan,
+        hakutaku_pack::plan_directory_after_pack(&options, &keys).unwrap()
+    );
 }
 
 #[test]
@@ -496,6 +618,9 @@ fn deferred_segments_are_isolated_and_can_arrive_after_snapshot_open() {
         package.asset("dlc/movie.mp4").unwrap().read(),
         Err(CoreError::SegmentUnavailable(id)) if id == deferred.id
     ));
+    assert!(
+        matches!(package.verify(), Err(CoreError::SegmentUnavailable(id)) if id == deferred.id)
+    );
 }
 
 #[test]
@@ -660,7 +785,7 @@ fn assert_release_matches(input: &Path, output: &Path, identity: &Identity) {
     assert_eq!(package.project_id(), identity.project_id());
     assert!(package.release_sequence() > 0);
     assert_ne!(package.source_fingerprint(), [0; 32]);
-    package.verify_segments().unwrap();
+    package.verify().unwrap();
     assert!(package.contains_asset("empty.txt").unwrap());
     assert!(!package.contains_asset("missing.txt").unwrap());
     assert!(matches!(

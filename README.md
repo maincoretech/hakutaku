@@ -25,8 +25,9 @@ catalogs, pages, and blocks, Ed25519 for publisher identity, and BLAKE3 for
 content addresses and signed commitments. It does not contain an algorithm
 identifier or compatibility branch.
 
-This directory is an independent Cargo workspace so it can be moved into its
-own repository without inheriting Kēne's dependency graph.
+Hakutaku is an independent Cargo workspace and repository. It has no dependency
+on Kēne, Bevy or an engine UI. Kēne pins Core/Pack by immutable Git revision;
+updating this repository alone does not update the engine dependency.
 
 ## Quick start
 
@@ -145,13 +146,13 @@ Full builds preserve and advance the authenticated release sequence even when
 rebuilding unchanged source or recovering missing old segments. An existing
 snapshot must authenticate; `--full` does not reset the launcher's rollback floor.
 
-Hakutaku 0.2.0 reads and writes **v2 only**. Existing v1 packages require a full
+Hakutaku 0.2.1 reads and writes **v2 only**. Existing v1 packages require a full
 source repack into a fresh directory using the same identity; pass
 `--release-sequence-floor N` above the last published sequence. Deploy the new
 runtime with its matching package. There is no legacy format fallback.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the implemented byte layout and
-[performance evidence](docs/PERFORMANCE.md#next-format-design-evidence) for the
+[performance evidence](docs/PERFORMANCE.md#v2-design-prototypes) for the
 measured design choices. The compact catalog uses 8-byte path slots and 32-byte
 positional chunk IDs; headers are 256/128 bytes. Audio uses 64 KiB blocks,
 video retains 256 KiB, and image CDC remains unchanged. Bounded publisher
@@ -221,57 +222,23 @@ release 42 to 43 with 199 reused blocks and one new block; verification succeeds
 Full mode disables the development cache and keeps strict validation. Its ad-hoc
 signature verifies. This covers the local debug app; release artifacts and
 Windows/Linux GUI acceptance remain separate.
-Publishing a portable Git dependency and remote release/CI remain separate.
+The v0.2.0 release is published from `f1aeff80b9076b56b6ef835bf51980f19c041af9`;
+[CI & Builds](https://github.com/maincoretech/hakutaku/actions/runs/38443445224)
+completed successfully. Downloaded release artifacts and Windows/Linux GUI
+interaction still require their own acceptance; neither is implied by CI or the debug-app checks.
 
-## Quality-review baseline (before v2)
+## Documentation ownership
 
-The workspace review covers every crate, with runtime and publisher paths as
-the priority. Scope coverage is not a claim of exhaustive proof.
+- [FORMAT](docs/FORMAT.md): normative v2 byte layout, verification and replacement rules.
+- [SECURITY](docs/SECURITY.md): identity/key handling, trust and platform boundaries.
+- [PERFORMANCE](docs/PERFORMANCE.md): current I/O/cache policy, historical v1 evidence, v2 design prototypes and integrated v2 measurements.
+- Public rustdoc: library API contract; CLI `--help`: accepted command options.
+- [CI workflow](.github/workflows/ci.yml): current quality, stress, coverage, target-build and publication gates.
 
-| Module | Reviewed paths and resulting changes |
-|---|---|
-| Core | Authenticated format/crypto, positional I/O, pages, segments, budgets, prefetch and cursors; remove quadratic cache insertion and path-validation allocation; share cursor/session block loading and preserve cursor position on read errors |
-| Pack | Source inventory/classification, identities, planning, chunking, dedup, cache parsing, staging, recovery and commit; bound reads and allocations before parsing, handle short reads correctly, use standard file replacement, preserve monotonic release ordering during full reconstruction |
-| CLI | Argument/error paths, identity/runtime-key separation, package open, verification and confined extraction; retain the existing public command contract |
-| GUI | Worker lifecycle, progress, resource filtering/selection, import/replace, release and identity flows; use egui visible-row rendering, cache filtering, throttle progress, handle worker creation failures, and scroll long release/identity pages |
-| Dependencies/CI | Rust/MSRV, direct dependencies, feature graph, coverage, native/mobile build jobs and release gates; pin Rust 1.99.0 and lock resolution, add native platform tests |
-
-Direct dependencies now use eframe 0.36.2, rfd 0.17.2, zstd 0.14.2 and
-FastCDC 5.0.0; the lockfile also advances BLAKE3 to 1.8.7 and zeroize to 1.9.1.
-The redundant direct egui dependency is removed in favor of eframe's re-export.
-No new direct crate or runtime framework is introduced. FastCDC keeps the same
-32/128/512 KiB parameters; its updated API uses `usize`. The native zstd version
-remains 1.5.7. See the [FastCDC changelog](https://docs.rs/crate/fastcdc/5.0.0/source/CHANGELOG.md)
-and [eframe release](https://github.com/emilk/egui/releases/tag/0.36.2).
-
-On Apple Silicon macOS with Rust 1.99.0, fmt, all-target/all-feature check and
-Clippy, documentation, and 76 workspace tests pass, including the later
-full-rebuild sequence regression. Before that follow-up, measured line coverage
-was 97.59% for Core/Pack, 53.29% for CLI, and 100% for the wire-format parser;
-coverage was not remeasured after the sequence fix. Existing coverage thresholds
-are unchanged. Actionlint passes with its optional
-shellcheck/pyflakes integrations disabled.
-
-The dependency review, before the sequence follow-up, verified that old and
-new dependency builds read each other's v1 packages byte-for-byte;
-new strict and development-cache incremental builds preserve an unchanged old
-snapshot and its segments. The fixture covers compressed text, raw video,
-empty files and deterministic random data with an odd tail. New full and
-incremental packages also pass the old dependency build's verifier/extractor.
-These two CLI builds both contain this review's reader fixes; the comparison
-isolates dependency compatibility. A separate archive of Kēne `6635d1f`, patched
-only to consume this local Core/Pack, passes all 196 Loader tests. Kēne's live
-checkout and dependency pins were unchanged during that baseline review.
-
-Native macOS acceptance directly exercised scanning 305 temporary assets,
-scrolling and filtering the resource list, incremental build, unchanged rebuild,
-verification and scrolling the complete release report. The local debug app's
-ad-hoc signature also verifies. This is not acceptance of a release artifact:
-remote CI, Windows/Linux GUI operation and mobile targets still need their
-own builds/runs. Dependency-policy boundaries are recorded in
-[SECURITY.md](docs/SECURITY.md#dependency-review-boundary), and measured results
-in [PERFORMANCE.md](docs/PERFORMANCE.md#bounded-cache-population).
-Raw local evidence is under the ignored `target/quality-review/` directory.
+The pre-v2 review remains available in the
+[versioned README](https://github.com/maincoretech/hakutaku/blob/f1aeff80b9076b56b6ef835bf51980f19c041af9/README.md#quality-review-baseline-before-v2)
+and ignored `target/quality-review/` evidence. Those v1 compatibility results do
+not establish v1/v2 wire compatibility; v2 explicitly rejects v1 packages.
 
 ## License
 

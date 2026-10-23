@@ -141,8 +141,54 @@ pub fn pack_directory(options: &PackOptions, identity: &Identity) -> Result<Pack
 pub fn pack_directory_with_progress<F>(
     options: &PackOptions,
     identity: &Identity,
-    mut progress: F,
+    progress: F,
 ) -> Result<PackReport>
+where
+    F: FnMut(PackProgress),
+{
+    pack_directory_inner(options, identity, progress).map(|(report, _)| report)
+}
+
+/// Builds a release and returns its committed inventory without rescanning
+/// source files. The plan describes the build's source snapshot, not edits made
+/// after it. Development-cache builds retain their metadata-trust policy.
+///
+/// # Errors
+///
+/// Returns the same build/validation errors as [`pack_directory_with_progress`].
+pub fn pack_directory_with_plan<F>(
+    options: &PackOptions,
+    identity: &Identity,
+    progress: F,
+) -> Result<(PackReport, crate::ReleasePlan)>
+where
+    F: FnMut(PackProgress),
+{
+    let (report, files) = pack_directory_inner(options, identity, progress)?;
+    let mut plan = crate::ReleasePlan {
+        previous_release: Some(report.release_sequence),
+        assets: Vec::with_capacity(files.len()),
+        ..Default::default()
+    };
+    for source in files {
+        plan.source_bytes += source.len; // Total was checked before building.
+        plan.assets.push(crate::PlannedAsset {
+            access: classify(&source).access,
+            availability: options.availability(&source.logical_path),
+            path: source.logical_path,
+            source_len: Some(source.len),
+            released_len: Some(source.len),
+            change: crate::AssetChange::Unchanged,
+        });
+    }
+    Ok((report, plan))
+}
+
+fn pack_directory_inner<F>(
+    options: &PackOptions,
+    identity: &Identity,
+    mut progress: F,
+) -> Result<(PackReport, Vec<SourceFile>)>
 where
     F: FnMut(PackProgress),
 {
@@ -199,6 +245,7 @@ where
     };
     let reuse = load_reuse_index(old_package.as_ref().filter(|_| options.incremental))?;
     let compacting = reuse.compacting;
+    let previous_storage = reuse.storage;
     let release_sequence = old_package
         .as_ref()
         .map_or(Ok(1), |package| {
@@ -257,6 +304,11 @@ where
         )?;
     }
     context.finish_active_segments()?;
+    // These lookup tables are only needed while assembling file records.
+    // Release them before snapshot encoding and source verification peak.
+    drop(std::mem::take(&mut context.reuse_index));
+    drop(std::mem::take(&mut context.current_reuse));
+    drop(build_cache);
     if !context.new_segment_records.is_empty() {
         sync_directory(&data_directory)?;
     }
@@ -270,31 +322,44 @@ where
         })
     {
         let old = old_package.as_ref().expect("checked above");
+        if !options.development_cache {
+            progress(PackProgress {
+                phase: "Verifying",
+                current_path: None,
+                completed_bytes: total_bytes,
+                total_bytes,
+            });
+            verify_staged_release(&snapshot_path, &data_directory, &files, identity, true)?;
+        }
         let active_segments = old.segment_ids()?;
         let active_release_sequence = old.release_sequence();
-        let storage = package_storage_stats(old)?;
+        let storage = previous_storage;
         if options.development_cache {
             save_build_cache(options, identity, active_release_sequence, &files, &context)?;
         }
         drop(old_package);
         cleanup_unreferenced_segments(&data_directory, &active_segments)?;
-        return Ok(PackReport {
-            changed: false,
-            release_sequence: active_release_sequence,
-            file_count: u32::try_from(files.len())
-                .map_err(|_| Error::InvalidInput("too many files".into()))?,
-            block_count: u32::try_from(context.pending_blocks.len())
-                .map_err(|_| Error::InvalidInput("too many blocks".into()))?,
-            reused_blocks: context.reused_blocks,
-            new_blocks: 0,
-            new_segments: 0,
-            new_segment_bytes: 0,
-            retained_segment_bytes: storage.retained,
-            referenced_block_bytes: storage.referenced,
-            stranded_segment_bytes: storage.stranded,
-        });
+        return Ok((
+            PackReport {
+                changed: false,
+                release_sequence: active_release_sequence,
+                file_count: u32::try_from(files.len())
+                    .map_err(|_| Error::InvalidInput("too many files".into()))?,
+                block_count: u32::try_from(context.pending_blocks.len())
+                    .map_err(|_| Error::InvalidInput("too many blocks".into()))?,
+                reused_blocks: context.reused_blocks,
+                new_blocks: 0,
+                new_segments: 0,
+                new_segment_bytes: 0,
+                retained_segment_bytes: storage.retained,
+                referenced_block_bytes: storage.referenced,
+                stranded_segment_bytes: storage.stranded,
+            },
+            files,
+        ));
     }
 
+    drop(old_package);
     progress(PackProgress {
         phase: "Writing snapshot",
         current_path: None,
@@ -328,7 +393,6 @@ where
         return Err(error);
     }
     let active_segments = context.active_segment_ids();
-    drop(old_package);
     cleanup_unreferenced_segments(&data_directory, &active_segments)?;
     progress(PackProgress {
         phase: "Complete",
@@ -336,7 +400,7 @@ where
         completed_bytes: total_bytes,
         total_bytes,
     });
-    Ok(report)
+    Ok((report, files))
 }
 
 #[derive(Clone)]
@@ -347,6 +411,7 @@ struct ReusableBlock {
 
 struct ReuseIndex {
     compacting: bool,
+    storage: StorageStats,
     blocks: HashMap<([u8; 32], Availability), ReusableBlock>,
     segments: Vec<SegmentRecord>,
 }
@@ -830,13 +895,11 @@ impl BuildContext<'_> {
                 .get(&id)
                 .ok_or_else(|| Error::InvalidInput("block references missing segment".into()))?;
         }
-        let block_refs: Vec<BlockRef> = self
-            .pending_blocks
-            .iter()
-            .map(|item| item.reference)
-            .collect();
-        let storage = storage_stats(&segments, &block_refs)?;
-        validate_pair_count(block_refs.len(), self.chunk_ids.len())?;
+        let storage = storage_stats(
+            &segments,
+            self.pending_blocks.iter().map(|item| &item.reference),
+        )?;
+        validate_pair_count(self.pending_blocks.len(), self.chunk_ids.len())?;
 
         let path_slots =
             build_path_slots(&self.file_paths, &self.file_records, &self.keys.path_key())?;
@@ -850,22 +913,23 @@ impl BuildContext<'_> {
             release_sequence,
             nonce_prefix,
             &snapshot_key,
-            &block_refs,
+            &self.pending_blocks,
             &self.chunk_ids,
             self.options.compression_level,
         )?;
-        let catalog = CatalogData {
+        let catalog_data = CatalogData {
             segments,
-            files: self.file_records.clone(),
+            files: std::mem::take(&mut self.file_records),
             path_slots,
-            path_pool: self.path_pool.clone(),
+            path_pool: std::mem::take(&mut self.path_pool),
             pages: encrypted_pages.directory,
-            total_blocks: u32::try_from(block_refs.len())
+            total_blocks: u32::try_from(self.pending_blocks.len())
                 .map_err(|_| Error::InvalidInput("too many blocks".into()))?,
             map_page_count: encrypted_pages.map_count,
             reuse_page_count: encrypted_pages.reuse_count,
-        }
-        .encode()?;
+        };
+        let catalog = catalog_data.encode()?;
+        self.file_records = catalog_data.files;
         let mut catalog_ciphertext =
             zstd::bulk::compress(&catalog, self.options.compression_level)?;
         let catalog_stored_len = u64::try_from(catalog_ciphertext.len() + 16)
@@ -930,7 +994,7 @@ impl BuildContext<'_> {
             release_sequence,
             file_count: u32::try_from(self.file_records.len())
                 .map_err(|_| Error::InvalidInput("too many files".into()))?,
-            block_count: u32::try_from(block_refs.len())
+            block_count: u32::try_from(self.pending_blocks.len())
                 .map_err(|_| Error::InvalidInput("too many blocks".into()))?,
             reused_blocks: self.reused_blocks,
             new_blocks: self.new_blocks,
@@ -971,23 +1035,10 @@ struct StorageStats {
     stranded: u64,
 }
 
-fn package_storage_stats(package: &Package) -> Result<StorageStats> {
-    let segment_count = package.segment_ids()?.len();
-    let mut segments = Vec::with_capacity(segment_count);
-    for index in 0..segment_count {
-        let ordinal = u16::try_from(index)
-            .map_err(|_| Error::InvalidInput("too many referenced segments".into()))?;
-        segments.push(package.segment_record(ordinal)?);
-    }
-    let blocks = package
-        .reuse_records()?
-        .into_iter()
-        .map(|record| record.block)
-        .collect::<Vec<_>>();
-    storage_stats(&segments, &blocks)
-}
-
-fn storage_stats(segments: &[SegmentRecord], blocks: &[BlockRef]) -> Result<StorageStats> {
+fn storage_stats<'a>(
+    segments: &[SegmentRecord],
+    blocks: impl IntoIterator<Item = &'a BlockRef>,
+) -> Result<StorageStats> {
     let retained = segments.iter().try_fold(0_u64, |total, segment| {
         total
             .checked_add(segment.file_len)
@@ -1209,6 +1260,7 @@ fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
     let Some(old) = old else {
         return Ok(ReuseIndex {
             compacting: false,
+            storage: StorageStats::default(),
             blocks: HashMap::new(),
             segments: Vec::new(),
         });
@@ -1224,6 +1276,7 @@ fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
         })
         .collect::<Result<Vec<_>>>()?;
     let records = old.reuse_records()?;
+    let storage = storage_stats(&segments, records.iter().map(|record| &record.block))?;
     let compact = compaction_segments(&segments, &records)?;
     let mut blocks = HashMap::new();
     for reuse in records {
@@ -1242,6 +1295,7 @@ fn load_reuse_index(old: Option<&Package>) -> Result<ReuseIndex> {
     }
     Ok(ReuseIndex {
         compacting: !compact.is_empty(),
+        storage,
         blocks,
         segments,
     })
@@ -1316,23 +1370,26 @@ fn build_pages(
     release_sequence: u64,
     nonce_prefix: [u8; 8],
     snapshot_key: &Aes256Key,
-    block_refs: &[BlockRef],
+    pending_blocks: &[PendingBlock],
     chunk_ids: &[[u8; 32]],
     compression_level: i32,
 ) -> Result<EncryptedPages> {
-    validate_pair_count(block_refs.len(), chunk_ids.len())?;
-    let page_capacity =
-        block_refs.len().div_ceil(BLOCKS_PER_MAP_PAGE) + chunk_ids.len().div_ceil(REUSE_PER_PAGE);
+    validate_pair_count(pending_blocks.len(), chunk_ids.len())?;
+    let page_capacity = pending_blocks.len().div_ceil(BLOCKS_PER_MAP_PAGE)
+        + chunk_ids.len().div_ceil(REUSE_PER_PAGE);
     let mut compressor = zstd::bulk::Compressor::new(compression_level)?;
     compressor.include_checksum(false)?;
     compressor.include_dictid(false)?;
     let mut directory = Vec::with_capacity(page_capacity);
     let mut ciphertexts = Vec::with_capacity(page_capacity);
     let mut relative_offset = 0_u64;
-    for (page_index, records) in block_refs.chunks(BLOCKS_PER_MAP_PAGE).enumerate() {
+    let mut records = Vec::with_capacity(BLOCKS_PER_MAP_PAGE);
+    for (page_index, chunk) in pending_blocks.chunks(BLOCKS_PER_MAP_PAGE).enumerate() {
+        records.clear();
+        records.extend(chunk.iter().map(|item| item.reference));
         let first = u32::try_from(page_index * BLOCKS_PER_MAP_PAGE)
             .map_err(|_| Error::InvalidInput("map page index".into()))?;
-        let plaintext = encode_map_page(first, records)?;
+        let plaintext = encode_map_page(first, &records)?;
         encrypt_page(
             project_id,
             release_sequence,
@@ -1573,6 +1630,7 @@ fn verify_staged_release(
         ResourceBudget::memory_constrained(),
         OpenPolicy::TrustFirstRelease,
     )?;
+    package.verify_metadata()?;
     package.verify_segments()?;
     if !verify_sources {
         return Ok(());
@@ -1756,6 +1814,11 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn validate_options(options: &PackOptions) -> Result<()> {
+    if options.development_cache && !options.incremental {
+        return Err(Error::InvalidInput(
+            "development cache requires incremental packing".into(),
+        ));
+    }
     if options.release_sequence_floor == 0 {
         return Err(Error::InvalidInput(
             "release sequence floor must be positive".into(),
@@ -2523,6 +2586,7 @@ mod tests {
         )
         .unwrap();
         assert!(package.list_assets().unwrap().is_empty());
+        package.verify().unwrap();
 
         let snapshot = output.join("game.haku");
         let mut bytes = std::fs::read(&snapshot).unwrap();

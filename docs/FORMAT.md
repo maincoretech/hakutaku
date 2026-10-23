@@ -36,7 +36,7 @@ output continues its authenticated sequence; a lower supplied floor cannot
 decrease it. Full builds require an authentic current snapshot when present.
 
 Measured layout choices and rejected alternatives are documented in
-[performance evidence](PERFORMANCE.md#next-format-design-evidence).
+[performance evidence](PERFORMANCE.md#v2-design-prototypes).
 
 ## Release layout
 
@@ -350,7 +350,8 @@ Ed25519 public key
 ```
 
 Cache hits do not repeat digest, AEAD, or zstd work. Prepared AES keys are
-retained only by the active snapshot and the bounded segment-handle cache.
+retained by the active snapshot, active segment readers and the bounded
+segment-handle cache. Trimming shared caches does not invalidate active readers.
 
 ## Publisher transaction
 

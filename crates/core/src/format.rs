@@ -723,7 +723,8 @@ impl CatalogData {
         let total_len = checked_table_end(page_offset, self.pages.len(), PAGE_RECORD_SIZE)?;
         validate_catalog_len(total_len)?;
 
-        let mut out = vec![0_u8; CATALOG_HEADER_SIZE];
+        let mut out = Vec::with_capacity(total_len);
+        out.resize(CATALOG_HEADER_SIZE, 0);
         out[..8].copy_from_slice(CATALOG_MAGIC);
         put_u16(&mut out, 8, FORMAT_MAJOR);
         put_u16(&mut out, 10, CATALOG_HEADER_SIZE as u16);
@@ -887,6 +888,7 @@ impl Catalog {
                 return Err(Error::InvalidFormat("segment record length"));
             }
         }
+        let mut expected_first_block = 0;
         for index in 0..self.file_count {
             let file = self.file(index)?;
             let path_end = (file.path_offset as usize)
@@ -899,10 +901,30 @@ impl Catalog {
                 .first_block
                 .checked_add(file.block_count)
                 .ok_or(Error::InvalidFormat("file block range overflow"))?;
-            if block_end > self.total_blocks {
+            if file.first_block != expected_first_block || block_end > self.total_blocks {
                 return Err(Error::InvalidFormat("file block range"));
             }
+            expected_first_block = block_end;
+            if (file.logical_len == 0) != (file.block_count == 0)
+                || file.logical_len < u64::from(file.block_count)
+                || file.logical_len > u64::from(file.block_count) * MAX_BLOCK_PLAIN_LEN as u64
+            {
+                return Err(Error::InvalidFormat(
+                    "file length cannot be covered by blocks",
+                ));
+            }
+            if file.layout == LayoutKind::Fixed
+                && file.logical_len != 0
+                && (file.fixed_block_len as usize > MAX_BLOCK_PLAIN_LEN
+                    || file.logical_len.div_ceil(u64::from(file.fixed_block_len))
+                        != u64::from(file.block_count))
+            {
+                return Err(Error::InvalidFormat("fixed file block count"));
+            }
             validate_canonical_path(self.path(index)?)?;
+        }
+        if expected_first_block != self.total_blocks {
+            return Err(Error::InvalidFormat("unowned file blocks"));
         }
         for index in 0..self.path_slot_count {
             let slot = self.path_slot(index)?;
@@ -1517,6 +1539,35 @@ mod tests {
         };
         let catalog = Catalog::parse(data.encode().unwrap().into()).unwrap();
         assert_eq!(catalog.find_file("missing", &key).unwrap(), None);
+    }
+
+    #[test]
+    fn file_lengths_and_block_ownership_must_be_consistent() {
+        let (data, _) = catalog_data();
+        for (len, blocks, fixed) in [
+            (u64::MAX, 1, 16),
+            (1, 0, 16),
+            (0, 1, 16),
+            (17, 1, 16),
+            (16, 1, u32::MAX),
+        ] {
+            let mut invalid = data.clone();
+            invalid.files[0].logical_len = len;
+            invalid.files[0].block_count = blocks;
+            invalid.files[0].fixed_block_len = fixed;
+            assert!(Catalog::parse(invalid.encode().unwrap().into()).is_err());
+        }
+        let mut invalid = data.clone();
+        invalid.files[0].layout = LayoutKind::ContentDefined;
+        invalid.files[0].fixed_block_len = 0;
+        invalid.files[0].logical_len = MAX_BLOCK_PLAIN_LEN as u64 + 1;
+        assert!(Catalog::parse(invalid.encode().unwrap().into()).is_err());
+        let mut invalid = data.clone();
+        invalid.files.push(invalid.files[0]);
+        assert!(Catalog::parse(invalid.encode().unwrap().into()).is_err());
+        let mut invalid = data;
+        invalid.files.clear();
+        assert!(Catalog::parse(invalid.encode().unwrap().into()).is_err());
     }
 
     #[test]

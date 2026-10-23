@@ -213,7 +213,7 @@ fn verify_command(parser: &mut lexopt::Parser) -> Result<(), Box<dyn std::error:
         return Err("verify accepts only --package, --keys, and --minimum-release".into());
     }
     let package = open_package(&arguments)?;
-    package.verify_segments()?;
+    package.verify()?;
     println!(
         "valid release {} ({} assets)",
         package.release_sequence(),

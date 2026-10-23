@@ -88,6 +88,12 @@ fn run_scale(
     if strict_incremental.changed || development_seed.changed || development_cached.changed {
         return Err("unchanged incremental benchmark unexpectedly changed the release".into());
     }
+    let gui_started = Instant::now();
+    let (gui_report, gui_plan) =
+        hakutaku_pack::pack_directory_with_plan(&development_options, identity, |_| {})?;
+    assert!(!gui_report.changed);
+    assert_eq!(gui_plan.assets.len(), asset_count);
+    let gui_elapsed = gui_started.elapsed();
     let counters = Counters::default();
 
     counters.reset();
@@ -125,6 +131,10 @@ fn run_scale(
     let concurrent = interleaved_cursors(&package, &counters, voice_count)?;
 
     println!("Hakutaku VN benchmark: assets={asset_count}");
+    println!(
+        "gui_cached_pack_and_plan_ms={:.3}",
+        milliseconds(gui_elapsed)
+    );
     println!(
         "pack_ms={:.3} blocks={} segments={}",
         milliseconds(pack_elapsed),

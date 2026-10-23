@@ -541,6 +541,71 @@ impl Package {
         lock(&self.inner.handles).clear();
     }
 
+    /// Verifies the complete release, including deferred segments, metadata
+    /// pages, logical block coverage and decoded content. Unlike normal opens,
+    /// this publisher/installation check reads all payloads, reloads metadata
+    /// pages and bypasses plaintext caches. Backends must remain immutable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing segments, corruption or invalid mappings.
+    pub fn verify(&self) -> Result<()> {
+        self.verify_metadata()?;
+        self.verify_segments()?;
+        let mut reader = BlockReader::default();
+        for index in 0..self.inner.catalog.total_blocks() {
+            let reference = self.inner.block_ref(index)?;
+            let data = self.inner.load_block_uncached(&reference, &mut reader)?;
+            reader.recycle(BlockData::Owned(data));
+        }
+        Ok(())
+    }
+
+    /// Authenticates all metadata pages and validates complete file mappings.
+    /// Does not read segment payloads; use [`Self::verify`] for a full check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupted pages, lookup or block coverage errors.
+    pub fn verify_metadata(&self) -> Result<()> {
+        lock(&self.inner.page_cache).clear();
+        for index in 0..self.inner.catalog.reuse_page_count() {
+            let page = self
+                .inner
+                .load_page(self.inner.catalog.map_page_count() + index, PageKind::Reuse)?;
+            parse_reuse_page(&page, checked_record_index(index, REUSE_PER_PAGE as u32)?)?;
+        }
+        for index in 0..self.inner.catalog.file_count() {
+            let file = self.inner.catalog.file(index)?;
+            if self.asset(self.inner.catalog.path(index)?)?.file_index() != index {
+                return Err(Error::InvalidFormat("path index does not resolve file"));
+            }
+            let mut logical = 0_u64;
+            for local in 0..file.block_count {
+                let block = self.inner.block_ref(file.first_block + local)?;
+                if block.logical_offset != logical {
+                    return Err(Error::InvalidFormat("non-contiguous file blocks"));
+                }
+                if file.layout == LayoutKind::Fixed
+                    && u64::from(block.plain_len)
+                        != (file.logical_len - logical).min(u64::from(file.fixed_block_len))
+                {
+                    return Err(Error::InvalidFormat("fixed block length mismatch"));
+                }
+                logical = logical
+                    .checked_add(u64::from(block.plain_len))
+                    .ok_or(Error::InvalidRange)?;
+                if logical > file.logical_len {
+                    return Err(Error::InvalidFormat("block exceeds file length"));
+                }
+            }
+            if logical != file.logical_len {
+                return Err(Error::InvalidFormat("incomplete file coverage"));
+            }
+        }
+        Ok(())
+    }
+
     /// Streams every segment and verifies its content-derived identifier.
     ///
     /// # Errors
@@ -686,6 +751,26 @@ impl PackageInner {
             return Ok(BlockData::Shared(value));
         }
 
+        let plaintext = self.load_block_uncached(reference, reader)?;
+        let admit = match access {
+            AccessClass::Hot => true,
+            AccessClass::Normal => self.second_normal_access(key),
+            AccessClass::Streaming | AccessClass::Transient => false,
+        };
+        if admit {
+            let plaintext = Arc::new(plaintext);
+            lock(&self.block_cache).insert(key, Arc::clone(&plaintext));
+            Ok(BlockData::Shared(plaintext))
+        } else {
+            Ok(BlockData::Owned(plaintext))
+        }
+    }
+
+    fn load_block_uncached(
+        &self,
+        reference: &BlockRef,
+        reader: &mut BlockReader,
+    ) -> Result<Vec<u8>> {
         let segment = self.catalog.segment(u32::from(reference.segment_ordinal))?;
         if reference.segment_block_ordinal >= segment.block_count {
             return Err(Error::InvalidFormat("segment block ordinal"));
@@ -719,20 +804,7 @@ impl PackageInner {
             ciphertext,
             "segment block",
         )?;
-        let plaintext = decode_buffered(reference.codec, reader, reference.plain_len as usize)?;
-
-        let admit = match access {
-            AccessClass::Hot => true,
-            AccessClass::Normal => self.second_normal_access(key),
-            AccessClass::Streaming | AccessClass::Transient => false,
-        };
-        if admit {
-            let plaintext = Arc::new(plaintext);
-            lock(&self.block_cache).insert(key, Arc::clone(&plaintext));
-            Ok(BlockData::Shared(plaintext))
-        } else {
-            Ok(BlockData::Owned(plaintext))
-        }
+        decode_buffered(reference.codec, reader, reference.plain_len as usize)
     }
 
     fn prefetch_block(
@@ -841,7 +913,11 @@ impl Asset {
     /// Returns an error for allocation limits, unavailable segments, or failed validation.
     pub fn read(&self) -> Result<Vec<u8>> {
         let len = usize::try_from(self.len()).map_err(|_| Error::LimitExceeded("asset length"))?;
-        let mut result = vec![0_u8; len];
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(len)
+            .map_err(|_| Error::LimitExceeded("asset allocation"))?;
+        result.resize(len, 0);
         let read = self.read_at(0, &mut result)?;
         validate_complete_read(read, len)?;
         Ok(result)
@@ -1300,6 +1376,15 @@ mod tests {
     }
 
     fn package_with_budget(budget: ResourceBudget) -> (Package, BlockRef) {
+        package_with_mapping(budget, 0, LayoutKind::Fixed, 4)
+    }
+
+    fn package_with_mapping(
+        budget: ResourceBudget,
+        logical_offset: u64,
+        layout: LayoutKind,
+        logical_len: u64,
+    ) -> (Package, BlockRef) {
         let project_id = ProjectId([1; 16]);
         let root_key = [2; 32];
         let keys = ProjectKeys::new(root_key, project_id);
@@ -1336,7 +1421,7 @@ mod tests {
         let mut cipher_digest = [0; 16];
         cipher_digest.copy_from_slice(&block_digest.as_bytes()[..16]);
         let reference = BlockRef {
-            logical_offset: 0,
+            logical_offset,
             segment_ordinal: 0,
             segment_block_ordinal: 0,
             physical_offset: SEGMENT_HEADER_SIZE as u64,
@@ -1426,12 +1511,12 @@ mod tests {
                 files: vec![FileRecord {
                     path_offset: 0,
                     path_len: 1,
-                    layout: LayoutKind::Fixed,
+                    layout,
                     access: AccessClass::Normal,
-                    logical_len: 4,
+                    logical_len,
                     first_block: 0,
                     block_count: 1,
-                    fixed_block_len: 4,
+                    fixed_block_len: if layout == LayoutKind::Fixed { 4 } else { 0 },
                 }],
                 path_slots,
                 path_pool: b"a".to_vec(),
@@ -1486,6 +1571,25 @@ mod tests {
             file: Arc::new(MemoryFile(Vec::new())),
             key: Aes256Key::new(&[0; 32]).unwrap(),
         })
+    }
+
+    #[test]
+    fn metadata_verification_rejects_authenticated_but_inconsistent_mappings() {
+        let budget = ResourceBudget::memory_constrained();
+        package_with_budget(budget).0.verify_metadata().unwrap();
+        for (offset, layout, len) in [
+            (1, LayoutKind::Fixed, 4),
+            (0, LayoutKind::Fixed, 3),
+            (0, LayoutKind::ContentDefined, 3),
+            (0, LayoutKind::ContentDefined, 5),
+        ] {
+            assert!(
+                package_with_mapping(budget, offset, layout, len)
+                    .0
+                    .verify_metadata()
+                    .is_err()
+            );
+        }
     }
 
     #[test]

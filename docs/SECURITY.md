@@ -13,6 +13,21 @@ tree. The output directory may neither equal nor be nested beneath that tree,
 so snapshots, segments, temporary files, and local build-cache state cannot be
 collected by a later scan.
 
+## Complete release verification
+
+`Package::open` authenticates the snapshot header and catalog; normal reads
+authenticate pages and blocks lazily. CLI/GUI Verify use `Package::verify` to
+also check every metadata page, path lookup, contiguous file mapping, segment
+digest and decoded content block, including Deferred segments. This is an
+explicit whole-release check, not part of normal startup. `verify_segments`
+retains its narrower segment-only meaning.
+
+Strict incremental builds verify existing payloads and compare sources even
+when the fingerprint is unchanged; missing/corrupt segments cannot yield a
+successful unchanged result. Development-cache unchanged builds intentionally
+retain their faster local-trust policy. The pack library, as well as its CLI,
+rejects development cache with full reconstruction.
+
 ## At-rest boundary
 
 On Unix, publisher identities, runtime-key exports, GUI backups, and their
@@ -30,10 +45,11 @@ memory-hard KDF envelope.
 
 ## Build and release trust
 
-Dependency vulnerability scanning and immutable full-SHA pins for third-party
-GitHub Actions should be mandatory CI gates. GitHub artifact attestations can
-bind published checksums and binaries to the repository, workflow, and commit;
-they complement rather than replace platform code signing.
+The [current workflow](../.github/workflows/ci.yml) runs a RustSec dependency audit,
+pins third-party Actions to full commit SHAs, and requires the audit plus quality,
+stress, coverage and target-build jobs before a main-branch release. The release
+job attests its assets and checksums. Attestations bind build provenance; they do
+not replace platform code signing or a downstream engine's license policy.
 
 The current macOS bundle uses ad-hoc signing and Windows binaries are unsigned.
 Formal distribution therefore still requires Apple Developer ID signing and

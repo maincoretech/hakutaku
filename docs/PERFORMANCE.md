@@ -1,7 +1,112 @@
 # Hakutaku performance baseline
 
-This is the single source of truth for Hakutaku layout and runtime performance.
+This guide owns I/O/cache policy and measured performance. The normative byte
+layout is [FORMAT.md](FORMAT.md); public API contracts live in rustdoc.
 Numbers are regression markers rather than storage-device specifications.
+
+The I/O and allocation sections describe the current v2 implementation. Earlier
+benchmark/cache tables record v1 development; the [design prototypes](#v2-design-prototypes)
+were measured before integration. Use [integrated v2 results](#integrated-v2-results)
+for the paired format comparison. Historical commands require the recorded source,
+inputs and binaries; a current checkout alone does not reproduce an old baseline.
+
+## Publisher validation and inventory reuse
+
+Measured on 2026-10-23, Apple M5 Pro / 24 GB / macOS 27.0.1, Rust 1.99.0. Baseline is
+`f1aeff8`; "checked" adds release verification, catalog bounds and GUI guards;
+"optimized" additionally reuses storage statistics and the checked source
+inventory, releases build-only indexes early, and encodes map pages without a
+second whole-release block-reference vector. Wire v2 and crypto are unchanged.
+
+Values are milliseconds, medians of three process runs. Original/optimized
+runs alternate; the checked-only runs were collected separately beforehand.
+Filesystem caches are warm; no compilation from this task overlapped timing,
+but other desktop activity was not controlled. The existing synthetic
+VN fixture uses 64-byte voice catalog entries plus media samples, not a full
+voice library or decoded playback. GUI timing covers the cached build and
+inventory update, not rendering or the final release-summary lookup.
+
+| Workload | Assets | Original | Checked | Optimized |
+|---|---:|---:|---:|---:|
+| Initial strict pack | 10k | 535.597 | 545.653 | 535.422 |
+| Initial strict pack | 100k | 6,483.138 | 6,774.655 | 7,315.653 |
+| Unchanged strict pack | 10k | 309.804 | 471.966 | 485.146 |
+| Unchanged strict pack | 100k | 4,233.378 | 6,430.582 | 6,725.947 |
+| Cached development pack | 10k | 161.221 | 158.763 | 198.587 |
+| Cached development pack | 100k | 2,229.038 | 2,155.630 | 2,251.737 |
+| GUI cached build + inventory | 10k | — | 313.456 | 202.063 |
+| GUI cached build + inventory | 100k | — | 4,548.862 | 2,183.091 |
+| Package open | 100k | 9.806 | 9.838 | 9.925 |
+| 1,000 path lookups | 100k | 0.466 | 0.479 | 0.477 |
+
+The demonstrated speed benefit is the GUI inventory path: about 35.5% less time
+at 10k and 52.0% at 100k versus the checked/rescanning implementation. Standalone
+CLI cached builds did not demonstrate a speed gain (10k was slower in this
+sample); the removed metadata traversal is not the dominant end-to-end cost.
+Initial strict packing at 100k was also slower; these results do not support a
+general publisher-throughput improvement claim. Strict unchanged builds now
+verify metadata, segments and source bytes instead of returning early: this
+necessary additional work must not be counted as an optimization regression
+against equivalent validation, nor hidden from users.
+
+A separate single 100k process per variant, measured outside the sandbox with
+`/usr/bin/time -l`, recorded checked -> optimized maximum RSS of 195,018,752 ->
+189,022,208 bytes (about -3.1%) and macOS peak memory footprint of 229,671,536 ->
+204,522,072 bytes (about -11.0%). These include fixture creation, publisher and
+runtime probes; they are not isolated packer peaks or runtime cache budgets.
+
+Reproduce with:
+
+```sh
+HAKUTAKU_VN_BENCH=1 HAKUTAKU_VN_BENCH_COUNTS=10000,100000 \
+  cargo bench --locked -p hakutaku-pack --bench vn_runtime
+```
+
+Local `target/publisher-review/` retains raw logs, baseline/checked source,
+executable hashes and exact commands. No dependency or public API was removed.
+`pack_directory_with_plan` is additive; its returned inventory describes the
+successful build, not subsequent external source edits. Explicit Scan still
+performs the current source/release comparison.
+
+### Real resource reads after the publisher fixes
+
+On the same machine/date, compared the original and optimized binaries above
+against `keine/projects/tday`: 83 Opus/WebP/shou files, 80,907,088 logical bytes
+(77.16 MiB). Three alternating original/optimized process pairs each ran five
+passes; values below are medians of the three per-process medians. Each workload
+starts with `Package::trim()` and new read sessions. Filesystem caches remain
+warm. Timings include authenticated reads and byte comparisons, but exclude
+packing, package open, media decoding and playback.
+
+| Read workload (whole batch) | Original ms | Optimized ms | Change |
+|---|---:|---:|---:|
+| First 4 KiB from each of 83 files | 3.886 | 3.836 | -1.3% |
+| All 77.16 MiB, sequential 64 KiB requests | 48.003 | 48.474 | +1.0% |
+| Opus: 4,480 random 4 KiB reads | 126.629 | 127.279 | +0.5% |
+| WebP: 4,480 random 4 KiB reads | 9.711 | 9.783 | +0.7% |
+
+These small differences do not demonstrate a runtime speed gain or regression.
+Backend requested bytes / logical bytes were effectively unchanged: 18.20x
+for file heads, 1.00x for sequential reads, 12.48x for audio seeks and 0.85x for
+image seeks. Small reads still authenticate whole blocks; repeated image reads
+can benefit from the bounded cache within a workload. These counters measure
+backend requests, not physical SSD traffic; this is not a cold-storage test.
+
+Exact local commands (run each version in order for runs 1 through 3):
+
+```sh
+for run in 1 2 3; do
+  for version in baseline after; do
+    HAKUTAKU_DESIGN_BENCH=real \
+    HAKUTAKU_REAL_ASSETS=/Users/shiftz/dev/keine/projects/tday \
+      target/publisher-review/${version}-vn \
+      > target/publisher-review/real-${version}-${run}.log
+  done
+done
+```
+
+The six `real-*.log` files retain every pass and byte counter. Source assets are
+copied into benchmark-owned temporary fixtures and are not modified.
 
 ## I/O model
 
@@ -69,10 +174,13 @@ never performs garbage collection.
   sessions reuse their active segment, buffers, and Streaming block window.
 
 `Package::trim` releases page, plaintext, prefetch, probation, and idle-handle
-caches together. Active readers keep only their current segment handle until
-the reader is dropped or moves to another segment.
+caches together. Active cursors/read sessions retain their own active segment
+handle, reusable decode buffers and current/previous Streaming block window.
+Trim does not invalidate those readers or reclaim caller-owned buffers, the
+catalog, thread-local codec state, or OS file cache. Cache budgets are not a
+whole-process memory limit.
 
-## Benchmark protocol
+## Historical v1 benchmark protocol
 
 The `stream-32m-v1` fixture contains deterministic incompressible MP4-shaped
 data. It reports pack and open latency, 128/256 KiB sequential throughput,
@@ -265,7 +373,7 @@ Raw logs, executable checksums, commands and environment are under
 `paired-{before,final}-{0,1,2}.log` for final medians, `final-vn.log`,
 `commands.txt`, and `machine.txt`.
 
-## Next-format design evidence
+## V2 design prototypes
 
 The following A/B experiments preceded the v2 implementation. They establish
 the choice of compact headers, an 8-byte path index and positional reuse IDs;

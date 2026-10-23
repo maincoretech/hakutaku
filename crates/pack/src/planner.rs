@@ -151,6 +151,8 @@ pub fn plan_directory(options: &PackOptions, keys: &RuntimeKeyMaterial) -> Resul
 /// [`crate::pack_directory`] or [`crate::pack_directory_with_progress`] has
 /// returned successfully for the same options. General previews must use
 /// [`plan_directory`] so same-size edits are compared byte-for-byte.
+/// GUI callers can avoid even this metadata rescan by using
+/// [`crate::pack_directory_with_plan`] and displaying its build-time inventory.
 ///
 /// # Errors
 ///
