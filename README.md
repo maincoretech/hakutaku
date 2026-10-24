@@ -242,5 +242,4 @@ not establish v1/v2 wire compatibility; v2 explicitly rejects v1 packages.
 
 ## License
 
-Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or the
-[MIT license](LICENSE-MIT), at your option.
+Licensed under the [MIT License](LICENSE).

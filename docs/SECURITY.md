@@ -91,7 +91,7 @@ reports the same four license families before and after this upgrade: BSL-1.0
 Linux build tooling). This comparison is not a full GUI license-policy pass.
 No allowlist was widened and no crate was hidden to suppress these results.
 Distribution must retain the corresponding upstream notices, including font
-notices, in addition to this project's own MIT/Apache licenses.
+notices, in addition to this project's own MIT license.
 
 The updated zstd Rust wrapper declares BSD-3-Clause, already permitted by that
 policy; the native zstd source remains 1.5.7. The reviewed primary metadata and
