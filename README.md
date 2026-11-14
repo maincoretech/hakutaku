@@ -160,8 +160,8 @@ consolidation prevents small patch segments accumulating indefinitely.
 
 ## Validation
 
-Hakutaku requires Rust 1.99.0. The same version is pinned for local development
-and CI in `rust-toolchain.toml`. Local acceptance uses:
+Hakutaku requires Rust 1.100.0. Local development and CI pin this version.
+Local acceptance uses:
 
 ```sh
 cargo fmt --all --check
@@ -169,7 +169,9 @@ cargo check --workspace --locked --all-targets --all-features
 cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 cargo test --workspace --locked --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked -p hakutaku-core -p hakutaku-pack --no-deps
-cargo llvm-cov --locked -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
+cargo llvm-cov --locked -p hakutaku-core -p hakutaku-pack --lcov --output-path target/hakutaku.lcov &&
+awk -F '[:,]' '/^DA:/ { lines++; if ($3 > 0) covered++ }
+  END { if (!lines) exit 1; print 100 * covered / lines; exit !(100 * covered >= 97.5 * lines) }' target/hakutaku.lcov
 cargo llvm-cov --locked -p hakutaku-cli --fail-under-lines 45
 cargo bench --locked --workspace
 ```
@@ -195,8 +197,11 @@ in [docs/SECURITY.md](docs/SECURITY.md).
 Both library crates deny missing public API documentation. CI therefore keeps
 public rustdoc coverage at 100%. The canonical wire-format parser is held at
 100% line coverage; the combined runtime and publisher baseline is 97.5% or
-higher, and CLI argument handling has a 45% regression floor. The remaining
-lines are operating-system and cryptographic-provider failure returns that
+higher, and CLI argument handling has a 45% regression floor. With Rust 1.100,
+LLVM's coverage summary and its per-line records can disagree for code shared
+across test binaries. The combined Core/Pack gate counts LCOV `DA:` records,
+which carry the execution count for each mapped source line.
+Some lines are operating-system and cryptographic-provider failure returns that
 cannot be triggered deterministically without replacing the production
 backends.
 

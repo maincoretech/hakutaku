@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
       - name: Large catalog
         env:
           HAKUTAKU_DESIGN_BENCH: metadata
@@ -61,14 +61,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
         with:
           tool: cargo-llvm-cov
       - name: Runtime and publisher line coverage
-        run: cargo llvm-cov --locked -p hakutaku-core -p hakutaku-pack --fail-under-lines 97.5
+        run: |
+          # Count executed source lines from the merged profile across all test binaries.
+          cargo llvm-cov --locked -p hakutaku-core -p hakutaku-pack --lcov --output-path "$RUNNER_TEMP/hakutaku.lcov"
+          awk -F '[:,]' '/^DA:/ { lines++; if ($3 > 0) covered++ }
+            END {
+              if (!lines) { print "No source line coverage data"; exit 1 }
+              printf "Core/Pack source lines: %d/%d (%.2f%%)\n", covered, lines, 100 * covered / lines
+              exit !(100 * covered >= 97.5 * lines)
+            }' "$RUNNER_TEMP/hakutaku.lcov"
       - name: CLI argument line coverage
         run: cargo llvm-cov --locked -p hakutaku-cli --fail-under-lines 45
       - name: Wire-format line coverage
@@ -105,7 +113,7 @@ jobs:
             platform: Android
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
       - run: rustup target add ${{ matrix.target }}
       - name: Configure Android NDK
         if: matrix.platform == 'Android'
@@ -138,7 +146,7 @@ jobs:
             suffix: windows-x86_64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
       - run: rustup target add ${{ matrix.target }}
       - name: Test native runtime, publisher and CLI
         if: matrix.target != 'x86_64-apple-darwin'
@@ -178,7 +186,7 @@ jobs:
             suffix: windows-x86_64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0
       - run: rustup target add ${{ matrix.target }}
       - name: Install Linux GUI libraries
         if: runner.os == 'Linux'

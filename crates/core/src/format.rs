@@ -1854,6 +1854,12 @@ mod tests {
         let file_offset = segment_offset + SEGMENT_RECORD_SIZE;
         let slot_offset = file_offset + FILE_RECORD_SIZE;
         let page_offset = slot_offset + 2 * PATH_SLOT_SIZE + 1;
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[page_offset - 1] = 0xff;
+        assert!(matches!(
+            Catalog::parse(invalid_utf8.into()),
+            Err(Error::InvalidFormat("path is not UTF-8"))
+        ));
         let occupied_slot = [slot_offset, slot_offset + PATH_SLOT_SIZE]
             .into_iter()
             .find(|offset| bytes[offset + 4..offset + 8] != EMPTY_PATH_SLOT.to_le_bytes())

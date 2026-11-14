@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 
 const FASTCDC_MIN: usize = 32 * 1024;
@@ -27,6 +28,8 @@ const HOT_SEGMENT_TARGET: u64 = 64 * 1024 * 1024;
 const NORMAL_SEGMENT_TARGET: u64 = 256 * 1024 * 1024;
 const TRANSIENT_SEGMENT_TARGET: u64 = 128 * 1024 * 1024;
 const BUILD_CACHE_FILE: &str = ".hakutaku-build-cache";
+
+type StagedSnapshot = DropGuard<PathBuf, fn(PathBuf)>;
 
 #[derive(Clone, Debug)]
 /// Inputs and policy controls for one deterministic package build.
@@ -366,7 +369,8 @@ where
         completed_bytes: total_bytes,
         total_bytes,
     });
-    let report = context.write_snapshot(release_sequence, source_fingerprint, &snapshot_path)?;
+    let (report, staged_snapshot) =
+        context.write_snapshot(release_sequence, source_fingerprint, &snapshot_path)?;
 
     progress(PackProgress {
         phase: "Verifying",
@@ -374,24 +378,18 @@ where
         completed_bytes: total_bytes,
         total_bytes,
     });
-    let staged_snapshot = snapshot_path.with_extension(format!("haku.part-{}", std::process::id()));
-    if let Err(error) = verify_staged_release(
+    verify_staged_release(
         &staged_snapshot,
         &data_directory,
         &files,
         identity,
         !options.development_cache,
-    ) {
-        let _ = std::fs::remove_file(&staged_snapshot);
-        return Err(error);
-    }
+    )?;
     if options.development_cache {
         save_build_cache(options, identity, report.release_sequence, &files, &context)?;
     }
-    if let Err(error) = commit_snapshot(&snapshot_path) {
-        let _ = std::fs::remove_file(&staged_snapshot);
-        return Err(error);
-    }
+    commit_snapshot(&staged_snapshot, &snapshot_path)?;
+    DropGuard::dismiss(staged_snapshot);
     let active_segments = context.active_segment_ids();
     cleanup_unreferenced_segments(&data_directory, &active_segments)?;
     progress(PackProgress {
@@ -867,7 +865,7 @@ impl BuildContext<'_> {
         release_sequence: u64,
         source_fingerprint: [u8; 32],
         target: &Path,
-    ) -> Result<PackReport> {
+    ) -> Result<(PackReport, StagedSnapshot)> {
         let mut segments: Vec<SegmentRecord> =
             self.used_existing_segments.values().cloned().collect();
         segments.extend(self.new_segment_records.iter().flatten().cloned());
@@ -965,31 +963,25 @@ impl BuildContext<'_> {
         header.signature = self.identity.sign(&signature_message)?;
 
         let temporary = target.with_extension(format!("haku.part-{}", std::process::id()));
-        let mut file = BufWriter::with_capacity(
-            1024 * 1024,
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?,
-        );
-        let result = (|| -> Result<()> {
-            file.write_all(&header.encode(false))?;
-            file.write_all(&catalog_ciphertext)?;
-            for page in &encrypted_pages.ciphertexts {
-                file.write_all(page)?;
-            }
-            file.flush()?;
-            file.get_ref().sync_all()?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            drop(file);
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let staged_snapshot: StagedSnapshot = DropGuard::new(temporary, |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        // Close the file before the guard can remove it, including on Windows.
+        let mut file = BufWriter::with_capacity(1024 * 1024, file);
+        file.write_all(&header.encode(false))?;
+        file.write_all(&catalog_ciphertext)?;
+        for page in &encrypted_pages.ciphertexts {
+            file.write_all(page)?;
         }
+        file.flush()?;
+        file.get_ref().sync_all()?;
         drop(file);
 
-        Ok(PackReport {
+        let report = PackReport {
             changed: true,
             release_sequence,
             file_count: u32::try_from(self.file_records.len())
@@ -1009,7 +1001,8 @@ impl BuildContext<'_> {
             retained_segment_bytes: storage.retained,
             referenced_block_bytes: storage.referenced,
             stranded_segment_bytes: storage.stranded,
-        })
+        };
+        Ok((report, staged_snapshot))
     }
 }
 
@@ -1720,8 +1713,7 @@ fn validate_build_cache_record_count(files: usize, records: usize) -> Result<()>
     Ok(())
 }
 
-fn commit_snapshot(target: &Path) -> Result<()> {
-    let temporary = target.with_extension(format!("haku.part-{}", std::process::id()));
+fn commit_snapshot(temporary: &Path, target: &Path) -> Result<()> {
     std::fs::rename(temporary, target)?;
     if let Some(parent) = target.parent() {
         sync_directory(parent)?;
@@ -2339,7 +2331,7 @@ mod tests {
         let target = output.join("game.haku");
         let temporary = target.with_extension(format!("haku.part-{}", std::process::id()));
         std::fs::write(&temporary, b"snapshot").unwrap();
-        commit_snapshot(&target).unwrap();
+        commit_snapshot(&temporary, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"snapshot");
 
         let active = SegmentId([1; 32]);
@@ -2554,6 +2546,11 @@ mod tests {
             .is_err()
         );
         assert!(target.is_dir());
+        assert!(
+            !target
+                .with_extension(format!("haku.part-{}", std::process::id()))
+                .exists()
+        );
 
         let input = root.join("segment-open/input");
         let output = root.join("segment-open/output");
@@ -2565,6 +2562,40 @@ mod tests {
         ));
         std::fs::create_dir_all(&collision).unwrap();
         assert!(pack_directory(&PackOptions::new(&input, &output), &identity).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_cache_failure_discards_staged_snapshot_and_keeps_previous_release() {
+        let root = scratch("cache-save-failure");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let asset = input.join("asset.bin");
+        let target = output.join("game.haku");
+        let identity = Identity::generate().unwrap();
+        let mut options = PackOptions::new(&input, &output);
+        std::fs::write(&asset, b"first").unwrap();
+        pack_directory(&options, &identity).unwrap();
+        let previous = std::fs::read(&target).unwrap();
+
+        std::fs::write(&asset, b"second").unwrap();
+        options.development_cache = true;
+        let staged = target.with_extension(format!("haku.part-{}", std::process::id()));
+        let mut blocked_cache_save = false;
+        assert!(
+            pack_directory_with_progress(&options, &identity, |progress| {
+                if progress.phase == "Verifying" {
+                    assert!(staged.is_file());
+                    std::fs::create_dir(output.join(BUILD_CACHE_FILE)).unwrap();
+                    blocked_cache_save = true;
+                }
+            })
+            .is_err()
+        );
+        assert!(blocked_cache_save);
+        assert_eq!(std::fs::read(&target).unwrap(), previous);
+        assert!(!staged.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
