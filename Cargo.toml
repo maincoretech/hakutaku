@@ -16,7 +16,7 @@ hakutaku-pack = { path = "crates/pack" }
 blake3 = "1.8.7"
 ring = { version = "0.17.14", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false }
-zstd = { version = "0.14.2", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 
 [profile.dev]
 opt-level = 1

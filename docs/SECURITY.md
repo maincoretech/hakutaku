@@ -95,9 +95,9 @@ notices, in addition to this project's own MIT license.
 
 The updated zstd Rust wrapper declares BSD-3-Clause, already permitted by that
 policy; the native zstd source remains 1.5.7. The reviewed primary metadata and
-license files are available in [zstd 0.14.2](https://docs.rs/crate/zstd/0.14.2/source/),
+license files are available in [zstd 0.14.3](https://docs.rs/crate/zstd/0.14.3/source/),
 [egui fonts](https://docs.rs/crate/epaint_default_fonts/0.36.2/source/),
-[clipboard-win](https://docs.rs/crate/clipboard-win/5.4.1/source/), and
+[clipboard-win](https://docs.rs/crate/clipboard-win/5.4.3/source/), and
 [target-lexicon](https://docs.rs/crate/target-lexicon/0.12.16/source/).
 
 ## Release ordering during reconstruction
